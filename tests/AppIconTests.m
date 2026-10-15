@@ -53,16 +53,18 @@ static void AssertIconGeometry(NSBitmapImageRep *bitmap, NSInteger n, NSString *
 
     NSInteger minX = n, minY = n, maxX = -1, maxY = -1;
     for (NSInteger y = 0; y < n; y++) {
-        for (NSInteger x = 0; x < n; x++) {
-            NSColor *color = [bitmap colorAtX:x y:y];
-            CGFloat alpha = color.alphaComponent;
-            if (x == 0 || y == 0 || x == n - 1 || y == n - 1)
-                Require(alpha == 0, [NSString stringWithFormat:@"%@ transparent outer edge", label]);
-            if (alpha * 255.0 >= 128.0) {
-                if (x < minX) minX = x;
-                if (y < minY) minY = y;
-                if (x > maxX) maxX = x;
-                if (y > maxY) maxY = y;
+        @autoreleasepool {
+            for (NSInteger x = 0; x < n; x++) {
+                NSColor *color = [bitmap colorAtX:x y:y];
+                CGFloat alpha = color.alphaComponent;
+                if (x == 0 || y == 0 || x == n - 1 || y == n - 1)
+                    Require(alpha == 0, [NSString stringWithFormat:@"%@ transparent outer edge", label]);
+                if (alpha * 255.0 >= 128.0) {
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x > maxX) maxX = x;
+                    if (y > maxY) maxY = y;
+                }
             }
         }
     }
@@ -136,15 +138,17 @@ static void AssertRGBAEqual(NSBitmapImageRep *a, NSBitmapImageRep *b, NSString *
     NSInteger n = a.pixelsWide;
     const double tol = 1.0 / 255.0;
     for (NSInteger y = 0; y < n; y++) {
-        for (NSInteger x = 0; x < n; x++) {
-            NSColor *ca = [[a colorAtX:x y:y] colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
-            NSColor *cb = [[b colorAtX:x y:y] colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
-            Require(ca != nil && cb != nil, [NSString stringWithFormat:@"%@ sRGB sample", label]);
-            Require(fabs(ca.redComponent - cb.redComponent) <= tol &&
-                    fabs(ca.greenComponent - cb.greenComponent) <= tol &&
-                    fabs(ca.blueComponent - cb.blueComponent) <= tol &&
-                    fabs(ca.alphaComponent - cb.alphaComponent) <= tol,
-                [NSString stringWithFormat:@"%@ pixel (%ld,%ld)", label, (long)x, (long)y]);
+        @autoreleasepool {
+            for (NSInteger x = 0; x < n; x++) {
+                NSColor *ca = [[a colorAtX:x y:y] colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+                NSColor *cb = [[b colorAtX:x y:y] colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+                Require(ca != nil && cb != nil, [NSString stringWithFormat:@"%@ sRGB sample", label]);
+                Require(fabs(ca.redComponent - cb.redComponent) <= tol &&
+                        fabs(ca.greenComponent - cb.greenComponent) <= tol &&
+                        fabs(ca.blueComponent - cb.blueComponent) <= tol &&
+                        fabs(ca.alphaComponent - cb.alphaComponent) <= tol,
+                    [NSString stringWithFormat:@"%@ pixel (%ld,%ld)", label, (long)x, (long)y]);
+            }
         }
     }
 }
