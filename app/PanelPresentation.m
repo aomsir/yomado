@@ -111,6 +111,98 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
     [window orderFrontRegardless];
 }
 
+@interface YMCocoaPanelPresentationEnvironment : NSObject <YMPanelPresentationEnvironment>
+@end
+
+@implementation YMCocoaPanelPresentationEnvironment
+- (NSApplicationActivationPolicy)activationPolicy { return NSApp.activationPolicy; }
+- (BOOL)requestActivationPolicy:(NSApplicationActivationPolicy)policy {
+    return [NSApp setActivationPolicy:policy];
+}
+- (void)activateApplication { [NSApp activate]; }
+- (void)deferUntilAfterMenuTracking:(dispatch_block_t)block {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSRunLoop.mainRunLoop performInModes:@[NSDefaultRunLoopMode] block:block];
+    });
+}
+- (BOOL)hasAttachedSheetForWindow:(NSWindow *)window { return window.attachedSheet != nil; }
+- (void)presentWindow:(NSWindow *)window { YMPresentControlPanelOnMainThread(window); }
+- (void)hideWindow:(NSWindow *)window { [window orderOut:nil]; }
+- (void)reportActivationPolicyFailure:(NSApplicationActivationPolicy)requested
+                        actualPolicy:(NSApplicationActivationPolicy)actual {
+    fprintf(stderr, "Control panel activation policy request %ld did not reach target (actual %ld).\n",
+            (long)requested, (long)actual);
+}
+@end
+
+@interface YMControlPanelPresenter ()
+@property(nonatomic, strong) NSWindow *window;
+@property(nonatomic, strong) id<YMPanelPresentationEnvironment> environment;
+@property(nonatomic, readwrite) BOOL panelOpen;
+@property(nonatomic) NSUInteger generation;
+@property(nonatomic) BOOL invalidated;
+@end
+
+@implementation YMControlPanelPresenter
+- (instancetype)initWithWindow:(NSWindow *)window {
+    return [self initWithWindow:window environment:[YMCocoaPanelPresentationEnvironment new]];
+}
+- (instancetype)initWithWindow:(NSWindow *)window
+                  environment:(id<YMPanelPresentationEnvironment>)environment {
+    if ((self = [super init])) {
+        _window = window;
+        _environment = environment;
+    }
+    return self;
+}
+- (void)ensurePolicy:(NSApplicationActivationPolicy)requested {
+    if (self.environment.activationPolicy == requested) return;
+    (void)[self.environment requestActivationPolicy:requested];
+    NSApplicationActivationPolicy actual = self.environment.activationPolicy;
+    if (actual != requested) {
+        [self.environment reportActivationPolicyFailure:requested actualPolicy:actual];
+    }
+}
+- (void)open {
+    NSCAssert(NSThread.isMainThread, @"Panel lifecycle requires the main thread.");
+    if (self.invalidated || !self.window) return;
+    self.panelOpen = YES;
+    NSUInteger generation = ++self.generation;
+    [self ensurePolicy:NSApplicationActivationPolicyRegular];
+    [self.environment activateApplication];
+    __weak YMControlPanelPresenter *weakSelf = self;
+    [self.environment deferUntilAfterMenuTracking:^{
+        YMControlPanelPresenter *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.invalidated ||
+            strongSelf.generation != generation || !strongSelf.panelOpen) return;
+        [strongSelf.environment presentWindow:strongSelf.window];
+    }];
+}
+- (BOOL)closeWindow:(NSWindow *)window {
+    NSCAssert(NSThread.isMainThread, @"Panel lifecycle requires the main thread.");
+    if (self.invalidated || !window || window != self.window ||
+        [self.environment hasAttachedSheetForWindow:window]) return NO;
+    if (!self.panelOpen) return YES;
+    self.panelOpen = NO;
+    NSUInteger generation = ++self.generation;
+    [self.environment hideWindow:window];
+    __weak YMControlPanelPresenter *weakSelf = self;
+    [self.environment deferUntilAfterMenuTracking:^{
+        YMControlPanelPresenter *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.invalidated ||
+            strongSelf.generation != generation || strongSelf.panelOpen) return;
+        [strongSelf ensurePolicy:NSApplicationActivationPolicyAccessory];
+    }];
+    return YES;
+}
+- (void)invalidate {
+    NSCAssert(NSThread.isMainThread, @"Panel lifecycle requires the main thread.");
+    self.invalidated = YES;
+    self.panelOpen = NO;
+    ++self.generation;
+}
+@end
+
 void YMPresentControlPanel(NSWindow *window) {
     if (!window) return;
     // Request activation while handling the explicit open action. Deferring

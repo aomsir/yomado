@@ -7,6 +7,205 @@ static void Check(BOOL condition, const char *message) {
     if (!condition) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
 }
 
+@interface YMFixtureWindow : NSObject
+@property BOOL visible;
+@property BOOL miniaturized;
+@property BOOL hidden;
+@property BOOL attachedSheet;
+@end
+@implementation YMFixtureWindow
+@end
+
+@interface YMFixtureEnvironment : NSObject <YMPanelPresentationEnvironment>
+@property NSApplicationActivationPolicy activationPolicy;
+@property NSInteger rejectedPolicy;
+@property BOOL falseAfterChange;
+@property BOOL trueWithoutChange;
+@property NSUInteger presentations;
+@property NSUInteger hides;
+@property NSUInteger failures;
+@property NSWindow *lastWindow;
+@property NSMutableArray<NSString *> *events;
+@property NSMutableArray *pending;
+- (void)drain;
+@end
+
+@implementation YMFixtureEnvironment
+- (instancetype)init {
+    if ((self = [super init])) {
+        _activationPolicy = NSApplicationActivationPolicyAccessory;
+        _rejectedPolicy = -1;
+        _events = [NSMutableArray array];
+        _pending = [NSMutableArray array];
+    }
+    return self;
+}
+- (BOOL)requestActivationPolicy:(NSApplicationActivationPolicy)policy {
+    [self.events addObject:[NSString stringWithFormat:@"policy:%ld", (long)policy]];
+    if (self.rejectedPolicy == policy) return NO;
+    if (self.trueWithoutChange) return YES;
+    self.activationPolicy = policy;
+    return !self.falseAfterChange;
+}
+- (void)activateApplication { [self.events addObject:@"activate"]; }
+- (void)deferUntilAfterMenuTracking:(dispatch_block_t)block {
+    [self.events addObject:@"schedule"];
+    [self.pending addObject:[block copy]];
+}
+- (BOOL)hasAttachedSheetForWindow:(NSWindow *)window {
+    return ((YMFixtureWindow *)(id)window).attachedSheet;
+}
+- (void)presentWindow:(NSWindow *)window {
+    self.presentations++;
+    self.lastWindow = window;
+    YMFixtureWindow *fixture = (YMFixtureWindow *)(id)window;
+    fixture.visible = YES;
+    fixture.hidden = fixture.miniaturized = NO;
+    [self.events addObject:@"present"];
+}
+- (void)hideWindow:(NSWindow *)window {
+    self.hides++;
+    ((YMFixtureWindow *)(id)window).visible = NO;
+    [self.events addObject:@"hide"];
+}
+- (void)reportActivationPolicyFailure:(NSApplicationActivationPolicy)requested
+                        actualPolicy:(NSApplicationActivationPolicy)actual {
+    (void)requested; (void)actual;
+    self.failures++;
+    [self.events addObject:@"failure"];
+}
+- (void)drain {
+    while (self.pending.count) {
+        dispatch_block_t block = self.pending.firstObject;
+        [self.pending removeObjectAtIndex:0];
+        block();
+    }
+}
+@end
+
+static void LifecycleTests(void) {
+    Check(NSApp == nil, "lifecycle tests start without NSApp");
+
+    YMFixtureWindow *w = [YMFixtureWindow new];
+    YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+    YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+        initWithWindow:(NSWindow *)(id)w environment:e];
+    [p open];
+    Check(p.panelOpen && e.activationPolicy == NSApplicationActivationPolicyRegular,
+          "open promotes before presentation");
+    Check([e.events isEqualToArray:@[@"policy:0", @"activate", @"schedule"]],
+          "activation stays in the explicit open action");
+    Check(e.presentations == 0, "presentation waits until menu tracking ends");
+    [e drain];
+    Check(e.presentations == 1 && e.lastWindow == (NSWindow *)(id)w,
+          "presentation reuses the bound window");
+    Check([p closeWindow:(NSWindow *)(id)w] && !p.panelOpen && e.hides == 1,
+          "close hides without destroying the window");
+    Check(e.activationPolicy == NSApplicationActivationPolicyRegular,
+          "demotion waits for the deferred close");
+    [e drain];
+    Check(e.activationPolicy == NSApplicationActivationPolicyAccessory,
+          "completed close removes regular application identity");
+
+    {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        Check(!p.panelOpen && e.presentations == 0 && e.activationPolicy == 1,
+              "close cancels a queued open");
+        [p open]; [p closeWindow:(NSWindow *)(id)w]; [p open]; [e drain];
+        Check(p.panelOpen && e.presentations == 1 && e.activationPolicy == 0,
+              "latest recovery/open defeats stale close and stale presentation");
+        [p open]; [p open]; [e drain];
+        Check(e.presentations == 2, "repeated opens coalesce to the latest queued presentation");
+        NSUInteger hides = e.hides;
+        [p closeWindow:(NSWindow *)(id)w]; [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        Check(e.hides == hides + 1 && e.activationPolicy == 1,
+              "repeated close is idempotent");
+    }
+    {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        NSUInteger count = e.events.count;
+        w.visible = NO; w.hidden = YES; w.miniaturized = YES;
+        [e drain];
+        Check(p.panelOpen && e.activationPolicy == 0 && e.events.count == count,
+              "visibility/minimization changes do not imply close");
+        w.attachedSheet = YES;
+        Check(![p closeWindow:(NSWindow *)(id)w] && p.panelOpen && e.hides == 0,
+              "attached sheet blocks closing and demotion");
+        w.attachedSheet = NO;
+        NSWindow *other = (NSWindow *)(id)[YMFixtureWindow new];
+        Check(![p closeWindow:other] && ![p closeWindow:nil] && e.hides == 0,
+              "unrelated and nil windows cannot demote the application");
+        [p open]; [e drain];
+        Check(w.visible && !w.hidden && !w.miniaturized && e.lastWindow == (NSWindow *)(id)w,
+              "open delegates restoration to presentation on the original window");
+    }
+    {
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc] initWithWindow:nil environment:e];
+        [p open]; [p closeWindow:nil]; [e drain];
+        Check(!p.panelOpen && e.events.count == 0, "nil-bound presenter is inert");
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        p = [[YMControlPanelPresenter alloc] initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [p invalidate]; [e drain];
+        Check(e.presentations == 0, "termination cancels queued presentation");
+        NSUInteger count = e.events.count;
+        [p open]; Check(![p closeWindow:(NSWindow *)(id)w], "invalidated presenter rejects close");
+        [e drain]; Check(e.events.count == count, "invalidated presenter produces no new effects");
+    }
+    {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        [p closeWindow:(NSWindow *)(id)w]; [p invalidate]; [e drain];
+        Check(e.activationPolicy == 0, "termination also cancels a pending demotion");
+        p = [[YMControlPanelPresenter alloc] initWithWindow:(NSWindow *)(id)w environment:e];
+        NSUInteger presentations = e.presentations;
+        [p open];
+        __weak YMControlPanelPresenter *weakPresenter = p;
+        p = nil;
+        Check(weakPresenter == nil, "deferred work does not retain the presenter through its environment");
+        [e drain];
+        Check(e.presentations == presentations, "queued callback tolerates a released owner");
+    }
+    for (NSInteger scenario = 0; scenario < 4; scenario++) {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        if (scenario == 0) e.activationPolicy = NSApplicationActivationPolicyRegular;
+        if (scenario == 1) e.falseAfterChange = YES;
+        if (scenario == 2) e.rejectedPolicy = NSApplicationActivationPolicyRegular;
+        if (scenario == 3) e.trueWithoutChange = YES;
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        Check(e.presentations == 1, "policy failure does not remove panel access");
+        Check(e.failures == (scenario >= 2 ? 1 : 0), "actual policy, not BOOL return, decides failure");
+        if (scenario == 0) Check(![e.events containsObject:@"policy:0"], "already-regular is not an error");
+    }
+    {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain]; e.rejectedPolicy = NSApplicationActivationPolicyAccessory;
+        [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        Check(!p.panelOpen && !w.visible && e.activationPolicy == 0 && e.failures == 1,
+              "failed demotion leaves a hidden panel and accessible live application");
+        Check(e.pending.count == 0, "failed demotion does not schedule retry polling");
+    }
+
+    Check(NSApp == nil, "lifecycle tests leave NSApp unset");
+}
+
 int main(void) {
     @autoreleasepool {
         // Geometry only: no NSApplication, NSWindow, NSScreen enumeration,
@@ -117,7 +316,10 @@ int main(void) {
             Check(!second.shouldMove && NSEqualRects(second.frame, p.frame),
                 "repeated presentation is geometrically idempotent");
         }
-        printf("PASS: %lu panel geometry assertions; no GUI or display operations\n", (unsigned long)scenarios);
+
+        LifecycleTests();
+        printf("PASS: %lu panel geometry + lifecycle assertions; no GUI or display operations\n",
+               (unsigned long)scenarios);
     }
     return 0;
 }
