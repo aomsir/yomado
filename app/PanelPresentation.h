@@ -30,6 +30,8 @@ FOUNDATION_EXPORT YMPanelPlacement YMControlPanelPlacement(
 - (BOOL)requestActivationPolicy:(NSApplicationActivationPolicy)policy;
 - (void)activateApplication;
 - (void)deferUntilAfterMenuTracking:(dispatch_block_t)block;
+- (void)deferUntilPolicySettles:(dispatch_block_t)block;
+- (BOOL)isWindowVisible:(NSWindow *)window;
 - (BOOL)hasAttachedSheetForWindow:(NSWindow *)window;
 - (void)presentWindow:(NSWindow *)window;
 - (void)hideWindow:(NSWindow *)window;

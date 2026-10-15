@@ -1,5 +1,4 @@
 #import "PanelPresentation.h"
-#import <ApplicationServices/ApplicationServices.h>
 #import <math.h>
 #import <unistd.h>
 
@@ -29,7 +28,10 @@ static void Check(BOOL condition, const char *message) {
 @property NSWindow *lastWindow;
 @property NSMutableArray<NSString *> *events;
 @property NSMutableArray *pending;
+@property NSMutableArray *settling;
+@property NSUInteger settleSchedules;
 - (void)drain;
+- (void)drainSettling;
 @end
 
 @implementation YMFixtureEnvironment
@@ -39,6 +41,7 @@ static void Check(BOOL condition, const char *message) {
         _rejectedPolicy = -1;
         _events = [NSMutableArray array];
         _pending = [NSMutableArray array];
+        _settling = [NSMutableArray array];
     }
     return self;
 }
@@ -54,6 +57,11 @@ static void Check(BOOL condition, const char *message) {
     [self.events addObject:@"schedule"];
     [self.pending addObject:[block copy]];
 }
+- (void)deferUntilPolicySettles:(dispatch_block_t)block {
+    self.settleSchedules++;
+    [self.settling addObject:[block copy]];
+}
+- (BOOL)isWindowVisible:(NSWindow *)window { return ((YMFixtureWindow *)(id)window).visible; }
 - (BOOL)hasAttachedSheetForWindow:(NSWindow *)window {
     return ((YMFixtureWindow *)(id)window).attachedSheet;
 }
@@ -83,157 +91,59 @@ static void Check(BOOL condition, const char *message) {
         block();
     }
 }
+- (void)drainSettling {
+    NSArray *blocks = [self.settling copy];
+    [self.settling removeAllObjects];
+    for (dispatch_block_t block in blocks) block();
+}
 @end
 
-// Private adapter declaration: tests override only system-call boundaries.
-// The public product API does not expose this test seam.
+// Exercise the real Cocoa scheduler with only its clock and menu-mode boundary
+// replaced. No NSApplication, window, timer or process-policy call is created.
 @interface YMCocoaPanelPresentationEnvironment : NSObject <YMPanelPresentationEnvironment>
-- (BOOL)requestAppKitActivationPolicy:(NSApplicationActivationPolicy)policy;
-- (OSStatus)transformCurrentProcessToAccessory;
-- (void)reportAccessoryTransformFailure:(OSStatus)status;
+- (void)scheduleAfterInterval:(NSTimeInterval)interval block:(dispatch_block_t)block;
 @end
 
-@interface YMFixtureCocoaEnvironment : YMCocoaPanelPresentationEnvironment
-@property BOOL appKitAccepted;
-@property OSStatus transformStatus;
-@property NSApplicationActivationPolicy observedPolicy;
-@property NSUInteger policyReads;
-@property NSUInteger transformCalls;
-@property NSUInteger transformFailures;
-@property NSMutableArray<NSString *> *events;
-@property NSMutableArray *pending;
-- (void)drain;
+@interface YMFixtureCocoaScheduler : YMCocoaPanelPresentationEnvironment
+@property NSTimeInterval interval;
+@property NSMutableArray *delays;
+@property NSMutableArray *defaults;
 @end
-
-@implementation YMFixtureCocoaEnvironment
+@implementation YMFixtureCocoaScheduler
 - (instancetype)init {
     if ((self = [super init])) {
-        _events = [NSMutableArray array];
-        _pending = [NSMutableArray array];
-        _observedPolicy = NSApplicationActivationPolicyRegular;
+        _delays = [NSMutableArray array];
+        _defaults = [NSMutableArray array];
     }
     return self;
 }
-- (NSApplicationActivationPolicy)activationPolicy { self.policyReads++; return self.observedPolicy; }
-- (BOOL)requestAppKitActivationPolicy:(NSApplicationActivationPolicy)policy {
-    [self.events addObject:[NSString stringWithFormat:@"appkit:%ld", (long)policy]];
-    if (self.appKitAccepted) self.observedPolicy = policy;
-    return self.appKitAccepted;
+- (void)scheduleAfterInterval:(NSTimeInterval)interval block:(dispatch_block_t)block {
+    self.interval = interval;
+    [self.delays addObject:[block copy]];
 }
-- (OSStatus)transformCurrentProcessToAccessory {
-    self.transformCalls++;
-    [self.events addObject:@"transform"];
-    if (self.transformStatus == noErr) self.observedPolicy = NSApplicationActivationPolicyAccessory;
-    return self.transformStatus;
-}
-- (void)reportAccessoryTransformFailure:(OSStatus)status {
-    self.transformFailures++;
-    [self.events addObject:@"transform-failure"];
-    [super reportAccessoryTransformFailure:status];
-}
-- (void)activateApplication {}
-- (void)deferUntilAfterMenuTracking:(dispatch_block_t)block { [self.pending addObject:[block copy]]; }
-- (BOOL)hasAttachedSheetForWindow:(NSWindow *)window { return ((YMFixtureWindow *)(id)window).attachedSheet; }
-- (void)presentWindow:(NSWindow *)window { ((YMFixtureWindow *)(id)window).visible = YES; }
-- (void)hideWindow:(NSWindow *)window { ((YMFixtureWindow *)(id)window).visible = NO; }
-- (void)reportActivationPolicyFailure:(NSApplicationActivationPolicy)requested actualPolicy:(NSApplicationActivationPolicy)actual {
-    (void)requested; (void)actual;
-}
-- (void)drain {
-    while (self.pending.count) {
-        dispatch_block_t block = self.pending.firstObject;
-        [self.pending removeObjectAtIndex:0];
-        block();
-    }
+- (void)deferUntilAfterMenuTracking:(dispatch_block_t)block {
+    [self.defaults addObject:[block copy]];
 }
 @end
 
-static void CocoaAdapterTests(void) {
-    Check(NSApp == nil, "adapter routing starts without a real application");
-    for (NSNumber *policyNumber in @[@(NSApplicationActivationPolicyRegular), @(NSApplicationActivationPolicyAccessory)]) {
-        NSApplicationActivationPolicy policy = policyNumber.integerValue;
-        for (NSNumber *acceptedNumber in @[@NO, @YES]) {
-            YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
-            e.appKitAccepted = acceptedNumber.boolValue;
-            e.observedPolicy = policy; // Matching observations cannot skip the request or fallback.
-            BOOL result = [e requestActivationPolicy:policy];
-            BOOL needsFallback = policy == NSApplicationActivationPolicyAccessory && !e.appKitAccepted;
-            NSArray *expected = needsFallback ? @[@"appkit:1", @"transform"]
-                : @[[NSString stringWithFormat:@"appkit:%ld", (long)policy]];
-            Check([e.events isEqualToArray:expected], "adapter requests AppKit first and only failed Accessory reaches transform");
-            Check(e.transformCalls == (needsFallback ? 1 : 0), "adapter has at most one bounded transform attempt");
-            Check(result == (e.appKitAccepted || needsFallback), "adapter preserves normal results and returns transform success");
-            Check(e.policyReads == 0 && e.pending.count == 0, "adapter neither gates on cached policy nor schedules retry polling");
-        }
-    }
-    {
-        YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
-        e.observedPolicy = NSApplicationActivationPolicyRegular;
-        Check([e requestActivationPolicy:NSApplicationActivationPolicyAccessory] && e.transformCalls == 1 &&
-              e.observedPolicy == NSApplicationActivationPolicyAccessory, "failed Accessory request also transforms when getter is not the target");
-    }
-    {
-        YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
-        e.observedPolicy = NSApplicationActivationPolicyAccessory;
-        e.transformStatus = -50;
-        FILE *capture = tmpfile();
-        Check(capture != NULL, "create process-local diagnostic capture");
-        fflush(stderr);
-        int savedError = dup(STDERR_FILENO);
-        Check(savedError >= 0, "preserve process-local stderr");
-        Check(dup2(fileno(capture), STDERR_FILENO) >= 0, "capture only this test process stderr");
-        BOOL result = [e requestActivationPolicy:NSApplicationActivationPolicyAccessory];
-        fflush(stderr);
-        int restored = dup2(savedError, STDERR_FILENO);
-        close(savedError);
-        Check(restored >= 0, "restore process-local stderr");
-        rewind(capture);
-        char bytes[256] = {0};
-        size_t count = fread(bytes, 1, sizeof(bytes) - 1, capture);
-        fclose(capture);
-        NSString *diagnostic = [[NSString alloc] initWithBytes:bytes length:count encoding:NSUTF8StringEncoding];
-        Check(!result && e.transformCalls == 1 && e.transformFailures == 1,
-              "transform failure returns false and reports once despite a matching getter");
-        Check([diagnostic isEqualToString:@"Accessory process conversion failed (OSStatus -50).\n"],
-              "production diagnostic preserves the raw transform status without private data");
-        Check(e.pending.count == 0 && e.policyReads == 0, "failed transform does not poll or trust an immediate cached getter");
-    }
-    for (NSUInteger scenario = 0; scenario < 5; scenario++) {
-        YMFixtureWindow *w = [YMFixtureWindow new];
-        YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
-        e.appKitAccepted = YES;
-        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc] initWithWindow:(NSWindow *)(id)w environment:e];
-        [p open]; [e drain];
-        e.appKitAccepted = NO;
-        [e.events removeAllObjects];
-        if (scenario == 0) { [p closeWindow:(NSWindow *)(id)w]; [p open]; }
-        if (scenario == 1) { [p closeWindow:(NSWindow *)(id)w]; [p invalidate]; }
-        if (scenario == 2) { w.attachedSheet = YES; [p closeWindow:(NSWindow *)(id)w]; }
-        if (scenario == 3) { [p closeWindow:(NSWindow *)(id)[YMFixtureWindow new]]; }
-        if (scenario == 4) { [p closeWindow:(NSWindow *)(id)w]; p = nil; }
-        [e drain];
-        Check(e.transformCalls == 0 && ![e.events containsObject:@"appkit:1"],
-              "cancelled or blocked close reaches neither accessory primitive");
-        Check(e.pending.count == 0, "cancelled adapter close leaves no retry work");
-    }
-    {
-        YMFixtureWindow *w = [YMFixtureWindow new];
-        YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
-        e.appKitAccepted = YES;
-        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc] initWithWindow:(NSWindow *)(id)w environment:e];
-        [p open]; [e drain];
-        e.appKitAccepted = NO;
-        [p closeWindow:(NSWindow *)(id)w]; [p closeWindow:(NSWindow *)(id)w];
-        Check(e.transformCalls == 0, "actual adapter fallback waits for the valid deferred close");
-        [e drain]; [e drain];
-        Check(e.transformCalls == 1 && !w.visible && !p.panelOpen && e.pending.count == 0,
-              "repeated close executes one adapter fallback without residual polling");
-        e.appKitAccepted = YES;
-        [p open]; [e drain];
-        Check(e.transformCalls == 1 && e.observedPolicy == NSApplicationActivationPolicyRegular && w.visible,
-              "reopen after fallback returns to the ordinary AppKit path on the same window");
-    }
-    Check(NSApp == nil, "adapter routing leaves NSApp unset and never executes real system primitives");
+static void CocoaSchedulerTests(void) {
+    Check(NSApp == nil, "Cocoa scheduler test starts without a real application");
+    YMFixtureCocoaScheduler *e = [YMFixtureCocoaScheduler new];
+    __block NSUInteger calls = 0;
+    [e deferUntilPolicySettles:^{ calls++; }];
+    Check(e.interval == 1.0 && e.delays.count == 1 && e.defaults.count == 0 && calls == 0,
+          "production scheduler queues one grace period before any retry");
+    dispatch_block_t timer = e.delays.firstObject;
+    [e.delays removeAllObjects];
+    timer();
+    Check(calls == 0 && e.defaults.count == 1,
+          "settled callback still waits for the normal menu-tracking boundary");
+    dispatch_block_t normalMode = e.defaults.firstObject;
+    [e.defaults removeAllObjects];
+    normalMode();
+    Check(calls == 1 && e.delays.count == 0 && e.defaults.count == 0,
+          "production scheduler invokes once with no repeating timer");
+    Check(NSApp == nil, "Cocoa scheduler test never initializes the real application");
 }
 
 // A policy getter can report the requested identity while the process still
@@ -292,10 +202,139 @@ static void StalePolicyTests(void) {
           closeEnvironment.failures == 0, "explicit close repairs effective policy without a false error");
 }
 
+static NSString *CaptureDiagnostic(dispatch_block_t block) {
+    FILE *capture = tmpfile();
+    Check(capture != NULL, "create process-local retry diagnostic capture");
+    fflush(stderr);
+    int savedError = dup(STDERR_FILENO);
+    Check(savedError >= 0, "preserve process-local stderr");
+    Check(dup2(fileno(capture), STDERR_FILENO) >= 0, "capture only this test process stderr");
+    block();
+    fflush(stderr);
+    int restored = dup2(savedError, STDERR_FILENO);
+    close(savedError);
+    Check(restored >= 0, "restore process-local stderr after retry");
+    rewind(capture);
+    char bytes[512] = {0};
+    size_t count = fread(bytes, 1, sizeof(bytes) - 1, capture);
+    fclose(capture);
+    return [[NSString alloc] initWithBytes:bytes length:count encoding:NSUTF8StringEncoding];
+}
+
+static void SettledRetryTests(void) {
+    {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        e.activationPolicy = NSApplicationActivationPolicyAccessory;
+        e.rejectedPolicy = NSApplicationActivationPolicyAccessory;
+        [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        Check(e.settleSchedules == 1 && e.settling.count == 1 && e.failures == 0,
+              "rejected close schedules once even when its transient getter already says Accessory");
+        e.activationPolicy = NSApplicationActivationPolicyRegular;
+        e.rejectedPolicy = -1;
+        [e.events removeAllObjects];
+        NSString *diagnostic = CaptureDiagnostic(^{ [e drainSettling]; });
+        Check([e.events isEqualToArray:@[@"policy:1"]] && e.activationPolicy == 1,
+              "settled retry repairs a later Regular state by submitting one AppKit request");
+        Check(!w.visible && !p.panelOpen && e.settleSchedules == 1 && e.settling.count == 0,
+              "successful retry leaves the panel hidden and no remaining retry work");
+        NSRegularExpression *format = [NSRegularExpression regularExpressionWithPattern:
+            @"^Control panel Accessory retry at [0-9]+\\.[0-9]{6}: accepted=1 actual=1\\.\\n$"
+            options:0 error:NULL];
+        Check([format numberOfMatchesInString:diagnostic options:0 range:NSMakeRange(0, diagnostic.length)] == 1,
+              "retry log has only monotonic time, accepted flag and actual policy");
+    }
+    for (NSUInteger scenario = 0; scenario < 3; scenario++) {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        e.falseAfterChange = scenario == 1;
+        e.trueWithoutChange = scenario == 2;
+        [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        Check(e.settleSchedules == (scenario == 0 ? 0 : 1),
+              "retry needs rejection or observed mismatch; a successful target transition schedules none");
+        [p invalidate]; [e drainSettling];
+    }
+    for (NSUInteger scenario = 0; scenario < 6; scenario++) {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        e.rejectedPolicy = NSApplicationActivationPolicyAccessory;
+        [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        Check(e.settling.count == 1, "cancellation scenario starts with one pending settled retry");
+        if (scenario == 0) { [p open]; [e drain]; }
+        if (scenario == 1) [p invalidate];
+        if (scenario == 2) {
+            __weak YMControlPanelPresenter *weakPresenter = p;
+            p = nil;
+            Check(weakPresenter == nil, "settled retry does not retain its presenter");
+        }
+        if (scenario == 3) w.attachedSheet = YES;
+        if (scenario == 4) w.visible = YES;
+        if (scenario == 5) [p setValue:(NSWindow *)(id)[YMFixtureWindow new] forKey:@"window"];
+        NSUInteger events = e.events.count;
+        NSString *diagnostic = CaptureDiagnostic(^{ [e drainSettling]; });
+        Check(e.events.count == events && diagnostic.length == 0 && e.settling.count == 0,
+              "open, invalidation, release, new sheet, visible panel or different bound window cancels late retry");
+    }
+    {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        e.rejectedPolicy = NSApplicationActivationPolicyAccessory;
+        [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        [p open]; [e drain];
+        [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        Check(e.settling.count == 2, "close-open-close creates retries belonging to two distinct generations");
+        NSUInteger events = e.events.count;
+        dispatch_block_t stale = e.settling.firstObject;
+        [e.settling removeObjectAtIndex:0];
+        NSString *cancelledLog = CaptureDiagnostic(stale);
+        Check(e.events.count == events && cancelledLog.length == 0,
+              "older close retry cannot write even while the latest generation is closed");
+        e.rejectedPolicy = -1;
+        (void)CaptureDiagnostic(^{ [e drainSettling]; });
+        Check(e.events.count == events + 1 && e.activationPolicy == 1 && e.settling.count == 0,
+              "only the latest close generation can issue its one settled request");
+    }
+    {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureEnvironment *e = [YMFixtureEnvironment new];
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc]
+            initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        e.rejectedPolicy = NSApplicationActivationPolicyAccessory;
+        [p closeWindow:(NSWindow *)(id)w]; [p closeWindow:(NSWindow *)(id)w]; [e drain];
+        NSString *diagnostic = CaptureDiagnostic(^{ [e drainSettling]; });
+        Check([diagnostic containsString:@"accepted=0 actual=0."] && e.failures == 2,
+              "failed retry reports its rejected request and observed state");
+        Check(e.settleSchedules == 1 && e.settling.count == 0 && e.pending.count == 0,
+              "a second failure and repeated close never create recursive retry polling");
+        NSUInteger events = e.events.count;
+        [e drain]; [e drainSettling];
+        Check(e.events.count == events, "no delayed policy changes survive the single failed retry");
+        e.rejectedPolicy = -1;
+        [p open]; [e drain];
+        Check(p.panelOpen && w.visible && e.activationPolicy == 0,
+              "manual reopening remains usable after the bounded retry fails");
+    }
+    Check(NSApp == nil, "settled retries never initialize NSApplication or touch real windows");
+}
+
 static void LifecycleTests(void) {
     Check(NSApp == nil, "lifecycle tests start without NSApp");
-    CocoaAdapterTests();
+    CocoaSchedulerTests();
     StalePolicyTests();
+    SettledRetryTests();
 
     YMFixtureWindow *w = [YMFixtureWindow new];
     YMFixtureEnvironment *e = [YMFixtureEnvironment new];

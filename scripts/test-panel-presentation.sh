@@ -16,5 +16,5 @@ ym_panel_sdk="$(DEVELOPER_DIR="$ym_panel_developer" /usr/bin/xcrun --sdk macosx 
   -I "$ym_panel_root/app" -I "$ym_panel_root/bridge" \
   "$ym_panel_root/tests/PanelPresentationTests.m" \
   "$ym_panel_root/app/PanelPresentation.m" "$ym_panel_root/bridge/VDVirtualDisplay.m" \
-  -framework AppKit -framework CoreGraphics -framework ApplicationServices -o "$ym_panel_stage/PanelPresentationTests"
+  -framework AppKit -framework CoreGraphics -o "$ym_panel_stage/PanelPresentationTests"
 "$ym_panel_stage/PanelPresentationTests"

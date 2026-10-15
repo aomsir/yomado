@@ -1,6 +1,5 @@
 #import "PanelPresentation.h"
 #import "VDVirtualDisplay.h"
-#import <ApplicationServices/ApplicationServices.h>
 #import <dispatch/dispatch.h>
 #import <math.h>
 
@@ -113,32 +112,13 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
 }
 
 @interface YMCocoaPanelPresentationEnvironment : NSObject <YMPanelPresentationEnvironment>
-- (BOOL)requestAppKitActivationPolicy:(NSApplicationActivationPolicy)policy;
-- (OSStatus)transformCurrentProcessToAccessory;
-- (void)reportAccessoryTransformFailure:(OSStatus)status;
+- (void)scheduleAfterInterval:(NSTimeInterval)interval block:(dispatch_block_t)block;
 @end
 
 @implementation YMCocoaPanelPresentationEnvironment
 - (NSApplicationActivationPolicy)activationPolicy { return NSApp.activationPolicy; }
 - (BOOL)requestActivationPolicy:(NSApplicationActivationPolicy)policy {
-    BOOL accepted = [self requestAppKitActivationPolicy:policy];
-    if (accepted || policy != NSApplicationActivationPolicyAccessory) return accepted;
-    // AppKit can decline a close while transiently reporting Accessory. Submit
-    // that explicit transition once to the process API, without a getter gate.
-    OSStatus status = [self transformCurrentProcessToAccessory];
-    if (status != noErr) [self reportAccessoryTransformFailure:status];
-    else fprintf(stderr, "Accessory process conversion completed.\n");
-    return status == noErr;
-}
-- (BOOL)requestAppKitActivationPolicy:(NSApplicationActivationPolicy)policy {
     return [NSApp setActivationPolicy:policy];
-}
-- (OSStatus)transformCurrentProcessToAccessory {
-    ProcessSerialNumber current = {0, kCurrentProcess};
-    return TransformProcessType(&current, kProcessTransformToUIElementApplication);
-}
-- (void)reportAccessoryTransformFailure:(OSStatus)status {
-    fprintf(stderr, "Accessory process conversion failed (OSStatus %d).\n", (int)status);
 }
 - (void)activateApplication { [NSApp activate]; }
 - (void)deferUntilAfterMenuTracking:(dispatch_block_t)block {
@@ -146,6 +126,17 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
         [NSRunLoop.mainRunLoop performInModes:@[NSDefaultRunLoopMode] block:block];
     });
 }
+- (void)scheduleAfterInterval:(NSTimeInterval)interval block:(dispatch_block_t)block {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(interval * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), block);
+}
+- (void)deferUntilPolicySettles:(dispatch_block_t)block {
+    // This is a single grace period, not a guarantee about macOS timing.
+    [self scheduleAfterInterval:1.0 block:^{
+        [self deferUntilAfterMenuTracking:block];
+    }];
+}
+- (BOOL)isWindowVisible:(NSWindow *)window { return window.visible; }
 - (BOOL)hasAttachedSheetForWindow:(NSWindow *)window { return window.attachedSheet != nil; }
 - (void)presentWindow:(NSWindow *)window { YMPresentControlPanelOnMainThread(window); }
 - (void)hideWindow:(NSWindow *)window { [window orderOut:nil]; }
@@ -176,14 +167,22 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
     }
     return self;
 }
-- (void)ensurePolicy:(NSApplicationActivationPolicy)requested {
+- (BOOL)ensurePolicy:(NSApplicationActivationPolicy)requested {
+    return [self ensurePolicy:requested logRetry:NO];
+}
+- (BOOL)ensurePolicy:(NSApplicationActivationPolicy)requested logRetry:(BOOL)logRetry {
     // Submit explicit lifecycle transitions even when the getter already
     // reports the target; that observation can precede the effective change.
-    (void)[self.environment requestActivationPolicy:requested];
+    BOOL accepted = [self.environment requestActivationPolicy:requested];
     NSApplicationActivationPolicy actual = self.environment.activationPolicy;
     if (actual != requested) {
         [self.environment reportActivationPolicyFailure:requested actualPolicy:actual];
     }
+    if (logRetry) {
+        fprintf(stderr, "Control panel Accessory retry at %.6f: accepted=%d actual=%ld.\n",
+                NSProcessInfo.processInfo.systemUptime, accepted, (long)actual);
+    }
+    return accepted && actual == requested;
 }
 - (void)open {
     NSCAssert(NSThread.isMainThread, @"Panel lifecycle requires the main thread.");
@@ -200,6 +199,12 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
         [strongSelf.environment presentWindow:strongSelf.window];
     }];
 }
+- (BOOL)canCompleteClose:(NSUInteger)generation window:(NSWindow *)window {
+    return !self.invalidated && window && self.window == window
+        && self.generation == generation && !self.panelOpen
+        && ![self.environment isWindowVisible:window]
+        && ![self.environment hasAttachedSheetForWindow:window];
+}
 - (BOOL)closeWindow:(NSWindow *)window {
     NSCAssert(NSThread.isMainThread, @"Panel lifecycle requires the main thread.");
     if (self.invalidated || !window || window != self.window ||
@@ -209,11 +214,20 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
     NSUInteger generation = ++self.generation;
     [self.environment hideWindow:window];
     __weak YMControlPanelPresenter *weakSelf = self;
+    __weak NSWindow *weakWindow = window;
     [self.environment deferUntilAfterMenuTracking:^{
         YMControlPanelPresenter *strongSelf = weakSelf;
-        if (!strongSelf || strongSelf.invalidated ||
-            strongSelf.generation != generation || strongSelf.panelOpen) return;
-        [strongSelf ensurePolicy:NSApplicationActivationPolicyAccessory];
+        NSWindow *closedWindow = weakWindow;
+        if (!strongSelf || ![strongSelf canCompleteClose:generation window:closedWindow]) return;
+        if ([strongSelf ensurePolicy:NSApplicationActivationPolicyAccessory]) return;
+        // A rejected request can transiently report Accessory before returning
+        // to Regular. Retry this explicit close once after the grace period.
+        [strongSelf.environment deferUntilPolicySettles:^{
+            YMControlPanelPresenter *retrySelf = weakSelf;
+            NSWindow *retryWindow = weakWindow;
+            if (!retrySelf || ![retrySelf canCompleteClose:generation window:retryWindow]) return;
+            [retrySelf ensurePolicy:NSApplicationActivationPolicyAccessory logRetry:YES];
+        }];
     }];
     return YES;
 }
