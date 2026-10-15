@@ -47,10 +47,4 @@ FOUNDATION_EXPORT YMPanelPlacement YMControlPanelPlacement(
 - (void)invalidate;
 @end
 
-// Explicit open/reopen only; never call from inventory refresh or a timer.
-// Requests activation immediately on the main thread, then queues presentation
-// after menu tracking. Only the passed panel is repositioned; no displays or
-// other applications are changed.
-FOUNDATION_EXPORT void YMPresentControlPanel(NSWindow * _Nullable window);
-
 NS_ASSUME_NONNULL_END

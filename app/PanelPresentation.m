@@ -202,18 +202,3 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
     ++self.generation;
 }
 @end
-
-void YMPresentControlPanel(NSWindow *window) {
-    if (!window) return;
-    // Request activation while handling the explicit open action. Deferring
-    // this first request can leave the panel behind another app's full-screen
-    // Space when automatic Space switching is disabled.
-    if (NSThread.isMainThread) [NSApp activate];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // A dispatched block can run inside a nested AppKit menu loop. Default
-        // mode postpones presentation until tracking has actually finished.
-        [NSRunLoop.mainRunLoop performInModes:@[NSDefaultRunLoopMode] block:^{
-            YMPresentControlPanelOnMainThread(window);
-        }];
-    });
-}

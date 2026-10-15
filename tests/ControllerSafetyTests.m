@@ -76,6 +76,7 @@
 @property NSUInteger showCalls;
 @property NSUInteger resumedTerminations;
 @property BOOL deferTopologyOperations;
+@property BOOL useRealPanelPresentation;
 @property NSMutableArray<NSDictionary *> *pendingTopologyOperations;
 - (void)runNextTopologyOperation;
 @end
@@ -101,7 +102,10 @@
 - (void)reportTopologyError:(NSError *)error { (void)error; self.reports++; }
 - (void)powerAssertions:(BOOL)on { self.systemAssertion = self.displayAssertion = on && !self.powerFails ? 1 : 0; }
 - (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID { (void)displayID; return YES; }
-- (void)showWindow:(id)sender { (void)sender; self.showCalls++; }
+- (void)showWindow:(id)sender {
+    self.showCalls++;
+    if (self.useRealPanelPresentation) [super showWindow:sender];
+}
 - (void)resumeTerminationAfterTopologyRecovery:(BOOL)recovered {
     if (self.terminationAfterTopologyRecovery && recovered) self.resumedTerminations++;
     self.terminationAfterTopologyRecovery=NO;
@@ -124,6 +128,35 @@
         }];
     }
 }
+@end
+
+@interface YMSpyPanelPresenter : NSObject
+@property NSUInteger opens;
+@property NSUInteger closes;
+@property NSUInteger invalidations;
+@property BOOL acceptClose;
+@property NSWindow *lastClosedWindow;
+@end
+@implementation YMSpyPanelPresenter
+- (void)open { self.opens++; }
+- (BOOL)closeWindow:(NSWindow *)window {
+    self.closes++; self.lastClosedWindow = window; return self.acceptClose;
+}
+- (void)invalidate { self.invalidations++; }
+@end
+
+@interface YMSpyPanelWindow : NSObject
+@property NSUInteger ordersOut;
+@end
+@implementation YMSpyPanelWindow
+- (void)orderOut:(id)sender { (void)sender; self.ordersOut++; }
+@end
+
+@interface YMSpyHeartbeat : NSObject
+@property NSUInteger invalidations;
+@end
+@implementation YMSpyHeartbeat
+- (void)invalidate { self.invalidations++; }
 @end
 
 static NSUInteger Tests, Failures;
@@ -267,6 +300,67 @@ int main(void) {
         [c runNextTopologyOperation];
         Expect(c.resumedTerminations==2&&c.pendingTopologyOperations.count==0,"second verified removal schedules final termination exactly once");
         Expect([c applicationShouldTerminate:unusedSender]==NSTerminateNow,"multi-output quit completes only after both restorations");
+
+        YMFakeController *panelController = [YMFakeController new];
+        YMSpyPanelWindow *panel = [YMSpyPanelWindow new];
+        panelController.window = (NSWindow *)(id)panel;
+        [panelController preparePanelPresenter];
+        Expect(panelController.panelPresenter != nil && NSApp == nil,
+               "binding creates no application or window");
+        YMSpyPanelPresenter *spy = [YMSpyPanelPresenter new];
+        spy.acceptClose = YES;
+        panelController.panelPresenter = (YMControlPanelPresenter *)(id)spy;
+        panelController.useRealPanelPresentation = YES;
+        YMSpyHeartbeat *heartbeat = [YMSpyHeartbeat new];
+        panelController.heartbeatTimer = (NSTimer *)(id)heartbeat;
+        [panelController showWindow:nil];
+        Expect(spy.opens == 1, "showWindow uses the retained presenter");
+        Expect(![panelController applicationShouldHandleReopen:(NSApplication *)(id)[NSObject new] hasVisibleWindows:NO] && spy.opens == 2,
+               "application reopen uses the same presenter");
+        Expect(![panelController windowShouldClose:panelController.window] && spy.closes == 1,
+               "panel close is delegated but never destroys the NSWindow");
+        Expect(spy.lastClosedWindow == panelController.window && panel.ordersOut == 0,
+               "controller does not bypass the presenter's sheet and identity guard");
+        Expect(heartbeat.invalidations == 0 && panelController.stopCalls == 0,
+               "closing panel neither invalidates heartbeat nor stops workspaces");
+        spy.acceptClose = NO;
+        Expect(![panelController windowShouldClose:panelController.window] && panel.ordersOut == 0,
+               "refused close leaves the panel untouched");
+        YMSpyPanelWindow *other = [YMSpyPanelWindow new];
+        NSUInteger closes = spy.closes;
+        [panelController windowShouldClose:(NSWindow *)(id)other];
+        Expect(spy.closes == closes && other.ordersOut == 1,
+               "other-window close preserves old hide behavior without application demotion");
+        panelController.previewMode = YES;
+        NSUInteger opens = spy.opens;
+        [panelController showWindow:nil];
+        Expect(spy.opens == opens, "preview cannot activate the interactive presenter");
+        [panelController preparePanelPresenter];
+        Expect(!panelController.panelPresenter && spy.invalidations == 1,
+               "preview binding drops the interactive presenter");
+        panelController.previewMode = NO;
+        panelController.panelPresenter = (YMControlPanelPresenter *)(id)spy;
+        [panelController applicationWillTerminate:(NSNotification *)(id)[NSObject new]];
+        Expect(spy.invalidations == 2 && heartbeat.invalidations == 1,
+               "actual termination invalidates lifecycle before cleanup completes");
+
+        c = Controller(&t, &d, &p, &s);
+        YMSpyPanelPresenter *recoverySpy = [YMSpyPanelPresenter new];
+        recoverySpy.acceptClose = YES;
+        c.window = (NSWindow *)(id)[YMSpyPanelWindow new];
+        c.panelPresenter = (YMControlPanelPresenter *)(id)recoverySpy;
+        c.useRealPanelPresentation = YES;
+        [c windowShouldClose:c.window];
+        Expect(s.display.isCreated && [(YMFakeDisplay *)s.display destroys] == 0 && c.stopCalls == 0,
+               "closing panel preserves an existing virtual display object");
+        c.displayProfiles = [NSMutableArray arrayWithObject:s];
+        c.selectedProfile = s; c.virtualDisplay = s.display;
+        c.simulateFinalRemovalRecoveryFailure = YES; t.restoreResult = NO;
+        Expect([c applicationShouldTerminate:unusedSender] == NSTerminateCancel,
+               "existing topology failure still cancels quit");
+        Expect(recoverySpy.opens == 1,
+               "safety recovery can reopen a previously closed panel through the actual showWindow path");
+
         Expect(NSApp == nil,"all controller tests leave NSApplication uninitialized");
         printf("Controller boundary tests: %lu passed, %lu failed; no GUI or display calls executed.\n",(unsigned long)(Tests-Failures),(unsigned long)Failures);
         return Failures?1:0;

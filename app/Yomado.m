@@ -189,8 +189,10 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property IOPMAssertionID displayAssertion;
 @property EventHotKeyRef hotkey;
 @property EventHandlerRef keyHandler;
+@property(strong) YMControlPanelPresenter *panelPresenter;
 - (void)restore:(id)sender;
 - (void)buildWindow;
+- (void)preparePanelPresenter;
 - (void)updateInventory;
 @end
 
@@ -799,6 +801,7 @@ static NSView *YMSpacer(void) {
     // Status messages are retained for recovery diagnostics, not permanent UI.
     self.statusLabel = Label(@"", 12, NSFontWeightRegular);
     self.detailLabel = Label(@"", 11, NSFontWeightRegular);
+    [self preparePanelPresenter];
 }
 - (void)displayParametersChanged:(NSNotification *)notification {
     (void)notification;
@@ -1014,10 +1017,15 @@ static NSView *YMSpacer(void) {
     if (self.previewMode) return;
     [self dropApplication:@{@"bundleIdentifier":@"com.tencent.xinWeChat", @"sourceDisplayID":@(self.wechatDisplayID)} targetDisplayID:0];
 }
+- (void)preparePanelPresenter {
+    [self.panelPresenter invalidate];
+    self.panelPresenter = (!self.previewMode && self.window)
+        ? [[YMControlPanelPresenter alloc] initWithWindow:self.window] : nil;
+}
 - (void)showWindow:(id)sender {
     (void)sender;
     if (self.previewMode) return;
-    YMPresentControlPanel(self.window);
+    [self.panelPresenter open];
 }
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)application hasVisibleWindows:(BOOL)hasVisibleWindows {
     (void)application;
@@ -1025,7 +1033,14 @@ static NSView *YMSpacer(void) {
     [self showWindow:nil];
     return NO;
 }
-- (BOOL)windowShouldClose:(NSWindow *)window { [window orderOut:nil]; return NO; }
+- (BOOL)windowShouldClose:(NSWindow *)window {
+    if (window == self.window && !self.previewMode) {
+        [self.panelPresenter closeWindow:window];
+        return NO;
+    }
+    [window orderOut:nil];
+    return NO;
+}
 - (void)updateInventory {
     if (self.updatingInventory) return;
     self.updatingInventory = YES;
@@ -1505,6 +1520,7 @@ static NSView *YMSpacer(void) {
 - (void)applicationWillTerminate:(NSNotification *)notification {
     if (self.previewMode) return;
     (void)notification;
+    [self.panelPresenter invalidate];
     [NSNotificationCenter.defaultCenter removeObserver:self];
     [self.heartbeatTimer invalidate];
     if (self.hotkey) UnregisterEventHotKey(self.hotkey);
@@ -1773,7 +1789,7 @@ int main(int argc, const char *argv[]) {
         [NSApplication sharedApplication];
         // The interactive app needs a regular identity for independent Stage
         // Manager grouping. Keep LSUIElement for the noninteractive modes above;
-        // the normal app shows both its Dock icon and the existing status item.
+        // panel open/close then manages Dock presence for the normal app.
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         ADController *controller = [[ADController alloc] init];
         NSApp.delegate = controller;
