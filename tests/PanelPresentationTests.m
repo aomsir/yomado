@@ -83,8 +83,65 @@ static void Check(BOOL condition, const char *message) {
 }
 @end
 
+// A policy getter can report the requested identity while the process still
+// needs an explicit policy request. Keep observation and effective state apart.
+@interface YMStalePolicyEnvironment : YMFixtureEnvironment
+@property BOOL overrideObservedPolicy;
+@property NSApplicationActivationPolicy reportedPolicy;
+@property(nonatomic, readonly) NSApplicationActivationPolicy effectivePolicy;
+@end
+
+@implementation YMStalePolicyEnvironment
+- (NSApplicationActivationPolicy)activationPolicy {
+    return self.overrideObservedPolicy ? self.reportedPolicy : [super activationPolicy];
+}
+- (NSApplicationActivationPolicy)effectivePolicy { return [super activationPolicy]; }
+@end
+
+static void StalePolicyTests(void) {
+    YMFixtureWindow *openWindow = [YMFixtureWindow new];
+    YMStalePolicyEnvironment *openEnvironment = [YMStalePolicyEnvironment new];
+    openEnvironment.overrideObservedPolicy = YES;
+    openEnvironment.reportedPolicy = NSApplicationActivationPolicyRegular;
+    YMControlPanelPresenter *openPresenter = [[YMControlPanelPresenter alloc]
+        initWithWindow:(NSWindow *)(id)openWindow environment:openEnvironment];
+    Check(openEnvironment.activationPolicy == NSApplicationActivationPolicyRegular &&
+          openEnvironment.effectivePolicy == NSApplicationActivationPolicyAccessory,
+          "open fixture separates reported and effective policy");
+    [openPresenter open]; [openEnvironment drain];
+    BOOL submittedOpen = [openEnvironment.events isEqualToArray:
+        @[@"policy:0", @"activate", @"schedule", @"present"]];
+
+    YMFixtureWindow *closeWindow = [YMFixtureWindow new];
+    YMStalePolicyEnvironment *closeEnvironment = [YMStalePolicyEnvironment new];
+    YMControlPanelPresenter *closePresenter = [[YMControlPanelPresenter alloc]
+        initWithWindow:(NSWindow *)(id)closeWindow environment:closeEnvironment];
+    [closePresenter open]; [closeEnvironment drain];
+    [closeEnvironment.events removeAllObjects];
+    closeEnvironment.overrideObservedPolicy = YES;
+    closeEnvironment.reportedPolicy = NSApplicationActivationPolicyAccessory;
+    Check(closeEnvironment.activationPolicy == NSApplicationActivationPolicyAccessory &&
+          closeEnvironment.effectivePolicy == NSApplicationActivationPolicyRegular,
+          "close fixture separates reported and effective policy");
+    [closePresenter closeWindow:(NSWindow *)(id)closeWindow];
+    Check(closeEnvironment.effectivePolicy == NSApplicationActivationPolicyRegular,
+          "stale policy does not bypass deferred-close timing");
+    [closeEnvironment drain];
+    BOOL submittedClose = [closeEnvironment.events isEqualToArray:@[@"hide", @"schedule", @"policy:1"]];
+    if (!submittedOpen || !submittedClose) {
+        fprintf(stderr, "Stale-policy requests: open=%d close=%d\n", submittedOpen, submittedClose);
+    }
+    Check(submittedOpen, "explicit open requests Regular despite a matching stale getter");
+    Check(openEnvironment.effectivePolicy == NSApplicationActivationPolicyRegular &&
+          openEnvironment.failures == 0, "explicit open repairs effective policy without a false error");
+    Check(submittedClose, "valid deferred close requests Accessory despite a matching stale getter");
+    Check(closeEnvironment.effectivePolicy == NSApplicationActivationPolicyAccessory &&
+          closeEnvironment.failures == 0, "explicit close repairs effective policy without a false error");
+}
+
 static void LifecycleTests(void) {
     Check(NSApp == nil, "lifecycle tests start without NSApp");
+    StalePolicyTests();
 
     YMFixtureWindow *w = [YMFixtureWindow new];
     YMFixtureEnvironment *e = [YMFixtureEnvironment new];
@@ -189,7 +246,8 @@ static void LifecycleTests(void) {
         [p open]; [e drain];
         Check(e.presentations == 1, "policy failure does not remove panel access");
         Check(e.failures == (scenario >= 2 ? 1 : 0), "actual policy, not BOOL return, decides failure");
-        if (scenario == 0) Check(![e.events containsObject:@"policy:0"], "already-regular is not an error");
+        if (scenario == 0) Check([e.events containsObject:@"policy:0"],
+                                "already-regular still submits the explicit open request without an error");
     }
     {
         YMFixtureWindow *w = [YMFixtureWindow new];

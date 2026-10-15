@@ -156,7 +156,8 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
     return self;
 }
 - (void)ensurePolicy:(NSApplicationActivationPolicy)requested {
-    if (self.environment.activationPolicy == requested) return;
+    // Submit explicit lifecycle transitions even when the getter already
+    // reports the target; that observation can precede the effective change.
     (void)[self.environment requestActivationPolicy:requested];
     NSApplicationActivationPolicy actual = self.environment.activationPolicy;
     if (actual != requested) {
