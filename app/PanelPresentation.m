@@ -1,5 +1,6 @@
 #import "PanelPresentation.h"
 #import "VDVirtualDisplay.h"
+#import <ApplicationServices/ApplicationServices.h>
 #import <dispatch/dispatch.h>
 #import <math.h>
 
@@ -112,12 +113,32 @@ static void YMPresentControlPanelOnMainThread(NSWindow *window) {
 }
 
 @interface YMCocoaPanelPresentationEnvironment : NSObject <YMPanelPresentationEnvironment>
+- (BOOL)requestAppKitActivationPolicy:(NSApplicationActivationPolicy)policy;
+- (OSStatus)transformCurrentProcessToAccessory;
+- (void)reportAccessoryTransformFailure:(OSStatus)status;
 @end
 
 @implementation YMCocoaPanelPresentationEnvironment
 - (NSApplicationActivationPolicy)activationPolicy { return NSApp.activationPolicy; }
 - (BOOL)requestActivationPolicy:(NSApplicationActivationPolicy)policy {
+    BOOL accepted = [self requestAppKitActivationPolicy:policy];
+    if (accepted || policy != NSApplicationActivationPolicyAccessory) return accepted;
+    // AppKit can decline a close while transiently reporting Accessory. Submit
+    // that explicit transition once to the process API, without a getter gate.
+    OSStatus status = [self transformCurrentProcessToAccessory];
+    if (status != noErr) [self reportAccessoryTransformFailure:status];
+    else fprintf(stderr, "Accessory process conversion completed.\n");
+    return status == noErr;
+}
+- (BOOL)requestAppKitActivationPolicy:(NSApplicationActivationPolicy)policy {
     return [NSApp setActivationPolicy:policy];
+}
+- (OSStatus)transformCurrentProcessToAccessory {
+    ProcessSerialNumber current = {0, kCurrentProcess};
+    return TransformProcessType(&current, kProcessTransformToUIElementApplication);
+}
+- (void)reportAccessoryTransformFailure:(OSStatus)status {
+    fprintf(stderr, "Accessory process conversion failed (OSStatus %d).\n", (int)status);
 }
 - (void)activateApplication { [NSApp activate]; }
 - (void)deferUntilAfterMenuTracking:(dispatch_block_t)block {

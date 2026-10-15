@@ -1,5 +1,7 @@
 #import "PanelPresentation.h"
+#import <ApplicationServices/ApplicationServices.h>
 #import <math.h>
+#import <unistd.h>
 
 static NSUInteger scenarios;
 static void Check(BOOL condition, const char *message) {
@@ -83,6 +85,157 @@ static void Check(BOOL condition, const char *message) {
 }
 @end
 
+// Private adapter declaration: tests override only system-call boundaries.
+// The public product API does not expose this test seam.
+@interface YMCocoaPanelPresentationEnvironment : NSObject <YMPanelPresentationEnvironment>
+- (BOOL)requestAppKitActivationPolicy:(NSApplicationActivationPolicy)policy;
+- (OSStatus)transformCurrentProcessToAccessory;
+- (void)reportAccessoryTransformFailure:(OSStatus)status;
+@end
+
+@interface YMFixtureCocoaEnvironment : YMCocoaPanelPresentationEnvironment
+@property BOOL appKitAccepted;
+@property OSStatus transformStatus;
+@property NSApplicationActivationPolicy observedPolicy;
+@property NSUInteger policyReads;
+@property NSUInteger transformCalls;
+@property NSUInteger transformFailures;
+@property NSMutableArray<NSString *> *events;
+@property NSMutableArray *pending;
+- (void)drain;
+@end
+
+@implementation YMFixtureCocoaEnvironment
+- (instancetype)init {
+    if ((self = [super init])) {
+        _events = [NSMutableArray array];
+        _pending = [NSMutableArray array];
+        _observedPolicy = NSApplicationActivationPolicyRegular;
+    }
+    return self;
+}
+- (NSApplicationActivationPolicy)activationPolicy { self.policyReads++; return self.observedPolicy; }
+- (BOOL)requestAppKitActivationPolicy:(NSApplicationActivationPolicy)policy {
+    [self.events addObject:[NSString stringWithFormat:@"appkit:%ld", (long)policy]];
+    if (self.appKitAccepted) self.observedPolicy = policy;
+    return self.appKitAccepted;
+}
+- (OSStatus)transformCurrentProcessToAccessory {
+    self.transformCalls++;
+    [self.events addObject:@"transform"];
+    if (self.transformStatus == noErr) self.observedPolicy = NSApplicationActivationPolicyAccessory;
+    return self.transformStatus;
+}
+- (void)reportAccessoryTransformFailure:(OSStatus)status {
+    self.transformFailures++;
+    [self.events addObject:@"transform-failure"];
+    [super reportAccessoryTransformFailure:status];
+}
+- (void)activateApplication {}
+- (void)deferUntilAfterMenuTracking:(dispatch_block_t)block { [self.pending addObject:[block copy]]; }
+- (BOOL)hasAttachedSheetForWindow:(NSWindow *)window { return ((YMFixtureWindow *)(id)window).attachedSheet; }
+- (void)presentWindow:(NSWindow *)window { ((YMFixtureWindow *)(id)window).visible = YES; }
+- (void)hideWindow:(NSWindow *)window { ((YMFixtureWindow *)(id)window).visible = NO; }
+- (void)reportActivationPolicyFailure:(NSApplicationActivationPolicy)requested actualPolicy:(NSApplicationActivationPolicy)actual {
+    (void)requested; (void)actual;
+}
+- (void)drain {
+    while (self.pending.count) {
+        dispatch_block_t block = self.pending.firstObject;
+        [self.pending removeObjectAtIndex:0];
+        block();
+    }
+}
+@end
+
+static void CocoaAdapterTests(void) {
+    Check(NSApp == nil, "adapter routing starts without a real application");
+    for (NSNumber *policyNumber in @[@(NSApplicationActivationPolicyRegular), @(NSApplicationActivationPolicyAccessory)]) {
+        NSApplicationActivationPolicy policy = policyNumber.integerValue;
+        for (NSNumber *acceptedNumber in @[@NO, @YES]) {
+            YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
+            e.appKitAccepted = acceptedNumber.boolValue;
+            e.observedPolicy = policy; // Matching observations cannot skip the request or fallback.
+            BOOL result = [e requestActivationPolicy:policy];
+            BOOL needsFallback = policy == NSApplicationActivationPolicyAccessory && !e.appKitAccepted;
+            NSArray *expected = needsFallback ? @[@"appkit:1", @"transform"]
+                : @[[NSString stringWithFormat:@"appkit:%ld", (long)policy]];
+            Check([e.events isEqualToArray:expected], "adapter requests AppKit first and only failed Accessory reaches transform");
+            Check(e.transformCalls == (needsFallback ? 1 : 0), "adapter has at most one bounded transform attempt");
+            Check(result == (e.appKitAccepted || needsFallback), "adapter preserves normal results and returns transform success");
+            Check(e.policyReads == 0 && e.pending.count == 0, "adapter neither gates on cached policy nor schedules retry polling");
+        }
+    }
+    {
+        YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
+        e.observedPolicy = NSApplicationActivationPolicyRegular;
+        Check([e requestActivationPolicy:NSApplicationActivationPolicyAccessory] && e.transformCalls == 1 &&
+              e.observedPolicy == NSApplicationActivationPolicyAccessory, "failed Accessory request also transforms when getter is not the target");
+    }
+    {
+        YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
+        e.observedPolicy = NSApplicationActivationPolicyAccessory;
+        e.transformStatus = -50;
+        FILE *capture = tmpfile();
+        Check(capture != NULL, "create process-local diagnostic capture");
+        fflush(stderr);
+        int savedError = dup(STDERR_FILENO);
+        Check(savedError >= 0, "preserve process-local stderr");
+        Check(dup2(fileno(capture), STDERR_FILENO) >= 0, "capture only this test process stderr");
+        BOOL result = [e requestActivationPolicy:NSApplicationActivationPolicyAccessory];
+        fflush(stderr);
+        int restored = dup2(savedError, STDERR_FILENO);
+        close(savedError);
+        Check(restored >= 0, "restore process-local stderr");
+        rewind(capture);
+        char bytes[256] = {0};
+        size_t count = fread(bytes, 1, sizeof(bytes) - 1, capture);
+        fclose(capture);
+        NSString *diagnostic = [[NSString alloc] initWithBytes:bytes length:count encoding:NSUTF8StringEncoding];
+        Check(!result && e.transformCalls == 1 && e.transformFailures == 1,
+              "transform failure returns false and reports once despite a matching getter");
+        Check([diagnostic isEqualToString:@"Accessory process conversion failed (OSStatus -50).\n"],
+              "production diagnostic preserves the raw transform status without private data");
+        Check(e.pending.count == 0 && e.policyReads == 0, "failed transform does not poll or trust an immediate cached getter");
+    }
+    for (NSUInteger scenario = 0; scenario < 5; scenario++) {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
+        e.appKitAccepted = YES;
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc] initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        e.appKitAccepted = NO;
+        [e.events removeAllObjects];
+        if (scenario == 0) { [p closeWindow:(NSWindow *)(id)w]; [p open]; }
+        if (scenario == 1) { [p closeWindow:(NSWindow *)(id)w]; [p invalidate]; }
+        if (scenario == 2) { w.attachedSheet = YES; [p closeWindow:(NSWindow *)(id)w]; }
+        if (scenario == 3) { [p closeWindow:(NSWindow *)(id)[YMFixtureWindow new]]; }
+        if (scenario == 4) { [p closeWindow:(NSWindow *)(id)w]; p = nil; }
+        [e drain];
+        Check(e.transformCalls == 0 && ![e.events containsObject:@"appkit:1"],
+              "cancelled or blocked close reaches neither accessory primitive");
+        Check(e.pending.count == 0, "cancelled adapter close leaves no retry work");
+    }
+    {
+        YMFixtureWindow *w = [YMFixtureWindow new];
+        YMFixtureCocoaEnvironment *e = [YMFixtureCocoaEnvironment new];
+        e.appKitAccepted = YES;
+        YMControlPanelPresenter *p = [[YMControlPanelPresenter alloc] initWithWindow:(NSWindow *)(id)w environment:e];
+        [p open]; [e drain];
+        e.appKitAccepted = NO;
+        [p closeWindow:(NSWindow *)(id)w]; [p closeWindow:(NSWindow *)(id)w];
+        Check(e.transformCalls == 0, "actual adapter fallback waits for the valid deferred close");
+        [e drain]; [e drain];
+        Check(e.transformCalls == 1 && !w.visible && !p.panelOpen && e.pending.count == 0,
+              "repeated close executes one adapter fallback without residual polling");
+        e.appKitAccepted = YES;
+        [p open]; [e drain];
+        Check(e.transformCalls == 1 && e.observedPolicy == NSApplicationActivationPolicyRegular && w.visible,
+              "reopen after fallback returns to the ordinary AppKit path on the same window");
+    }
+    Check(NSApp == nil, "adapter routing leaves NSApp unset and never executes real system primitives");
+}
+
 // A policy getter can report the requested identity while the process still
 // needs an explicit policy request. Keep observation and effective state apart.
 @interface YMStalePolicyEnvironment : YMFixtureEnvironment
@@ -141,6 +294,7 @@ static void StalePolicyTests(void) {
 
 static void LifecycleTests(void) {
     Check(NSApp == nil, "lifecycle tests start without NSApp");
+    CocoaAdapterTests();
     StalePolicyTests();
 
     YMFixtureWindow *w = [YMFixtureWindow new];
