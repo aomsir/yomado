@@ -39,3 +39,5 @@ bash "$ym_root/scripts/test-display-topology.sh"
 bash "$ym_root/scripts/test-controller-safety.sh"
 
 bash "$ym_root/scripts/test-panel-presentation.sh"
+# Image-only app icon regressions; no application or displays are started.
+bash "$ym_root/scripts/test-app-icon.sh"
