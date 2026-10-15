@@ -37,3 +37,6 @@ bash "$ym_root/scripts/test-updates.sh"
 # Pure injected backend/controller regressions; never touch live displays.
 bash "$ym_root/scripts/test-display-topology.sh"
 bash "$ym_root/scripts/test-controller-safety.sh"
+
+# Image-only app icon regressions; no application or displays are started.
+bash "$ym_root/scripts/test-app-icon.sh"
