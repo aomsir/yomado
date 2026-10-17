@@ -1,8 +1,7 @@
 #import "AppWorkspace.h"
 #import "AppWorkspaceAccess.h"
 #import "AppWorkspacePolicy.h"
-#import "UpdateWorkspaceRecovery.h"
-#import <ApplicationServices/ApplicationServices.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 NSString * const YMAppWorkspaceErrorDomain = @"dev.chekusu.yomado.app-workspace";
 
@@ -11,36 +10,12 @@ static const NSTimeInterval kYMInventoryCacheTTL = 1.0;
 static const NSUInteger kYMInventoryMaxPIDs = 64;
 static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 
-static AXUIElementRef YMWElement(id value) {
-    return value && CFGetTypeID((__bridge CFTypeRef)value) == AXUIElementGetTypeID() ? (__bridge AXUIElementRef)value : NULL;
-}
-static id YMWRead(id element, CFStringRef attribute) {
-    AXUIElementRef ref = YMWElement(element); CFTypeRef value = NULL;
-    if (!ref || AXUIElementCopyAttributeValue(ref, attribute, &value) != kAXErrorSuccess) return nil;
-    return CFBridgingRelease(value);
-}
-static NSDictionary *YMWFrame(id element) {
-    id p = YMWRead(element, kAXPositionAttribute), s = YMWRead(element, kAXSizeAttribute);
-    if (!p || !s || CFGetTypeID((__bridge CFTypeRef)p) != AXValueGetTypeID() ||
-        CFGetTypeID((__bridge CFTypeRef)s) != AXValueGetTypeID()) return nil;
-    CGPoint point; CGSize size;
-    if (!AXValueGetValue((__bridge AXValueRef)p, kAXValueCGPointType, &point) ||
-        !AXValueGetValue((__bridge AXValueRef)s, kAXValueCGSizeType, &size)) return nil;
-    return YMWorkspaceGeometry(@{@"x": @(point.x), @"y": @(point.y), @"width": @(size.width), @"height": @(size.height)});
-}
-static BOOL YMWOrdinaryWindow(id element) {
-    NSString *role = YMWRead(element, kAXRoleAttribute), *subrole = YMWRead(element, kAXSubroleAttribute);
-    return [role isEqualToString:(__bridge NSString *)kAXWindowRole] &&
-        ![subrole isEqualToString:(__bridge NSString *)kAXDialogSubrole] &&
-        ![subrole isEqualToString:(__bridge NSString *)kAXSystemDialogSubrole] &&
-        ![subrole isEqualToString:(__bridge NSString *)kAXFloatingWindowSubrole];
-}
-
 @interface YMWPlacement : NSObject
 @property(nonatomic, strong) id element;
 @property(nonatomic, strong) NSRunningApplication *application;
 @property(nonatomic, copy) NSString *bundleID;
 @property(nonatomic, copy) NSDictionary *origin;
+@property(nonatomic, copy) NSDictionary *identity;
 @property(nonatomic) CGWindowID windowID;
 @property(nonatomic) CGDirectDisplayID lastDisplayID;
 @end
@@ -648,9 +623,11 @@ static BOOL YMWOrdinaryWindow(id element) {
 - (BOOL)preflight:(NSError **)error {
     if (self.operationInProgress) return [self fail:error code:1 text:@"正在核对窗口位置，请稍候。"];
     if (!self.accessibilityTrusted) return [self fail:error code:2 text:@"移动窗口需要控制权限；请先打开控制权限设置。"];
+    NSArray *cg = [self.windowAccess visibleWindows];
+    if (!cg) return [self fail:error code:3 text:@"无法读取窗口清单，尚未移动任何窗口。"];
     [self refreshInventory];
-    if (!self.inventoryReady || ![self inventoryCacheFresh])
-        return [self fail:error code:3 text:@"无法读取窗口清单，尚未移动任何窗口。"];
+    // Selected-app move/restore uses a live per-app observe. Do not wait for
+    // unrelated App background AX cache. Close/export keep inventoryReady gates.
     return YES;
 }
 - (BOOL)genericBundleAllowed:(NSString *)bundle error:(NSError **)error {
@@ -658,52 +635,97 @@ static BOOL YMWOrdinaryWindow(id element) {
     return [self fail:error code:4 text:[bundle isEqualToString:@"com.tencent.xinWeChat"] ?
         @"微信由专用安全恢复器处理，请通过控制面板的微信条目操作。" : @"此应用的窗口由系统或 yomado 自身管理，不能移入。"];
 }
-- (YMWPlacement *)placementForElement:(id)element application:(NSRunningApplication *)application windowID:(CGWindowID)windowID {
-    for (YMWPlacement *p in self.placements.copy)
-        if (p.application.processIdentifier == application.processIdentifier && !p.application.terminated &&
-            CFEqual((__bridge CFTypeRef)p.element, (__bridge CFTypeRef)element)) {
+- (YMWPlacement *)placementForElement:(id)element application:(NSRunningApplication *)application
+                             windowID:(CGWindowID)windowID identity:(NSDictionary *)identity {
+    (void)element;
+    for (YMWPlacement *p in self.placements.copy) {
+        if (p.application.processIdentifier != application.processIdentifier || p.application.terminated)
+            continue;
+        if (YMWorkspaceSameWindowIdentity(p.identity, identity)) {
             if (p.windowID == windowID) return p;
-            // An app may reuse an AX identity after closing a window. A newly
-            // observed CG window ID must never inherit that old window's frame.
+            // Lifecycle reuse of the same AX element must not inherit an old frame.
             [self.placements removeObject:p];
+            return nil;
         }
+        // Same window ID with a different five-field identity is a replacement.
+        if (p.windowID == windowID) [self.placements removeObject:p];
+    }
     return nil;
 }
 - (NSArray<NSDictionary *> *)candidatesForApplication:(NSRunningApplication *)app sourceFilter:(NSNumber *)filter error:(NSError **)error {
-    NSMutableArray *visible = [NSMutableArray array];
-    for (NSDictionary *window in self.windows)
-        if ([window[@"pid"] intValue] == app.processIdentifier && YMWorkspaceMatchesSource(window, filter))
-            [visible addObject:window];
-    AXUIElementRef ref = AXUIElementCreateApplication(app.processIdentifier);
-    if (!ref) { [self fail:error code:5 text:@"无法访问应用窗口；请先打开应用主窗口。 "]; return nil; }
-    AXUIElementSetMessagingTimeout(ref, 0.8);
-    id element = CFBridgingRelease(ref), raw = YMWRead(element, kAXWindowsAttribute);
-    if (![raw isKindOfClass:NSArray.class]) { [self fail:error code:6 text:@"应用暂时没有响应窗口查询；已保留原位置记录。 "]; return nil; }
-    // Only a successful enumeration may retire a closed AX identity. A new
-    // window never receives an old window's checkpoint, even after relaunch.
+    if (!app || app.terminated) {
+        [self fail:error code:5 text:@"无法访问应用窗口；请先打开应用主窗口。"]; return nil;
+    }
+    NSArray *cgAll = [self.windowAccess visibleWindows];
+    if (!cgAll) {
+        [self fail:error code:3 text:@"无法读取窗口清单，尚未移动任何窗口。"]; return nil;
+    }
+    NSMutableArray *cgForApp = [NSMutableArray array];
+    for (NSDictionary *cg in cgAll)
+        if ([cg[@"pid"] intValue] == app.processIdentifier) [cgForApp addObject:cg];
+
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 0.8;
+    NSDictionary *observation = [self.windowAccess observeApplication:app deadline:deadline];
+    if (app.terminated) {
+        [self fail:error code:5 text:@"无法访问应用窗口；请先打开应用主窗口。"]; return nil;
+    }
+    if (![observation isKindOfClass:NSDictionary.class] ||
+        ![observation[@"complete"] isKindOfClass:NSNumber.class] || ![observation[@"complete"] boolValue]) {
+        NSString *reason = [observation[@"reason"] isKindOfClass:NSString.class] ? observation[@"reason"] : @"";
+        if ([reason isEqual:@"incompleteMetadata"] || [reason isEqual:@"duplicateIdentity"]) {
+            [self fail:error code:20 text:@"无法确认窗口身份；请保持应用打开后重试，尚未移动任何窗口。"];
+            return nil;
+        }
+        [self fail:error code:6 text:@"应用暂时没有响应窗口查询；已保留原位置记录。"]; return nil;
+    }
+    NSArray *axWindows = [observation[@"windows"] isKindOfClass:NSArray.class] ? observation[@"windows"] : @[];
+    BOOL anyValidIdentity = NO;
+    for (NSDictionary *ax in axWindows)
+        if (YMWorkspaceIdentityValid(ax[@"identity"])) { anyValidIdentity = YES; break; }
+    // Identity private API unavailable: AX rows exist but none carry a valid identity.
+    if (cgForApp.count && axWindows.count && !anyValidIdentity) {
+        [self fail:error code:20 text:@"无法确认窗口身份；请保持应用打开后重试，尚未移动任何窗口。"];
+        return nil;
+    }
+
+    NSDictionary *snapshot = YMWorkspaceNormalizeWindowSnapshot(cgForApp, axWindows, YES, self.displays);
+    if (!YMWorkspaceSnapshotAllowsSource(snapshot, filter)) {
+        [self fail:error code:7 text:@"部分窗口无法可靠匹配或移动。请关闭弹窗、展开普通窗口后重试；尚未继续移屏。"];
+        return nil;
+    }
+
+    // Only a complete, identity-trusted enumeration may retire closed placements.
+    NSMutableSet *liveKeys = [NSMutableSet set];
+    for (NSDictionary *ax in axWindows) {
+        NSDictionary *identity = ax[@"identity"];
+        if (YMWorkspaceIdentityValid(identity))
+            [liveKeys addObject:YMWorkspaceWindowKey(identity[@"pid"], identity[@"windowID"])];
+    }
     for (YMWPlacement *placement in self.placements.copy) {
         if (placement.application.processIdentifier != app.processIdentifier) continue;
-        BOOL found = NO;
-        for (id window in raw) if (YMWElement(window) && CFEqual((__bridge CFTypeRef)window, (__bridge CFTypeRef)placement.element)) { found = YES; break; }
-        if (!found) [self.placements removeObject:placement];
+        NSString *key = YMWorkspaceIdentityValid(placement.identity)
+            ? YMWorkspaceWindowKey(placement.identity[@"pid"], placement.identity[@"windowID"])
+            : YMWorkspaceWindowKey(@(placement.application.processIdentifier), @(placement.windowID));
+        if (![liveKeys containsObject:key]) [self.placements removeObject:placement];
     }
-    NSMutableArray *result = [NSMutableArray array]; NSMutableSet *used = [NSMutableSet set];
-    for (id window in raw) {
-        if (!YMWOrdinaryWindow(window) || [YMWRead(window, kAXMinimizedAttribute) boolValue]) continue;
-        NSDictionary *frame = YMWFrame(window); if (!frame) continue;
-        NSMutableArray *matches = [NSMutableArray array];
-        for (NSDictionary *entry in visible)
-            if (![used containsObject:entry[@"windowID"]] && YMWorkspaceSameFrame(frame, entry[@"frame"])) [matches addObject:entry];
-        // Overlapping identical windows cannot be associated reliably without
-        // private AX APIs. Refuse rather than bind a checkpoint to the wrong one.
-        if (matches.count != 1) continue;
-        Boolean settable = false;
-        if (AXUIElementIsAttributeSettable(YMWElement(window), kAXPositionAttribute, &settable) != kAXErrorSuccess || !settable) continue;
-        NSDictionary *entry = matches.firstObject; [used addObject:entry[@"windowID"]];
-        [result addObject:@{@"element": window, @"frame": frame, @"windowID": entry[@"windowID"], @"displayID": entry[@"displayID"]}];
-    }
-    if (result.count != visible.count) {
-        [self fail:error code:7 text:@"部分窗口无法可靠匹配或移动。请关闭弹窗、展开普通窗口后重试；尚未继续移屏。"]; return nil;
+
+    NSMutableArray *result = [NSMutableArray array];
+    for (NSDictionary *window in snapshot[@"windows"]) {
+        if (!YMWorkspaceMatchesSource(window, filter)) continue;
+        if (![window[@"positionSettable"] boolValue] || !window[@"element"] ||
+            !YMWorkspaceIdentityValid(window[@"identity"]) || !YMWorkspaceGeometry(window[@"frame"])) {
+            [self fail:error code:7 text:@"部分窗口无法可靠匹配或移动。请关闭弹窗、展开普通窗口后重试；尚未继续移屏。"];
+            return nil;
+        }
+        [result addObject:@{
+            @"element": window[@"element"],
+            @"frame": window[@"frame"],
+            @"cgFrame": window[@"cgFrame"] ?: window[@"frame"],
+            @"windowID": window[@"windowID"],
+            @"displayID": window[@"displayID"],
+            @"isVirtual": window[@"isVirtual"] ?: @NO,
+            @"identity": window[@"identity"]
+        }];
     }
     return result;
 }
@@ -748,33 +770,36 @@ static BOOL YMWOrdinaryWindow(id element) {
     }
     return YMWorkspaceSameFrame(display[@"bounds"], live[@"bounds"]);
 }
-- (BOOL)placeElement:(id)element frame:(NSDictionary *)frame display:(NSDictionary *)display application:(NSRunningApplication *)app {
-    pid_t PID = 0; AXUIElementRef ref = YMWElement(element);
-    if (!ref || app.terminated || AXUIElementGetPid(ref, &PID) != kAXErrorSuccess || PID != app.processIdentifier ||
-        ![self displayStillCurrent:display] || !YMWorkspaceGeometry(frame)) return NO;
-    AXUIElementSetMessagingTimeout(ref, 0.8);
-    NSDictionary *before = YMWFrame(element); if (!before) return NO;
+- (BOOL)placeElement:(id)element frame:(NSDictionary *)frame display:(NSDictionary *)display
+         application:(NSRunningApplication *)app expectedIdentity:(NSDictionary *)identity {
+    if (app.terminated || !YMWorkspaceIdentityValid(identity) || !YMWorkspaceGeometry(frame) ||
+        ![self displayStillCurrent:display]) return NO;
+    NSDictionary *live = [self.windowAccess observeElement:element];
+    if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], identity) ||
+        ![live[@"ordinary"] boolValue] || [live[@"minimized"] boolValue] ||
+        ![live[@"positionSettable"] boolValue] || !YMWorkspaceGeometry(live[@"frame"])) return NO;
+    NSDictionary *before = live[@"frame"];
     CGSize size = CGSizeMake([frame[@"width"] doubleValue], [frame[@"height"] doubleValue]);
-    Boolean resizable = false;
-    if ((fabs([before[@"width"] doubleValue] - size.width) > 1 || fabs([before[@"height"] doubleValue] - size.height) > 1) &&
-        AXUIElementIsAttributeSettable(ref, kAXSizeAttribute, &resizable) == kAXErrorSuccess && resizable) {
-        AXValueRef value = AXValueCreate(kAXValueCGSizeType, &size);
-        if (value) { (void)AXUIElementSetAttributeValue(ref, kAXSizeAttribute, value); CFRelease(value); }
+    if (fabs([before[@"width"] doubleValue] - size.width) > 1 ||
+        fabs([before[@"height"] doubleValue] - size.height) > 1) {
+        (void)[self.windowAccess setSize:size element:element expectedIdentity:identity];
+        live = [self.windowAccess observeElement:element];
+        if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], identity)) return NO;
     }
     if (![self displayStillCurrent:display]) return NO;
     CGPoint point = CGPointMake([frame[@"x"] doubleValue], [frame[@"y"] doubleValue]);
-    AXValueRef value = AXValueCreate(kAXValueCGPointType, &point);
-    AXError moved = value ? AXUIElementSetAttributeValue(ref, kAXPositionAttribute, value) : kAXErrorFailure;
-    if (value) CFRelease(value);
-    if (moved != kAXErrorSuccess) return NO;
+    if (![self.windowAccess setPosition:point element:element expectedIdentity:identity]) return NO;
     for (NSUInteger observation = 0; observation < 4; observation++) {
         // The run loop permits external screen changes while settling. Never
         // accept a frame against stale bounds after a display moves/disappears.
         if (![self displayStillCurrent:display]) return NO;
-        NSDictionary *actual = YMWFrame(element);
-        if (!actual) return NO;
-        if (YMWorkspaceFrameFits(actual, display)) return YES;
-        if (observation < 3) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
+        live = [self.windowAccess observeElement:element];
+        if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], identity) ||
+            !YMWorkspaceGeometry(live[@"frame"])) return NO;
+        if (YMWorkspaceFrameFits(live[@"frame"], display)) return YES;
+        if (observation < 3)
+            [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode
+                                   beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];
     }
     return NO;
 }
@@ -790,8 +815,10 @@ static BOOL YMWOrdinaryWindow(id element) {
         return [self fail:error code:9 text:@"请拖入一个 macOS 应用（.app）。"];
     if (![self genericBundleAllowed:bundle.bundleIdentifier error:error]) return NO;
     NSMutableArray *operations = [NSMutableArray array]; BOOL running = NO;
-    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle.bundleIdentifier]) {
-        if (app.terminated || ![app.bundleURL.URLByResolvingSymlinksInPath.URLByStandardizingPath isEqual:canonical]) continue;
+    for (NSRunningApplication *app in [self.windowAccess applicationsForBundleIdentifier:bundle.bundleIdentifier]) {
+        NSURL *appURL = app.bundleURL.isFileURL
+            ? app.bundleURL.URLByResolvingSymlinksInPath.URLByStandardizingPath : nil;
+        if (app.terminated || ![appURL isEqual:canonical]) continue;
         running = YES;
         NSArray *candidates = [self candidatesForApplication:app sourceFilter:filter error:error]; if (!candidates) return NO;
         for (NSDictionary *candidate in candidates) if ([candidate[@"displayID"] unsignedIntValue] != ID)
@@ -805,23 +832,46 @@ static BOOL YMWOrdinaryWindow(id element) {
     @try {
         for (NSDictionary *operation in operations) {
             NSRunningApplication *app = operation[@"application"]; NSDictionary *candidate = operation[@"candidate"];
-            id element = candidate[@"element"]; NSDictionary *before = YMWFrame(element);
-            if (!YMWorkspaceSameFrame(before, candidate[@"frame"]))
-                return [self fail:error code:11 text:@"窗口位置已变化，已停止后续移动；可以返回已移动的窗口。"];
+            id element = candidate[@"element"];
+            NSDictionary *expectedIdentity = candidate[@"identity"];
+            NSDictionary *live = [self.windowAccess observeElement:element];
+            if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], expectedIdentity) ||
+                !YMWorkspaceSameFrame(live[@"frame"], candidate[@"frame"]) ||
+                ![live[@"ordinary"] boolValue] || [live[@"minimized"] boolValue] ||
+                ![live[@"positionSettable"] boolValue])
+                return [self fail:error code:11 text:@"窗口身份或位置已变化，已停止后续移动；可以返回已移动的窗口。"];
+            NSDictionary *liveDisplay = YMWorkspaceDisplayForFrame(live[@"frame"], self.displays);
+            if (!liveDisplay ||
+                [liveDisplay[@"displayID"] unsignedIntValue] != [candidate[@"displayID"] unsignedIntValue] ||
+                !YMWorkspaceMatchesSource(@{@"displayID": liveDisplay[@"displayID"],
+                    @"isVirtual": liveDisplay[@"isVirtual"]}, filter) ||
+                ![self displayStillCurrent:target])
+                return [self fail:error code:11 text:@"窗口身份或位置已变化，已停止后续移动；可以返回已移动的窗口。"];
+            NSDictionary *before = live[@"frame"];
             NSDictionary *source = [self display:[candidate[@"displayID"] unsignedIntValue]];
-            YMWPlacement *placement = [self placementForElement:element application:app windowID:[candidate[@"windowID"] unsignedIntValue]];
+            YMWPlacement *placement = [self placementForElement:element application:app
+                                                       windowID:[candidate[@"windowID"] unsignedIntValue]
+                                                       identity:expectedIdentity];
             BOOL created = !placement;
             if (!placement) {
                 placement = [YMWPlacement new]; placement.element = element; placement.application = app;
-                placement.bundleID = app.bundleIdentifier; placement.windowID = [candidate[@"windowID"] unsignedIntValue];
+                placement.bundleID = app.bundleIdentifier;
+                placement.windowID = [candidate[@"windowID"] unsignedIntValue];
+                placement.identity = expectedIdentity;
+                // Physical AX origin only — virtual→virtual must not invent/overwrite it.
                 placement.origin = YMWorkspaceOrigin(before, source);
-                [self.placements addObject:placement]; // Original geometry precedes every write.
+                [self.placements addObject:placement];
             }
             CGDirectDisplayID priorID = placement.lastDisplayID;
             placement.lastDisplayID = ID;
+            placement.element = element;
+            placement.identity = expectedIdentity;
             NSDictionary *destination = YMWorkspaceFrameOnDisplay(before, nil, target);
-            if (![self placeElement:element frame:destination display:target application:app]) {
-                BOOL returned = [self placeElement:element frame:before display:source application:app];
+            if (![self placeElement:element frame:destination display:target application:app
+                   expectedIdentity:expectedIdentity]) {
+                // Never roll back onto a replacement that no longer matches identity.
+                BOOL returned = [self placeElement:element frame:before display:source application:app
+                                  expectedIdentity:expectedIdentity];
                 if (returned && created && placement.origin) [self.placements removeObject:placement];
                 else if (returned) placement.lastDisplayID = priorID ?: [source[@"displayID"] unsignedIntValue];
                 return [self fail:error code:12 text:returned ? @"移屏未获验证，当前窗口已退回；已停止后续移动。" :
@@ -846,21 +896,30 @@ static BOOL YMWOrdinaryWindow(id element) {
 - (BOOL)performRestoreBundle:(NSString *)bundle sourceID:(CGDirectDisplayID)sourceID physicalTarget:(NSDictionary *)physicalTarget error:(NSError **)error {
     if (!YMWorkspaceGenericRestoreAllowed(bundle)) return [self fail:error code:4 text:@"请先把 yomado 控制面板移回实体屏，再关闭此虚拟屏。"];
     NSUInteger restored = 0, fallback = 0;
-    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle]) {
+    for (NSRunningApplication *app in [self.windowAccess applicationsForBundleIdentifier:bundle]) {
         if (app.terminated) continue;
         NSArray *candidates = [self candidatesForApplication:app sourceFilter:sourceID ? @(sourceID) : nil error:error]; if (!candidates) return NO;
         for (NSDictionary *candidate in candidates) {
             NSDictionary *source = [self display:[candidate[@"displayID"] unsignedIntValue]];
             if (![self.ownedIDs containsObject:source[@"displayID"]]) continue;
-            id element = candidate[@"element"]; YMWPlacement *placement = [self placementForElement:element application:app windowID:[candidate[@"windowID"] unsignedIntValue]];
-            NSDictionary *origin = placement.origin, *before = YMWFrame(element);
-            if (!YMWorkspaceSameFrame(before, candidate[@"frame"]))
-                return [self fail:error code:13 text:@"窗口位置已变化，已停止恢复；请刷新后再试。"];
+            id element = candidate[@"element"];
+            NSDictionary *expectedIdentity = candidate[@"identity"];
+            YMWPlacement *placement = [self placementForElement:element application:app
+                                                       windowID:[candidate[@"windowID"] unsignedIntValue]
+                                                       identity:expectedIdentity];
+            NSDictionary *live = [self.windowAccess observeElement:element];
+            if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], expectedIdentity) ||
+                !YMWorkspaceSameFrame(live[@"frame"], candidate[@"frame"]) ||
+                ![live[@"ordinary"] boolValue] || [live[@"minimized"] boolValue] ||
+                ![live[@"positionSettable"] boolValue])
+                return [self fail:error code:13 text:@"窗口身份或位置已变化，已停止恢复；请刷新后再试。"];
+            NSDictionary *origin = placement.origin, *before = live[@"frame"];
             NSDictionary *target = physicalTarget ?: YMWorkspacePhysicalDisplay(origin[@"displayUUID"], self.displays);
             NSDictionary *destination = physicalTarget ? YMWorkspaceFrameForExplicitPhysicalReturn(origin, before, target) :
                 YMWorkspaceFrameOnDisplay(origin[@"relative"] ?: before, origin[@"relative"], target);
             if (!target || !destination) return [self fail:error code:14 text:@"没有可用的实体显示器；保留虚拟屏和窗口记录。"];
-            if (![self placeElement:element frame:destination display:target application:app])
+            if (![self placeElement:element frame:destination display:target application:app
+                   expectedIdentity:expectedIdentity])
                 return [self fail:error code:15 text:@"尚未确认窗口已返回实体屏；保留虚拟屏和原位置记录。"];
             if (!origin || (physicalTarget && !YMWorkspaceOriginBelongsToDisplay(origin, target))) fallback++;
             if (placement) [self.placements removeObject:placement];
@@ -961,12 +1020,18 @@ static BOOL YMWOrdinaryWindow(id element) {
             [self fail:error code:31 text:@"已有窗口的原位置无法精确交接，已暂停更新。"];
             return nil;
         }
-        NSDictionary *identity = YMUpdateIdentityForWindowElement(placement.element);
-        NSDictionary *frame = YMWFrame(placement.element);
+        NSDictionary *live = [self.windowAccess observeElement:placement.element];
+        NSDictionary *identity = live[@"identity"];
+        NSDictionary *frame = live[@"frame"];
+        if (YMWorkspaceIdentityValid(placement.identity) &&
+            !YMWorkspaceSameWindowIdentity(identity, placement.identity)) {
+            [self fail:error code:31 text:@"已有窗口的原位置无法精确交接，已暂停更新。"]; return nil;
+        }
         NSDictionary *display = YMWorkspaceDisplayForFrame(frame, self.displays);
         NSDictionary *relative = YMWorkspaceGeometry(placement.origin[@"relative"]);
         NSString *uuid = placement.origin[@"displayUUID"];
-        if (!identity || [identity[@"pid"] intValue] != placement.application.processIdentifier ||
+        if (!YMWorkspaceIdentityValid(identity) ||
+            [identity[@"pid"] intValue] != placement.application.processIdentifier ||
             [identity[@"windowID"] unsignedIntValue] != placement.windowID || !frame ||
             ![self.ownedIDs containsObject:display[@"displayID"]] || !relative ||
             ![uuid isKindOfClass:NSString.class] || !uuid.length || [seen containsObject:identity]) {
@@ -986,8 +1051,13 @@ static BOOL YMWOrdinaryWindow(id element) {
         NSDictionary *identity = checkpoint[@"identity"], *origin = checkpoint[@"origin"];
         NSDictionary *relative = YMWorkspaceGeometry(origin[@"relative"]);
         NSString *uuid = origin[@"displayUUID"];
-        id element = YMUpdateResolveWindowIdentity(identity, error);
-        NSDictionary *frame = element ? YMWFrame(element) : nil;
+        if (!YMWorkspaceIdentityValid(identity))
+            return [self fail:error code:31 text:@"窗口原位置接管未完成，保留恢复记录供重试。"];
+        id element = [self.windowAccess resolveIdentity:identity error:error];
+        NSDictionary *live = element ? [self.windowAccess observeElement:element] : nil;
+        NSDictionary *frame = live[@"frame"];
+        if (!YMWorkspaceSameWindowIdentity(live[@"identity"], identity))
+            return [self fail:error code:31 text:@"窗口原位置接管未完成，保留恢复记录供重试。"];
         NSDictionary *display = YMWorkspaceDisplayForFrame(frame, self.displays);
         if (!element || !frame || ![self.ownedIDs containsObject:display[@"displayID"]] || !relative ||
             ![uuid isKindOfClass:NSString.class] || !uuid.length || [seen containsObject:identity])
@@ -995,17 +1065,21 @@ static BOOL YMWOrdinaryWindow(id element) {
         [seen addObject:identity];
         YMWPlacement *placement = [YMWPlacement new];
         placement.element = element;
-        placement.application = [NSRunningApplication runningApplicationWithProcessIdentifier:[identity[@"pid"] intValue]];
+        placement.application = [self.windowAccess applicationForPID:[identity[@"pid"] intValue]];
         placement.bundleID = identity[@"bundleID"];
         placement.windowID = [identity[@"windowID"] unsignedIntValue];
+        placement.identity = identity;
         placement.lastDisplayID = [display[@"displayID"] unsignedIntValue];
         placement.origin = @{@"displayUUID": uuid, @"relative": relative};
+        if (!placement.application || placement.application.terminated)
+            return [self fail:error code:31 text:@"窗口原位置接管未完成，保留恢复记录供重试。"];
         [pending addObject:placement];
     }
     // All exact lookups complete before changing any in-memory ownership.
     for (YMWPlacement *placement in pending) {
         for (YMWPlacement *old in self.placements.copy)
-            if (old.windowID == placement.windowID && old.application.processIdentifier == placement.application.processIdentifier)
+            if (old.windowID == placement.windowID &&
+                old.application.processIdentifier == placement.application.processIdentifier)
                 [self.placements removeObject:old];
         [self.placements addObject:placement];
     }

@@ -39,16 +39,7 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 
 #pragma mark - Fake application / access
 
-@interface YMFakeRunningApp : NSObject
-@property(nonatomic) pid_t processIdentifier;
-@property(nonatomic, getter=isTerminated) BOOL terminated;
-@property(nonatomic, copy) NSString *bundleIdentifier;
-@property(nonatomic, strong) NSURL *bundleURL;
-@property(nonatomic, copy) NSString *localizedName;
-@property(nonatomic, strong) NSImage *icon;
-@end
-@implementation YMFakeRunningApp
-@end
+@class YMFakeRunningApp;
 
 @interface YMFakeWindowAccess : NSObject <YMWorkspaceWindowAccess>
 @property(nonatomic) BOOL trusted;
@@ -57,15 +48,41 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, YMFakeRunningApp *> *appsByPID;
 @property(nonatomic, strong) NSMutableDictionary *elementFrames;
 @property(nonatomic, strong) NSMutableDictionary *elementIdentities;
+@property(nonatomic, strong) NSMutableDictionary *elementStates;
+@property(nonatomic, strong) NSMutableArray<NSDictionary *> *positionWrites;
+@property(nonatomic, strong) NSMutableArray<NSDictionary *> *sizeWrites;
+@property(nonatomic, copy) NSDictionary *currentFrame;
+@property(nonatomic) NSUInteger activationRequests;
 @property(nonatomic) NSUInteger readCount;
 @property(nonatomic) NSUInteger writeCount;
 @property(nonatomic) NSUInteger observeCount;
 @property(nonatomic) NSUInteger observeElementCount;
 @property(nonatomic) BOOL failVisibleWindows;
 @property(nonatomic) BOOL forceIncompleteObserve;
+@property(nonatomic, strong) NSMutableSet<NSNumber *> *forceIncompletePIDs;
 @property(nonatomic, copy) NSString *incompleteReason;
 @property(nonatomic) NSTimeInterval observeDelay;
+@property(nonatomic) NSUInteger failNextPositionWrites;
+@property(nonatomic) BOOL syncCGOnWrite;
+@property(nonatomic) BOOL flipIdentityOnNextObserveElement;
 @property(nonatomic, strong) NSMutableArray<NSNumber *> *observedPIDs;
+@end
+
+@interface YMFakeRunningApp : NSObject
+@property(nonatomic) pid_t processIdentifier;
+@property(nonatomic, getter=isTerminated) BOOL terminated;
+@property(nonatomic, copy) NSString *bundleIdentifier;
+@property(nonatomic, strong) NSURL *bundleURL;
+@property(nonatomic, copy) NSString *localizedName;
+@property(nonatomic, strong) NSImage *icon;
+@property(nonatomic, weak) YMFakeWindowAccess *access;
+@end
+@implementation YMFakeRunningApp
+- (BOOL)activateWithOptions:(NSApplicationActivationOptions)options {
+    (void)options;
+    self.access.activationRequests += 1;
+    return NO;
+}
 @end
 
 @implementation YMFakeWindowAccess
@@ -78,18 +95,29 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     _appsByPID = [NSMutableDictionary dictionary];
     _elementFrames = [NSMutableDictionary dictionary];
     _elementIdentities = [NSMutableDictionary dictionary];
+    _elementStates = [NSMutableDictionary dictionary];
+    _positionWrites = [NSMutableArray array];
+    _sizeWrites = [NSMutableArray array];
+    _forceIncompletePIDs = [NSMutableSet set];
     _observedPIDs = [NSMutableArray array];
     _incompleteReason = @"timeout";
+    _syncCGOnWrite = YES;
     return self;
 }
 
 - (YMFakeRunningApp *)installApp:(pid_t)pid name:(NSString *)name bundle:(NSString *)bundle {
+    return [self installApp:pid name:name bundle:bundle bundleURL:nil];
+}
+
+- (YMFakeRunningApp *)installApp:(pid_t)pid name:(NSString *)name bundle:(NSString *)bundle
+                       bundleURL:(NSURL *)bundleURL {
     YMFakeRunningApp *app = [YMFakeRunningApp new];
     app.processIdentifier = pid;
     app.bundleIdentifier = bundle;
     app.localizedName = name;
-    app.bundleURL = [NSURL fileURLWithPath:[NSString stringWithFormat:@"/tmp/fake-%@.app", bundle]];
+    app.bundleURL = bundleURL ?: [NSURL fileURLWithPath:[NSString stringWithFormat:@"/tmp/fake-%@.app", bundle]];
     app.terminated = NO;
+    app.access = self;
     self.appsByPID[@(pid)] = app;
     return app;
 }
@@ -105,8 +133,44 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     NSMutableArray *list = [self.axByPID[@(pid)] mutableCopy] ?: [NSMutableArray array];
     [list addObject:ax];
     self.axByPID[@(pid)] = list;
-    self.elementFrames[[NSString stringWithFormat:@"%p", element]] = axFrame;
-    self.elementIdentities[[NSString stringWithFormat:@"%p", element]] = identity;
+    NSString *key = [NSString stringWithFormat:@"%p", element];
+    self.elementFrames[key] = axFrame;
+    self.elementIdentities[key] = identity;
+    self.elementStates[key] = @{@"ordinary": @YES, @"minimized": @NO, @"positionSettable": @YES};
+    self.currentFrame = axFrame;
+}
+
+- (NSString *)elementKey:(id)element {
+    return [NSString stringWithFormat:@"%p", element];
+}
+
+- (void)updateAXFrame:(NSDictionary *)frame forElement:(id)element {
+    NSString *key = [self elementKey:element];
+    self.elementFrames[key] = frame;
+    self.currentFrame = frame;
+    NSDictionary *identity = self.elementIdentities[key];
+    if (!identity) return;
+    pid_t pid = [identity[@"pid"] intValue];
+    NSMutableArray *list = [self.axByPID[@(pid)] mutableCopy] ?: [NSMutableArray array];
+    for (NSUInteger i = 0; i < list.count; i++) {
+        NSMutableDictionary *ax = [list[i] mutableCopy];
+        if ([ax[@"element"] isEqual:element] || [ax[@"identity"] isEqual:identity]) {
+            ax[@"frame"] = frame;
+            list[i] = ax;
+        }
+    }
+    self.axByPID[@(pid)] = list;
+    if (!self.syncCGOnWrite) return;
+    CGWindowID windowID = [identity[@"windowID"] unsignedIntValue];
+    for (NSUInteger i = 0; i < self.cgWindows.count; i++) {
+        NSDictionary *cg = self.cgWindows[i];
+        if ([cg[@"pid"] intValue] == pid && [cg[@"windowID"] unsignedIntValue] == windowID) {
+            NSMutableDictionary *updated = [cg mutableCopy];
+            updated[@"frame"] = frame;
+            self.cgWindows[i] = updated;
+            break;
+        }
+    }
 }
 
 - (BOOL)accessibilityTrusted { return self.trusted; }
@@ -124,7 +188,7 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 - (NSArray<NSRunningApplication *> *)applicationsForBundleIdentifier:(NSString *)bundleID {
     NSMutableArray *result = [NSMutableArray array];
     for (YMFakeRunningApp *app in self.appsByPID.allValues)
-        if ([app.bundleIdentifier isEqual:bundleID]) [result addObject:app];
+        if ([app.bundleIdentifier isEqual:bundleID]) [result addObject:(id)app];
     return result;
 }
 
@@ -134,7 +198,7 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     self.observeCount++;
     pid_t pid = application.processIdentifier;
     [self.observedPIDs addObject:@(pid)];
-    if (self.forceIncompleteObserve)
+    if (self.forceIncompleteObserve || [self.forceIncompletePIDs containsObject:@(pid)])
         return @{@"windows": self.axByPID[@(pid)] ?: @[], @"complete": @NO,
                  @"reason": self.incompleteReason ?: @"timeout"};
     YMFakeRunningApp *app = self.appsByPID[@(pid)];
@@ -145,12 +209,35 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 
 - (nullable NSDictionary *)observeElement:(id)element {
     self.observeElementCount++;
-    NSString *key = [NSString stringWithFormat:@"%p", element];
+    NSString *key = [self elementKey:element];
+    if (self.flipIdentityOnNextObserveElement) {
+        self.flipIdentityOnNextObserveElement = NO;
+        NSDictionary *prior = self.elementIdentities[key];
+        if (prior) {
+            NSMutableDictionary *changed = [prior mutableCopy];
+            changed[@"startSeconds"] = @([prior[@"startSeconds"] unsignedLongLongValue] + 1);
+            self.elementIdentities[key] = changed;
+            NSMutableArray *list = [self.axByPID[prior[@"pid"]] mutableCopy];
+            for (NSUInteger i = 0; i < list.count; i++) {
+                NSMutableDictionary *ax = [list[i] mutableCopy];
+                if ([ax[@"element"] isEqual:element]) {
+                    ax[@"identity"] = changed;
+                    list[i] = ax;
+                }
+            }
+            self.axByPID[prior[@"pid"]] = list;
+        }
+    }
     NSDictionary *frame = self.elementFrames[key];
     NSDictionary *identity = self.elementIdentities[key];
+    NSDictionary *state = self.elementStates[key];
     if (!frame || !identity) return nil;
-    return @{@"identity": identity, @"frame": frame, @"ordinary": @YES, @"minimized": @NO,
-             @"readable": @YES, @"positionSettable": @YES, @"element": element};
+    return @{@"identity": identity, @"frame": frame,
+             @"ordinary": state[@"ordinary"] ?: @YES,
+             @"minimized": state[@"minimized"] ?: @NO,
+             @"readable": @YES,
+             @"positionSettable": state[@"positionSettable"] ?: @YES,
+             @"element": element};
 }
 
 - (nullable id)resolveIdentity:(NSDictionary *)identity error:(NSError **)error {
@@ -167,17 +254,50 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 
 - (BOOL)setPosition:(CGPoint)position element:(id)element
    expectedIdentity:(NSDictionary *)identity {
-    (void)position; (void)element; (void)identity;
+    NSString *key = [self elementKey:element];
+    if (!YMWorkspaceSameWindowIdentity(self.elementIdentities[key], identity)) return NO;
+    [self.positionWrites addObject:@{@"identity": identity, @"x": @(position.x), @"y": @(position.y),
+        @"element": element ?: [NSNull null]}];
     self.writeCount++;
+    if (self.failNextPositionWrites) {
+        self.failNextPositionWrites -= 1;
+        return NO;
+    }
+    NSDictionary *prior = self.elementFrames[key] ?: Frame(position.x, position.y, 100, 100);
+    [self updateAXFrame:Frame(position.x, position.y,
+                              [prior[@"width"] doubleValue], [prior[@"height"] doubleValue])
+             forElement:element];
     return YES;
 }
 
 - (BOOL)setSize:(CGSize)size element:(id)element expectedIdentity:(NSDictionary *)identity {
-    (void)size; (void)element; (void)identity;
+    NSString *key = [self elementKey:element];
+    if (!YMWorkspaceSameWindowIdentity(self.elementIdentities[key], identity)) return NO;
+    [self.sizeWrites addObject:@{@"identity": identity, @"width": @(size.width), @"height": @(size.height),
+        @"element": element ?: [NSNull null]}];
     self.writeCount++;
+    NSDictionary *prior = self.elementFrames[key] ?: Frame(0, 0, size.width, size.height);
+    [self updateAXFrame:Frame([prior[@"x"] doubleValue], [prior[@"y"] doubleValue], size.width, size.height)
+             forElement:element];
     return YES;
 }
 @end
+
+static NSURL *WriteTempFixtureApp(NSString *bundleID) {
+    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"yomado-mgr-%@", NSUUID.UUID.UUIDString]];
+    NSString *appPath = [root stringByAppendingPathComponent:@"Calculator.app"];
+    NSString *contents = [appPath stringByAppendingPathComponent:@"Contents"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:contents withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+    NSDictionary *plist = @{@"CFBundleIdentifier": bundleID,
+                            @"CFBundleName": @"Calculator",
+                            @"CFBundleExecutable": @"Calculator",
+                            @"CFBundlePackageType": @"APPL"};
+    [plist writeToURL:[NSURL fileURLWithPath:[contents stringByAppendingPathComponent:@"Info.plist"]]
+              atomically:YES];
+    return [NSURL fileURLWithPath:appPath];
+}
 
 #pragma mark - Workspace fixture
 
@@ -274,6 +394,13 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 - (void)installPlacementElement:(id)element application:(YMFakeRunningApp *)app
                        windowID:(CGWindowID)windowID origin:(NSDictionary *)origin
                   lastDisplayID:(CGDirectDisplayID)lastDisplayID {
+    [self installPlacementElement:element application:app windowID:windowID
+                           origin:origin lastDisplayID:lastDisplayID identity:nil];
+}
+
+- (void)installPlacementElement:(id)element application:(YMFakeRunningApp *)app
+                       windowID:(CGWindowID)windowID origin:(NSDictionary *)origin
+                  lastDisplayID:(CGDirectDisplayID)lastDisplayID identity:(NSDictionary *)identity {
     Class cls = NSClassFromString(@"YMWPlacement");
     Check(cls != Nil, @"YMWPlacement class must be linked");
     id placement = [cls new];
@@ -283,6 +410,7 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     [placement setValue:@(windowID) forKey:@"windowID"];
     [placement setValue:origin forKey:@"origin"];
     [placement setValue:@(lastDisplayID) forKey:@"lastDisplayID"];
+    if (identity) [placement setValue:identity forKey:@"identity"];
     [[self valueForKey:@"placements"] addObject:placement];
 }
 @end
@@ -296,6 +424,18 @@ static YMWorkspaceFixture *FixtureWithThumbnail(YMFakeWindowAccess **outAccess) 
                      axFrame:Frame(830, 719, 230, 408)];
     YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
     if (outAccess) *outAccess = access;
+    return workspace;
+}
+
+static YMWorkspaceFixture *ManagerFixture(YMFakeWindowAccess **outAccess, NSURL **outURL,
+                                          NSDictionary *cgFrame, NSDictionary *axFrame) {
+    NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+    YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+    [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+    [access installWindowPID:42 windowID:1490 cgFrame:cgFrame axFrame:axFrame];
+    YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+    if (outAccess) *outAccess = access;
+    if (outURL) *outURL = fixtureURL;
     return workspace;
 }
 
@@ -1051,11 +1191,354 @@ int main(void) {
                   @"over-cap unknown tail must not authorize empty no-AX close");
         }
 
-        // Default init must not be used by these fixtures.
+        // --- Task 5: real manager entry + exact identity move/restore ---
         {
-            // Ensure runtime tests never construct the native default manager path
-            // for assertions above — all fixtures used initWithWindowAccess:.
-            Check(YES, @"fixtures inject fake access only");
+            // Step 1 smoke: Stage Manager thumbnail through public move/restore.
+            YMFakeWindowAccess *access = nil;
+            NSURL *fixtureURL = nil;
+            NSDictionary *originalFrame = Frame(830, 719, 230, 408);
+            NSDictionary *identity = Identity(42, 1490);
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                Frame(15, 982, 37, 102), originalFrame);
+            [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:displays];
+            // Do not drain: selected-app move must not require global UI ready.
+            Check(!workspace.inventoryReady, @"move probe starts without inventory ready");
+            NSError *error = nil;
+            NSUInteger activationsBefore = access.activationRequests;
+            BOOL moved = [workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8
+                                                   error:&error];
+            Check(moved, @"Stage Manager thumbnail moves through the real manager entry point");
+            Check(access.positionWrites.count == 1, @"only the selected window is written");
+            if (access.positionWrites.count)
+                Check([access.positionWrites[0][@"identity"] isEqual:identity],
+                      @"write targets exact identity");
+            else
+                Check(NO, @"write targets exact identity");
+            Check(access.activationRequests == activationsBefore,
+                  @"no target application activation");
+            // Seed activation counter can rise only when activateWithOptions: is messaged.
+            [(id)access.appsByPID[@42] activateWithOptions:0];
+            Check(access.activationRequests == activationsBefore + 1,
+                  @"activationRequests records real activate attempts");
+            BOOL restored = moved && [workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:8 toPhysicalDisplayID:5 error:&error];
+            Check(restored && YMWorkspaceSameFrame(access.currentFrame, originalFrame),
+                  @"return uses real origin instead of thumbnail geometry");
+        }
+        {
+            // Small and large thumbnails; same size different IDs stay distinct.
+            YMFakeWindowAccess *access = nil;
+            NSURL *fixtureURL = nil;
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                Frame(20, 900, 120, 140), Frame(100, 100, 400, 300));
+            [access installWindowPID:42 windowID:1491
+                             cgFrame:Frame(40, 900, 120, 140)
+                             axFrame:Frame(500, 100, 400, 300)];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSError *error = nil;
+            Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"large-enough Stage Manager thumbnails move by identity");
+            Check(access.positionWrites.count == 2, @"both same-size windows written once each");
+            NSSet *written = [NSSet setWithArray:@[access.positionWrites[0][@"identity"],
+                                                   access.positionWrites[1][@"identity"]]];
+            Check([written containsObject:Identity(42, 1490)] &&
+                  [written containsObject:Identity(42, 1491)],
+                  @"same-size different IDs are not confused");
+        }
+        {
+            // Source isolation across physical5 / virtual8 / virtual9.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:100
+                             cgFrame:Frame(100, 100, 230, 408) axFrame:Frame(100, 100, 230, 408)];
+            [access installWindowPID:42 windowID:200
+                             cgFrame:Frame(2700, 100, 230, 408) axFrame:Frame(2700, 100, 230, 408)];
+            [access installWindowPID:42 windowID:300
+                             cgFrame:Frame(5300, 100, 230, 408) axFrame:Frame(5300, 100, 230, 408)];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:displays];
+            NSError *error = nil;
+            Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"physical card move succeeds");
+            Check(access.positionWrites.count == 1 &&
+                  [access.positionWrites[0][@"identity"] isEqual:Identity(42, 100)],
+                  @"from5→8 only writes physical window");
+            [access.positionWrites removeAllObjects];
+            Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:8 toDisplayID:9 error:&error],
+                  @"virtual→virtual transfer succeeds");
+            NSMutableSet *ids = [NSMutableSet set];
+            for (NSDictionary *write in access.positionWrites) [ids addObject:write[@"identity"]];
+            Check(access.positionWrites.count == 2 &&
+                  [ids containsObject:Identity(42, 100)] &&
+                  [ids containsObject:Identity(42, 200)] &&
+                  ![ids containsObject:Identity(42, 300)],
+                  @"from8→9 writes only windows on 8, never screen 9");
+            // Finder whole-app (source=nil) keeps explicit cross-source semantics.
+            access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:100
+                             cgFrame:Frame(100, 100, 230, 408) axFrame:Frame(100, 100, 230, 408)];
+            [access installWindowPID:42 windowID:200
+                             cgFrame:Frame(2700, 100, 230, 408) axFrame:Frame(2700, 100, 230, 408)];
+            [access installWindowPID:42 windowID:300
+                             cgFrame:Frame(5300, 100, 230, 408) axFrame:Frame(5300, 100, 230, 408)];
+            workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:displays];
+            [access.positionWrites removeAllObjects];
+            Check([workspace moveApplicationAtURL:fixtureURL toDisplayID:8 error:&error],
+                  @"Finder whole-app drop moves every non-target source window");
+            Check(access.positionWrites.count == 2, @"nil source moves physical and other-virtual only");
+        }
+        {
+            // Hidden / minimized / non-ordinary / AX-not-in-CG are not moved; dialog blocks.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:Frame(100, 100, 230, 408) axFrame:Frame(100, 100, 230, 408)];
+            // AX-only (not in CG): must not be collected.
+            id ghost = @"el-ghost";
+            NSMutableArray *ax = [access.axByPID[@42] mutableCopy];
+            [ax addObject:@{@"identity": Identity(42, 9999), @"frame": Frame(120, 120, 230, 408),
+                @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES,
+                @"element": ghost}];
+            access.axByPID[@42] = ax;
+            access.elementFrames[[NSString stringWithFormat:@"%p", ghost]] = Frame(120, 120, 230, 408);
+            access.elementIdentities[[NSString stringWithFormat:@"%p", ghost]] = Identity(42, 9999);
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSError *error = nil;
+            Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"AX-not-in-CG ghost does not block or move");
+            Check(access.positionWrites.count == 1 &&
+                  [access.positionWrites[0][@"identity"] isEqual:Identity(42, 1490)],
+                  @"only CG-visible ordinary window is written");
+
+            // Dialog blocker on source refuses move.
+            access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:Frame(100, 100, 230, 408) axFrame:Frame(100, 100, 230, 408)];
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1500,
+                @"frame": Frame(150, 150, 200, 200), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            ax = [access.axByPID[@42] mutableCopy];
+            id dialog = @"el-dialog";
+            [ax addObject:@{@"identity": Identity(42, 1500), @"frame": Frame(150, 150, 200, 200),
+                @"ordinary": @NO, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES,
+                @"element": dialog}];
+            access.axByPID[@42] = ax;
+            access.elementFrames[[NSString stringWithFormat:@"%p", dialog]] = Frame(150, 150, 200, 200);
+            access.elementIdentities[[NSString stringWithFormat:@"%p", dialog]] = Identity(42, 1500);
+            workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [access.positionWrites removeAllObjects];
+            error = nil;
+            Check(![workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"dialog blocker refuses source move");
+            Check(access.positionWrites.count == 0, @"dialog blocker writes nothing");
+        }
+        {
+            // Identity change between candidates and first write stops; no unsafe write.
+            YMFakeWindowAccess *access = nil;
+            NSURL *fixtureURL = nil;
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                Frame(100, 100, 230, 408), Frame(100, 100, 230, 408));
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            access.flipIdentityOnNextObserveElement = YES;
+            NSError *error = nil;
+            Check(![workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"identity change before write fails closed");
+            Check(error.code == 11, @"identity change uses code 11");
+            Check(access.positionWrites.count == 0, @"identity change writes nothing");
+        }
+        {
+            // Replacement window ID must not inherit a prior origin checkpoint.
+            YMFakeWindowAccess *access = nil;
+            NSURL *fixtureURL = nil;
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                Frame(100, 100, 230, 408), Frame(100, 100, 230, 408));
+            id element = access.axByPID[@42].firstObject[@"element"];
+            YMFakeRunningApp *app = access.appsByPID[@42];
+            NSDictionary *oldOrigin = YMWorkspaceOrigin(Frame(50, 50, 230, 408),
+                                                        RuntimeDisplay(5, 0, NO, @"physical"));
+            NSDictionary *oldIdentity = @{@"pid": @42, @"windowID": @1490, @"startSeconds": @1,
+                @"startMicroseconds": @1, @"bundleID": @"test.calculator"};
+            [workspace installPlacementElement:element application:app windowID:1490
+                                        origin:oldOrigin lastDisplayID:5 identity:oldIdentity];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSError *error = nil;
+            Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"replacement with new lifecycle identity can still move");
+            id placement = [[workspace valueForKey:@"placements"] firstObject];
+            Check(!YMWorkspaceSameWindowIdentity([placement valueForKey:@"identity"], oldIdentity),
+                  @"live placement stores the new identity");
+            Check(![[placement valueForKey:@"origin"] isEqual:oldOrigin],
+                  @"replacement never inherits prior origin checkpoint");
+        }
+        {
+            // Write fails then rollback succeeds → checkpoint cleaned when created this move.
+            YMFakeWindowAccess *access = nil;
+            NSURL *fixtureURL = nil;
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                Frame(100, 100, 230, 408), Frame(100, 100, 230, 408));
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            access.failNextPositionWrites = 1; // destination fails; rollback succeeds
+            NSError *error = nil;
+            Check(![workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"failed destination with successful rollback reports failure");
+            Check(error.code == 12, @"rollback success uses code 12");
+            Check([[workspace valueForKey:@"placements"] count] == 0,
+                  @"successful rollback clears newly created checkpoint");
+            Check(YMWorkspaceSameFrame(access.currentFrame, Frame(100, 100, 230, 408)),
+                  @"successful rollback restores prior frame");
+        }
+        {
+            // Write fails and rollback fails → keep target ownership record.
+            YMFakeWindowAccess *access = nil;
+            NSURL *fixtureURL = nil;
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                Frame(100, 100, 230, 408), Frame(100, 100, 230, 408));
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            access.failNextPositionWrites = 2;
+            NSError *error = nil;
+            Check(![workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"failed destination and rollback keeps records");
+            Check([[workspace valueForKey:@"placements"] count] == 1,
+                  @"failed rollback retains placement on target screen");
+            id placement = [[workspace valueForKey:@"placements"] firstObject];
+            Check([[placement valueForKey:@"lastDisplayID"] unsignedIntValue] == 8,
+                  @"failed rollback leaves lastDisplayID on target");
+        }
+        {
+            // Manual entry without checkpoint → explicit physical return centers.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            NSDictionary *virtualFrame = Frame(2700, 100, 230, 408);
+            [access installWindowPID:42 windowID:1490 cgFrame:virtualFrame axFrame:virtualFrame];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSError *error = nil;
+            Check([workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:8 toPhysicalDisplayID:5 error:&error],
+                  @"manual entry without checkpoint restores to requested physical");
+            // Centered on physical usable area: x=(2560-230)/2=1165, y=32+(1408-408)/2=532
+            Check(YMWorkspaceSameFrame(access.currentFrame, Frame(1165, 532, 230, 408)),
+                  @"manual return centers on requested physical screen");
+        }
+        {
+            // Return to a different physical screen does not reuse old offsets.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            NSDictionary *virtualFrame = Frame(2700, 100, 230, 408);
+            [access installWindowPID:42 windowID:1490 cgFrame:virtualFrame axFrame:virtualFrame];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            NSDictionary *origin = YMWorkspaceOrigin(Frame(100, 100, 230, 408),
+                                                     RuntimeDisplay(5, 0, NO, @"physical"));
+            id element = access.axByPID[@42].firstObject[@"element"];
+            [workspace installPlacementElement:element application:access.appsByPID[@42]
+                                      windowID:1490 origin:origin lastDisplayID:8
+                                      identity:Identity(42, 1490)];
+            // Add a second physical display as explicit target.
+            NSArray *twoPhysical = @[RuntimeDisplay(5, 0, NO, @"physical"),
+                @{@"displayID": @6, @"displayUUID": @"other-physical",
+                  @"bounds": Frame(-2560, 0, 2560, 1440), @"isMain": @NO,
+                  @"isActive": @YES, @"isOnline": @YES, @"isVirtual": @NO},
+                RuntimeDisplay(8, 2560, YES, @"agent-a"),
+                RuntimeDisplay(9, 5120, YES, @"agent-b")];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:twoPhysical];
+            NSError *error = nil;
+            Check([workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:8 toPhysicalDisplayID:6 error:&error],
+                  @"explicit other physical target restores");
+            // Centered on display 6 usable area, not old (100,100) offsets.
+            Check(YMWorkspaceSameFrame(access.currentFrame, Frame(-2560 + 1165, 532, 230, 408)),
+                  @"other physical target centers rather than reusing old offsets");
+        }
+        {
+            // Delayed CG: CG physical thumbnail while AX already on virtual8 — keep origin.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            access.syncCGOnWrite = NO;
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            NSDictionary *cgPhysical = Frame(15, 982, 37, 102);
+            NSDictionary *axVirtual = Frame(2700, 100, 230, 408);
+            [access installWindowPID:42 windowID:1490 cgFrame:cgPhysical axFrame:axVirtual];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            NSDictionary *origin = YMWorkspaceOrigin(Frame(830, 719, 230, 408),
+                                                     RuntimeDisplay(5, 0, NO, @"physical"));
+            id element = access.axByPID[@42].firstObject[@"element"];
+            [workspace installPlacementElement:element application:access.appsByPID[@42]
+                                      windowID:1490 origin:origin lastDisplayID:8
+                                      identity:Identity(42, 1490)];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check([[workspace valueForKey:@"placements"] count] == 1,
+                  @"delayed physical CG keeps origin while AX owns virtual");
+            Check([[workspace rowsForDisplayID:8] count] == 1,
+                  @"AX virtual geometry owns the window for inventory rows");
+        }
+        {
+            // Unrelated app inventory timeout does not block selected-app move;
+            // close still requires full evidence.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:Frame(100, 100, 230, 408) axFrame:Frame(100, 100, 230, 408)];
+            [access installApp:77 name:@"Other" bundle:@"test.other"];
+            [access installWindowPID:77 windowID:7700
+                             cgFrame:Frame(200, 200, 300, 300) axFrame:Frame(200, 200, 300, 300)];
+            [access.forceIncompletePIDs addObject:@77];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady, @"unrelated app timeout leaves inventory not ready");
+            NSError *error = nil;
+            Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"unrelated app timeout does not block selected-app move");
+            Check(access.positionWrites.count == 1, @"selected app still writes once");
+            Check(![workspace restoreDisplayID:8 error:&error],
+                  @"close still requires full-range inventory evidence");
+        }
+        {
+            // Adopt then restore uses checkpoint origin; closed/unresolvable rejects export.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            NSDictionary *virtualFrame = Frame(2700, 100, 230, 408);
+            [access installWindowPID:42 windowID:1490 cgFrame:virtualFrame axFrame:virtualFrame];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            NSDictionary *identity = Identity(42, 1490);
+            NSDictionary *origin = @{@"displayUUID": @"physical",
+                @"relative": Frame(100, 100, 230, 408)};
+            NSError *error = nil;
+            Check([workspace adoptRestartOriginCheckpoints:@[@{@"identity": identity, @"origin": origin}]
+                                                     error:&error],
+                  @"adopt accepts live resolvable checkpoint");
+            Check([workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:8 toPhysicalDisplayID:5 error:&error],
+                  @"adopted origin restores correctly");
+            Check(YMWorkspaceSameFrame(access.currentFrame, Frame(100, 100, 230, 408)),
+                  @"adopted origin returns exact remembered frame");
+
+            // Unresolvable identity refuses adopt (no bogus empty origin).
+            access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:1490 cgFrame:virtualFrame axFrame:virtualFrame];
+            workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            NSDictionary *missing = @{@"pid": @42, @"windowID": @1490, @"startSeconds": @9999,
+                @"startMicroseconds": @1, @"bundleID": @"test.calculator"};
+            error = nil;
+            Check(![workspace adoptRestartOriginCheckpoints:@[@{@"identity": missing, @"origin": origin}]
+                                                      error:&error],
+                  @"unresolvable identity refuses adopt");
         }
 
         printf("App workspace runtime tests: %lu passed, %lu failed; no GUI or display calls executed.\n",
