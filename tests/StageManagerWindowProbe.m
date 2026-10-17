@@ -572,15 +572,24 @@ static int ProbeWriteFailureReceipt(NSString *receiptPath, CGDirectDisplayID tar
     return code;
 }
 
+// Self-test injection only: force the real permission exit without changing AX settings.
+static BOOL gProbeForcePermissionDenied = NO;
+static BOOL ProbeAccessibilityTrusted(void) {
+    if (gProbeForcePermissionDenied) return NO;
+    return AXIsProcessTrusted();
+}
+
 static int ProbeRunNative(NSString *mode, pid_t pid, CGWindowID windowID, CGDirectDisplayID targetID,
                           NSString *receiptPath) {
     if (pid <= 0 || windowID == 0 || targetID == 0) {
         fprintf(stderr, "pid, window-id and target-display-id must be positive integers\n");
         return 2;
     }
-    if (!AXIsProcessTrusted()) {
+    if (!ProbeAccessibilityTrusted()) {
         fprintf(stderr, "Accessibility permission unavailable\n");
-        return ProbeWriteFailureReceipt(receiptPath, targetID, nil, @"permission", 3);
+        // Keep CLI-known target fields only — never invent lifecycle identity here.
+        return ProbeWriteFailureReceipt(receiptPath, targetID,
+            @{@"pid": @(pid), @"windowID": @(windowID)}, @"permission", 3);
     }
     NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
     if (!app || app.terminated || ![app.bundleIdentifier isEqualToString:@"com.apple.calculator"]) {
@@ -810,6 +819,31 @@ static void RunSelfTests(void) {
               @"failure receipt records zero writes");
         Check([json[@"targetDisplayID"] isEqual:@9], @"failure receipt keeps target id");
     }
+    // Real permission exit wiring: inject deny through ProbeRunNative, not helper-only.
+    Check(ProbeWriteReceipt(ProbeReceipt(priorPass, ProbeIdentity(42, 7, @"com.apple.calculator"),
+                                         ProbeFrame(10, 20, 30, 40), 9, @""),
+                            receiptPath, &receiptError),
+          @"reseed prior passed receipt before permission wiring");
+    gProbeForcePermissionDenied = YES;
+    int permissionCode = ProbeRunNative(@"--check", 42, 7, 9, receiptPath);
+    gProbeForcePermissionDenied = NO;
+    Check(permissionCode == 3, @"permission wiring returns permission exit code");
+    NSData *permissionData = [NSData dataWithContentsOfFile:receiptPath];
+    NSDictionary *permissionJSON = permissionData
+        ? [NSJSONSerialization JSONObjectWithData:permissionData options:0 error:nil] : nil;
+    Check([permissionJSON isKindOfClass:NSDictionary.class], @"permission wiring writes JSON receipt");
+    Check([permissionJSON[@"passed"] isEqual:@NO], @"permission wiring clears prior passed:true");
+    Check([permissionJSON[@"failureReason"] isEqual:@"permission"],
+          @"permission wiring records permission stage");
+    Check([permissionJSON[@"targetDisplayID"] isEqual:@9],
+          @"permission wiring keeps target display");
+    Check([permissionJSON[@"identity"][@"pid"] isEqual:@42],
+          @"permission wiring retains known CLI pid");
+    Check([permissionJSON[@"identity"][@"windowID"] isEqual:@7],
+          @"permission wiring retains known CLI windowID");
+    Check(permissionJSON[@"identity"][@"startSeconds"] == nil &&
+              permissionJSON[@"identity"][@"startMicroseconds"] == nil,
+          @"permission wiring must not invent lifecycle identity fields");
     [[NSFileManager defaultManager] removeItemAtPath:receiptDir error:nil];
 
     fprintf(stderr, "PASS %u self-test checks\n", (unsigned)gChecks);

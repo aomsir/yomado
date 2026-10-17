@@ -70,6 +70,8 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 @property(nonatomic, copy) NSDictionary *observeElementMutation;
 @property(nonatomic, copy) void (^observeElementSideEffect)(NSUInteger count);
 @property(nonatomic, strong) NSMutableArray<NSNumber *> *observedPIDs;
+/// When YES, applicationForPID returns a fresh equal wrapper (not pointer-identical).
+@property(nonatomic) BOOL reboxApplicationWrappers;
 @end
 
 @interface YMFakeRunningApp : NSObject
@@ -80,12 +82,23 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 @property(nonatomic, copy) NSString *localizedName;
 @property(nonatomic, strong) NSImage *icon;
 @property(nonatomic, weak) YMFakeWindowAccess *access;
+/// Stable across equal wrappers of one process lifetime; replaced on same-PID relaunch.
+@property(nonatomic, strong) id lifecycleToken;
 @end
 @implementation YMFakeRunningApp
 - (BOOL)activateWithOptions:(NSApplicationActivationOptions)options {
     (void)options;
     self.access.activationRequests += 1;
     return NO;
+}
+- (BOOL)isEqual:(id)other {
+    if (other == self) return YES;
+    if (![other isKindOfClass:YMFakeRunningApp.class]) return NO;
+    YMFakeRunningApp *app = other;
+    return self.lifecycleToken != nil && self.lifecycleToken == app.lifecycleToken;
+}
+- (NSUInteger)hash {
+    return self.lifecycleToken ? (NSUInteger)self.lifecycleToken : (NSUInteger)self;
 }
 @end
 
@@ -122,6 +135,8 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     app.bundleURL = bundleURL ?: [NSURL fileURLWithPath:[NSString stringWithFormat:@"/tmp/fake-%@.app", bundle]];
     app.terminated = NO;
     app.access = self;
+    // New install = new lifecycle, even when PID is reused after termination.
+    app.lifecycleToken = app;
     self.appsByPID[@(pid)] = app;
     return app;
 }
@@ -245,7 +260,18 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 }
 
 - (nullable NSRunningApplication *)applicationForPID:(pid_t)pid {
-    return (NSRunningApplication *)self.appsByPID[@(pid)];
+    YMFakeRunningApp *stored = self.appsByPID[@(pid)];
+    if (!stored) return nil;
+    if (!self.reboxApplicationWrappers) return (NSRunningApplication *)stored;
+    YMFakeRunningApp *wrapper = [YMFakeRunningApp new];
+    wrapper.processIdentifier = stored.processIdentifier;
+    wrapper.terminated = stored.terminated;
+    wrapper.bundleIdentifier = stored.bundleIdentifier;
+    wrapper.bundleURL = stored.bundleURL;
+    wrapper.localizedName = stored.localizedName;
+    wrapper.access = stored.access;
+    wrapper.lifecycleToken = stored.lifecycleToken;
+    return (NSRunningApplication *)wrapper;
 }
 
 - (NSArray<NSRunningApplication *> *)applicationsForBundleIdentifier:(NSString *)bundleID {
@@ -1963,7 +1989,8 @@ int main(void) {
             access.axByPID[@42] = @[ax];
             access.elementFrames[[access elementKey:ax[@"element"]]] = ax[@"frame"];
             access.elementIdentities[[access elementKey:ax[@"element"]]] = identity;
-            (void)replacement;
+            Check(![replacement isEqual:original],
+                  @"#3 same-PID replacement must not be lifecycle-equal to prior process");
             dispatch_block_t publish = workspace.pendingPublishes.firstObject;
             [workspace.pendingPublishes removeObjectAtIndex:0];
             publish();
@@ -1971,6 +1998,46 @@ int main(void) {
                   @"#3 replacement process cannot publish ready with stale AX");
             Check([[workspace rowsForDisplayID:5] count] == 0,
                   @"#3 replacement must not publish old physical geometry as current");
+        }
+        {
+            // Equal wrappers of the same lifetime must publish; pointer singleton is not required.
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:Frame(15, 982, 37, 102)
+                             axFrame:Frame(830, 719, 230, 408)];
+            YMFakeRunningApp *stored = access.appsByPID[@42];
+            access.reboxApplicationWrappers = YES;
+            id first = [access applicationForPID:42];
+            id second = [access applicationForPID:42];
+            Check(first != second, @"#3 reboxed wrappers are distinct objects");
+            Check([first isEqual:second], @"#3 reboxed wrappers share process lifecycle equality");
+            Check([first isEqual:stored], @"#3 reboxed wrapper equals stored lifecycle token");
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady,
+                  @"#3 same-lifecycle reboxed wrappers must still publish ready");
+            Check([[workspace rowsForDisplayID:5] count] == 1,
+                  @"#3 same-lifecycle reboxed wrappers keep physical rows");
+            Check(![workspace needsRestoreForDisplayID:8],
+                  @"#3 same-lifecycle reboxed wrappers must not force restore");
+        }
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            dispatch_block_t read = workspace.pendingReads.firstObject;
+            [workspace.pendingReads removeObjectAtIndex:0];
+            read();
+            YMFakeRunningApp *original = access.appsByPID[@42];
+            original.terminated = YES;
+            // Live lookup still returns the terminated object (no replacement installed).
+            dispatch_block_t publish = workspace.pendingPublishes.firstObject;
+            [workspace.pendingPublishes removeObjectAtIndex:0];
+            publish();
+            Check(!workspace.inventoryReady,
+                  @"#3 terminated observed process cannot publish ready");
         }
 
         // --- Global fix: MUST_FIX #4/#5 confirmed aux exclusion vs non-admitted ---
@@ -1988,14 +2055,35 @@ int main(void) {
             NSDictionary *snapshot = YMWorkspaceNormalizeWindowSnapshot(access.cgWindows, ax, YES, displays);
             Check([snapshot[@"complete"] boolValue] && [snapshot[@"blockers"] count] == 0,
                   @"#4 normalizer confirms small aux without blockers");
-            Check([snapshot[@"excluded"] count] >= 1,
-                  @"#4 normalizer retains confirmed exclusion evidence");
+            Check(snapshot[@"excluded"] == nil,
+                  @"#4 normalizer must not expose excluded schema field");
+            Check([snapshot[@"windows"] count] == 1,
+                  @"#4 ordinary window remains while aux is privately excluded");
+            BOOL auxPublished = NO;
+            for (NSDictionary *window in snapshot[@"windows"]) {
+                if ([window[@"windowID"] isEqual:@1491]) auxPublished = YES;
+            }
+            Check(!auxPublished, @"#4 confirmed aux must not appear in published windows");
             [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
             [workspace drainReads];
             Check(workspace.inventoryReady,
                   @"#4 confirmed aux exclusion must not block inventory ready");
             Check(![workspace needsRestoreForDisplayID:8],
                   @"#4 confirmed aux exclusion must not keep needsRestore");
+        }
+        {
+            // Unknown/unmatched admitted CG must still fail closed without excluded schema.
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
+                @"frame": Frame(830, 719, 230, 408), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            // No AX record → unmatched, not confirmed exclusion.
+            access.axByPID[@42] = @[];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady,
+                  @"#4 unmatched admitted CG must fail closed without excluded schema");
         }
         {
             YMFakeWindowAccess *access = [YMFakeWindowAccess new];

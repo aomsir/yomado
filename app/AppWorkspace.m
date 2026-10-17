@@ -387,8 +387,10 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
             ![observed respondsToSelector:@selector(isTerminated)]) return NO;
         if (observed.terminated) return NO;
         NSRunningApplication *live = [self.windowAccess applicationForPID:pidValue.intValue];
+        if (!live || live.terminated) return NO;
+        // Lifecycle equality, not pointer identity — equal wrappers of one process are OK.
         // Same-PID replacement must not reuse AX collected against the prior process.
-        if (live != observed) return NO;
+        if (![live isEqual:observed]) return NO;
         if (!live.bundleIdentifier.length || !live.bundleURL) return NO;
     }
     return YES;
@@ -401,7 +403,8 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         NSRunningApplication *observed = observedApps[@(pid)];
         NSRunningApplication *app = observed ?: [self.windowAccess applicationForPID:pid];
         if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) continue;
-        if (observed && (observed.terminated || [self.windowAccess applicationForPID:pid] != observed))
+        NSRunningApplication *live = [self.windowAccess applicationForPID:pid];
+        if (observed && (observed.terminated || !live || live.terminated || ![live isEqual:observed]))
             continue;
         NSMutableDictionary *window = [entry mutableCopy];
         window[@"bundleIdentifier"] = app.bundleIdentifier;
@@ -411,19 +414,56 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
     return windows;
 }
-- (BOOL)snapshotHasUnresolvedEvidence:(NSDictionary *)snapshot cg:(NSArray *)cgWindows {
+// Private confirmed-exclusion evidence bound to this job's already-classified CG/AX.
+// Reuses normalizer on single-record subsets; does not extend the public snapshot schema.
+- (NSSet<NSString *> *)confirmedExcludedKeysFromCG:(NSArray *)cgWindows
+                                        axRecords:(NSArray *)axRecords
+                                         displays:(NSArray *)displays {
+    if (![cgWindows isKindOfClass:NSArray.class] || ![axRecords isKindOfClass:NSArray.class] ||
+        ![displays isKindOfClass:NSArray.class]) return [NSSet set];
+    NSMutableDictionary *axByKey = [NSMutableDictionary dictionary];
+    for (NSDictionary *ax in axRecords) {
+        if (![ax isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *identity = ax[@"identity"];
+        if (![identity isKindOfClass:NSDictionary.class] ||
+            !YMWorkspaceIdentityInteger(identity[@"pid"], 1, INT_MAX) ||
+            !YMWorkspaceIdentityInteger(identity[@"windowID"], 1, UINT32_MAX)) continue;
+        NSString *key = YMWorkspaceWindowKey(identity[@"pid"], identity[@"windowID"]);
+        if (axByKey[key]) {
+            axByKey[key] = [NSNull null]; // duplicate AX → never confirm exclusion
+            continue;
+        }
+        axByKey[key] = ax;
+    }
+    BOOL truncated = NO;
+    NSArray *admitted = [self admittedCGCandidates:cgWindows truncated:&truncated];
+    if (truncated) return [NSSet set];
+    NSMutableSet *excluded = [NSMutableSet set];
+    for (NSDictionary *cg in admitted) {
+        NSString *key = YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"]);
+        id ax = axByKey[key];
+        if (![ax isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *subset = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[ax], YES, displays);
+        if (![subset[@"complete"] boolValue]) continue;
+        if ([subset[@"blockers"] count]) continue;
+        if ([subset[@"windows"] count]) continue;
+        [excluded addObject:key];
+    }
+    return excluded;
+}
+- (BOOL)snapshotHasUnresolvedEvidence:(NSDictionary *)snapshot cg:(NSArray *)cgWindows
+                         excludedKeys:(NSSet<NSString *> *)excludedKeys {
     if (![snapshot[@"complete"] boolValue]) return YES;
     if ([snapshot[@"blockers"] count]) return YES;
     BOOL truncated = NO;
     NSArray *admitted = [self admittedCGCandidates:cgWindows truncated:&truncated];
     if (truncated) return YES;
     // Any visible CG candidate that did not become a published window remains unknown,
-    // unless the normalizer retained exact confirmed-exclusion evidence for it.
+    // unless this job privately confirmed exact exclusion against current CG/AX.
     NSMutableSet *published = [NSMutableSet set];
     for (NSDictionary *window in snapshot[@"windows"])
         [published addObject:YMWorkspaceWindowKey(window[@"pid"], window[@"windowID"])];
-    NSSet *excluded = [NSSet setWithArray:[snapshot[@"excluded"] isKindOfClass:NSArray.class]
-        ? snapshot[@"excluded"] : @[]];
+    NSSet *excluded = excludedKeys ?: [NSSet set];
     for (NSDictionary *cg in admitted) {
         NSString *key = YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"]);
         if ([published containsObject:key]) continue;
@@ -482,7 +522,6 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
                      complete:(BOOL)complete reason:(NSString *)reason
                      snapshot:(NSDictionary *)snapshot axRecords:(NSArray *)axRecords
                  observedApps:(NSDictionary *)observedApps {
-    (void)axRecords;
     if (self.operationInProgress) {
         // Write still settling: keep latest request but do not publish/retire.
         self.inventoryReady = NO;
@@ -538,16 +577,19 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         // missing fields, and over-cap tails must not prove an owned virtual empty.
         BOOL unresolved = [self cgHasUnclassifiableEvidence:liveCG] ||
             [self snapshotHasUnresolvedEvidence:
-                @{@"windows": windows, @"blockers": @[], @"excluded": @[], @"complete": @YES}
-                                                   cg:liveCG];
+                @{@"windows": windows, @"blockers": @[], @"complete": @YES}
+                                                   cg:liveCG
+                                        excludedKeys:nil];
         [self publishWindows:windows ready:!unresolved key:liveKey generation:jobGeneration
                 excludedKeys:nil];
         [self drainLatestInventoryRequest];
         return;
     }
-    NSSet *excludedKeys = [NSSet setWithArray:[snapshot[@"excluded"] isKindOfClass:NSArray.class]
-        ? snapshot[@"excluded"] : @[]];
-    // Observed process must still be the same object; same-PID relaunch discards.
+    // Private evidence from this job's axRecords + current CG — not snapshot schema.
+    NSSet *excludedKeys = [self confirmedExcludedKeysFromCG:liveCG
+                                                  axRecords:axRecords
+                                                   displays:self.displays];
+    // Observed process must still match by lifecycle equality; same-PID relaunch discards.
     if (observedApps.count && ![self observedAppsStillCurrent:observedApps]) {
         self.inventoryPublishedKey = liveKey;
         self.inventoryPublishedGeneration = jobGeneration;
@@ -564,7 +606,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     // identity/frame/layer/onScreen/alpha); those still block ready/empty close.
     if (!complete || !snapshot || ![snapshot[@"complete"] boolValue] ||
         [self cgHasUnclassifiableEvidence:liveCG] ||
-        [self snapshotHasUnresolvedEvidence:snapshot cg:liveCG]) {
+        [self snapshotHasUnresolvedEvidence:snapshot cg:liveCG excludedKeys:excludedKeys]) {
         NSArray *partial = snapshot
             ? [self assembledWindowsFromSnapshot:snapshot observedApps:observedApps]
             : self.windows;

@@ -219,7 +219,7 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
     BOOL enumerationComplete, NSArray<NSDictionary *> *displays) {
     if (!enumerationComplete || ![cgWindows isKindOfClass:NSArray.class] ||
         ![axWindows isKindOfClass:NSArray.class] || ![displays isKindOfClass:NSArray.class])
-        return @{@"windows": @[], @"blockers": @[], @"excluded": @[], @"complete": @NO};
+        return @{@"windows": @[], @"blockers": @[], @"complete": @NO};
 
     NSMutableDictionary *cgByKey = [NSMutableDictionary dictionary];
     NSMutableDictionary *axByKey = [NSMutableDictionary dictionary];
@@ -228,7 +228,6 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
     NSMutableSet *crossPIDWindowIDs = [NSMutableSet set];
     NSMutableArray *blockers = [NSMutableArray array];
     NSMutableArray *windows = [NSMutableArray array];
-    NSMutableArray *excluded = [NSMutableArray array];
     BOOL complete = YES;
 
     for (NSDictionary *cg in cgWindows) {
@@ -271,7 +270,7 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
         }
         for (NSNumber *windowID in crossPIDWindowIDs)
             [blockers addObject:YMWorkspaceBlocker(@0, windowID, @"crossPID", nil)];
-        return @{@"windows": @[], @"blockers": blockers, @"excluded": @[], @"complete": @YES};
+        return @{@"windows": @[], @"blockers": blockers, @"complete": @YES};
     }
 
     for (NSString *key in cgByKey) {
@@ -307,10 +306,9 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
             } else if (YMWorkspaceCGMeetsOldSize(axFrame)) {
                 [blockers addObject:YMWorkspaceBlocker(cg[@"pid"], cg[@"windowID"],
                     minimized ? @"minimized" : @"nonOrdinary", display)];
-            } else {
-                // Exact classified exclusion: small non-ordinary/minimized surface.
-                [excluded addObject:YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"])];
             }
+            // Exact classified small non-ordinary/minimized: omit without blocker.
+            // Manager privately re-classifies current CG/AX to confirm exclusion.
             continue;
         }
         if (!axFrame) {
@@ -318,7 +316,7 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
             continue;
         }
         if (!YMWorkspaceCGMeetsOldSize(axFrame)) {
-            [excluded addObject:YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"])];
+            // Exact classified undersized ordinary: omit without blocker.
             continue;
         }
         if (!display) {
@@ -336,8 +334,7 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
         [windows addObject:entry];
     }
 
-    return @{@"windows": windows, @"blockers": blockers, @"excluded": excluded,
-             @"complete": @(complete)};
+    return @{@"windows": windows, @"blockers": blockers, @"complete": @(complete)};
 }
 // Source eligibility for a normalized snapshot; unknown blockers close every source.
 static inline BOOL YMWorkspaceSnapshotAllowsSource(NSDictionary *snapshot,
