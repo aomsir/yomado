@@ -14,6 +14,9 @@ static NSDictionary *Display(unsigned int ID, double x, BOOL virtualDisplay, BOO
     return @{@"displayID": @(ID), @"displayUUID": uuid, @"bounds": Frame(x, 0, 1920, 1080),
         @"isActive": @YES, @"isOnline": @YES, @"isVirtual": @(virtualDisplay), @"isMain": @(main)};
 }
+static NSDictionary *First(NSArray *items) {
+    return [items isKindOfClass:NSArray.class] && items.count ? items[0] : nil;
+}
 int main(void) {
     @autoreleasepool {
         NSDictionary *left = Display(3, -1920, NO, NO, @"left");
@@ -96,6 +99,174 @@ int main(void) {
         Check(YMWorkspacePhysicalReturnConfirmed(calculatorPhysical, calculatorPhysical, displays, NO), @"matching physical CG and AX observations confirm a manual return");
         Check(!YMWorkspacePhysicalReturnConfirmed(calculatorPhysical, calculatorPhysical, displays, YES), @"in-progress mutation never retires its own checkpoint");
         Check(!YMWorkspacePhysicalReturnConfirmed(calculatorPhysical, Frame(900, 675, 230, 408), displays, NO), @"disagreeing physical positions preserve placement while observations settle");
+
+        NSDictionary *identity = @{@"pid": @42, @"windowID": @1490,
+            @"startSeconds": @1000, @"startMicroseconds": @7, @"bundleID": @"test.calculator"};
+        NSDictionary *cg = @{@"pid": @42, @"windowID": @1490,
+            @"frame": Frame(15, 982, 37, 102), @"layer": @0, @"onScreen": @YES, @"alpha": @1};
+        NSDictionary *ax = @{@"identity": identity, @"frame": Frame(830, 719, 230, 408),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *result = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[ax], YES, displays);
+        Check([result[@"windows"] count] == 1, @"small Stage Manager thumbnail keeps its real window");
+        Check([First(result[@"windows"])[@"frame"] isEqual:ax[@"frame"]], @"use AX geometry only after exact identity");
+        Check([First(result[@"windows"])[@"cgFrame"] isEqual:cg[@"frame"]], @"retain independent raw CG geometry");
+        Check(YMWorkspaceSnapshotAllowsSource(result, @5), @"real source screen remains eligible");
+
+        NSDictionary *largeCG = @{@"pid": @42, @"windowID": @1490,
+            @"frame": Frame(15, 982, 150, 120), @"layer": @0, @"onScreen": @YES, @"alpha": @1};
+        NSDictionary *largeResult = YMWorkspaceNormalizeWindowSnapshot(@[largeCG], @[ax], YES, displays);
+        Check([largeResult[@"windows"] count] == 1, @"larger Stage Manager thumbnail still joins by identity");
+        Check([First(largeResult[@"windows"])[@"frame"] isEqual:ax[@"frame"]], @"larger thumbnail still uses AX geometry");
+
+        NSDictionary *identityB = @{@"pid": @42, @"windowID": @1491,
+            @"startSeconds": @1000, @"startMicroseconds": @7, @"bundleID": @"test.calculator"};
+        NSDictionary *cgB = @{@"pid": @42, @"windowID": @1491,
+            @"frame": Frame(200, 200, 230, 408), @"layer": @0, @"onScreen": @YES, @"alpha": @1};
+        NSDictionary *axB = @{@"identity": identityB, @"frame": Frame(830, 719, 230, 408),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *sameFrame = YMWorkspaceNormalizeWindowSnapshot(@[cg, cgB], @[ax, axB], YES, displays);
+        Check([sameFrame[@"windows"] count] == 2, @"identical real frames with different window IDs stay distinct");
+        BOOL found1490 = NO, found1491 = NO, crossed = NO;
+        for (NSDictionary *window in sameFrame[@"windows"]) {
+            if ([window[@"windowID"] unsignedIntValue] == 1490 && [window[@"identity"] isEqual:identity]) found1490 = YES;
+            if ([window[@"windowID"] unsignedIntValue] == 1491 && [window[@"identity"] isEqual:identityB]) found1491 = YES;
+            if ([window[@"windowID"] unsignedIntValue] == 1490 && [window[@"identity"] isEqual:identityB]) crossed = YES;
+            if ([window[@"windowID"] unsignedIntValue] == 1491 && [window[@"identity"] isEqual:identity]) crossed = YES;
+        }
+        Check(found1490 && found1491, @"each identical-frame window keeps its own identity");
+        Check(!crossed, @"never bind by array position or identical frame");
+
+        NSDictionary *dupCG = YMWorkspaceNormalizeWindowSnapshot(@[cg, cg], @[ax], YES, displays);
+        Check([dupCG[@"windows"] count] == 0 && [dupCG[@"blockers"] count] > 0, @"duplicate CG key becomes blocker");
+        Check(!YMWorkspaceSnapshotAllowsSource(dupCG, @5), @"duplicate CG key refuses every source");
+        NSDictionary *dupAX = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[ax, ax], YES, displays);
+        Check([dupAX[@"windows"] count] == 0 && [dupAX[@"blockers"] count] > 0, @"duplicate AX key becomes blocker");
+        Check(!YMWorkspaceSnapshotAllowsSource(dupAX, nil), @"duplicate AX key refuses whole-app drop");
+        NSDictionary *otherPID = @{@"pid": @99, @"windowID": @1490,
+            @"startSeconds": @1000, @"startMicroseconds": @7, @"bundleID": @"test.other"};
+        NSDictionary *cgOther = @{@"pid": @99, @"windowID": @1490,
+            @"frame": Frame(100, 100, 200, 200), @"layer": @0, @"onScreen": @YES, @"alpha": @1};
+        NSDictionary *axOther = @{@"identity": otherPID, @"frame": Frame(100, 100, 200, 200),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *crossPID = YMWorkspaceNormalizeWindowSnapshot(@[cg, cgOther], @[ax, axOther], YES, displays);
+        Check([crossPID[@"blockers"] count] > 0, @"same window ID under different PIDs is a blocker");
+        Check(!YMWorkspaceSnapshotAllowsSource(crossPID, @5), @"cross-PID window ID collision closes sources");
+
+        Check(YMWorkspaceSameWindowIdentity(identity, identity), @"identical five-field identities match");
+        NSMutableDictionary *changedStart = [identity mutableCopy];
+        changedStart[@"startSeconds"] = @1001;
+        Check(!YMWorkspaceSameWindowIdentity(identity, changedStart), @"changed startSeconds cannot inherit origin");
+        NSMutableDictionary *changedMicros = [identity mutableCopy];
+        changedMicros[@"startMicroseconds"] = @8;
+        Check(!YMWorkspaceSameWindowIdentity(identity, changedMicros), @"changed startMicroseconds cannot inherit origin");
+        Check(!YMWorkspaceSameWindowIdentity(identity, nil), @"nil identity is never equal");
+        Check(!YMWorkspaceSameWindowIdentity(identity, @{@"pid": @42, @"windowID": @1490}), @"partial identity is never equal");
+        Check(!YMWorkspaceSameWindowIdentity(
+            @{@"pid": @0, @"windowID": @1490, @"startSeconds": @1000, @"startMicroseconds": @7, @"bundleID": @"test.calculator"},
+            @{@"pid": @0, @"windowID": @1490, @"startSeconds": @1000, @"startMicroseconds": @7, @"bundleID": @"test.calculator"}),
+            @"zero PID identities are invalid");
+        Check(!YMWorkspaceSameWindowIdentity(
+            @{@"pid": @42, @"windowID": @(-1), @"startSeconds": @1000, @"startMicroseconds": @7, @"bundleID": @"test.calculator"},
+            @{@"pid": @42, @"windowID": @(-1), @"startSeconds": @1000, @"startMicroseconds": @7, @"bundleID": @"test.calculator"}),
+            @"negative window ID identities are invalid");
+
+        NSDictionary *axOnAgent = @{@"identity": identity, @"frame": Frame(2100, 50, 230, 408),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *owned = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[axOnAgent], YES, displays);
+        Check([owned[@"windows"] count] == 1, @"thumbnail on physical edge still joins real AX window");
+        Check([First(owned[@"windows"])[@"displayID"] isEqual:@8], @"ownership uses AX geometry on agent workspace");
+        Check([First(owned[@"windows"])[@"isVirtual"] boolValue], @"AX-owned agent window is virtual");
+        Check(!YMWorkspaceMatchesSource(First(owned[@"windows"]), @5), @"physical source cannot collect agent-owned window");
+        Check(!YMWorkspaceMatchesSource(First(owned[@"windows"]), @0), @"physical card cannot collect agent-owned window");
+
+        NSDictionary *axOnly = @{@"identity": identityB, @"frame": Frame(400, 400, 230, 408),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *spaceIsolated = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[ax, axOnly], YES, displays);
+        Check([spaceIsolated[@"windows"] count] == 1, @"AX window absent from CG visibility stays out of result");
+        Check([First(spaceIsolated[@"windows"])[@"windowID"] isEqual:@1490], @"only the CG-visible identity is retained");
+
+        NSDictionary *offscreen = @{@"pid": @42, @"windowID": @1490,
+            @"frame": Frame(15, 982, 37, 102), @"layer": @0, @"onScreen": @NO, @"alpha": @1};
+        Check([YMWorkspaceNormalizeWindowSnapshot(@[offscreen], @[ax], YES, displays)[@"windows"] count] == 0,
+            @"off-screen CG surface is not movable");
+        NSDictionary *transparent = @{@"pid": @42, @"windowID": @1490,
+            @"frame": Frame(15, 982, 37, 102), @"layer": @0, @"onScreen": @YES, @"alpha": @0};
+        Check([YMWorkspaceNormalizeWindowSnapshot(@[transparent], @[ax], YES, displays)[@"windows"] count] == 0,
+            @"transparent CG surface is not movable");
+        NSDictionary *floating = @{@"pid": @42, @"windowID": @1490,
+            @"frame": Frame(15, 982, 37, 102), @"layer": @1, @"onScreen": @YES, @"alpha": @1};
+        Check([YMWorkspaceNormalizeWindowSnapshot(@[floating], @[ax], YES, displays)[@"windows"] count] == 0,
+            @"non-zero layer CG surface is not movable");
+
+        NSDictionary *minimizedAX = @{@"identity": identity, @"frame": Frame(830, 719, 230, 408),
+            @"ordinary": @YES, @"minimized": @YES, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *minimized = YMWorkspaceNormalizeWindowSnapshot(
+            @[@{@"pid": @42, @"windowID": @1490, @"frame": Frame(100, 100, 230, 408),
+                @"layer": @0, @"onScreen": @YES, @"alpha": @1}], @[minimizedAX], YES, displays);
+        Check([minimized[@"windows"] count] == 0, @"minimized window is never movable");
+        Check([minimized[@"blockers"] count] > 0, @"visible minimized window remains a blocker");
+        NSDictionary *dialogAX = @{@"identity": identity, @"frame": Frame(830, 719, 230, 408),
+            @"ordinary": @NO, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *dialog = YMWorkspaceNormalizeWindowSnapshot(
+            @[@{@"pid": @42, @"windowID": @1490, @"frame": Frame(100, 100, 230, 408),
+                @"layer": @0, @"onScreen": @YES, @"alpha": @1}], @[dialogAX], YES, displays);
+        Check([dialog[@"windows"] count] == 0, @"non-ordinary dialog is never movable");
+        Check([dialog[@"blockers"] count] > 0, @"visible non-ordinary dialog remains a blocker");
+        NSDictionary *smallAux = YMWorkspaceNormalizeWindowSnapshot(
+            @[@{@"pid": @42, @"windowID": @1490, @"frame": Frame(15, 982, 37, 102),
+                @"layer": @0, @"onScreen": @YES, @"alpha": @1}], @[dialogAX], YES, displays);
+        Check([smallAux[@"windows"] count] == 0 && [smallAux[@"blockers"] count] == 0,
+            @"small non-ordinary auxiliary surface may be excluded");
+
+        NSDictionary *nanAX = @{@"identity": identity, @"frame": Frame(NAN, 719, 230, 408),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *nanResult = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[nanAX], YES, displays);
+        Check([nanResult[@"windows"] count] == 0, @"NaN AX frame cannot become movable");
+        Check(![nanResult[@"complete"] boolValue] || [nanResult[@"blockers"] count] > 0,
+            @"NaN AX frame fails closed rather than pretending complete emptiness");
+        Check(!YMWorkspaceSnapshotAllowsSource(nanResult, @5), @"NaN AX frame refuses sources");
+        NSDictionary *missingIdentity = @{@"frame": Frame(830, 719, 230, 408),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *noIdentity = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[missingIdentity], YES, displays);
+        Check([noIdentity[@"windows"] count] == 0, @"missing identity cannot become movable");
+        Check(!YMWorkspaceSnapshotAllowsSource(noIdentity, @5), @"missing identity refuses sources");
+        NSDictionary *unreadableAX = @{@"identity": identity, @"frame": Frame(830, 719, 230, 408),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @NO, @"positionSettable": @YES};
+        NSDictionary *unreadable = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[unreadableAX], YES, displays);
+        Check([unreadable[@"windows"] count] == 0, @"unreadable AX window cannot become movable");
+        Check(!YMWorkspaceSnapshotAllowsSource(unreadable, @5), @"unreadable AX window refuses sources");
+        NSDictionary *incomplete = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[ax], NO, displays);
+        Check([incomplete[@"windows"] count] == 0, @"incomplete enumeration yields no movable windows");
+        Check(![incomplete[@"complete"] boolValue], @"incomplete enumeration is never marked complete");
+        Check(!YMWorkspaceSnapshotAllowsSource(incomplete, @5), @"incomplete enumeration refuses sources");
+        Check(!YMWorkspaceSnapshotAllowsSource(incomplete, nil), @"incomplete enumeration refuses whole-app drop");
+
+        NSDictionary *blockerIdentity = @{@"pid": @42, @"windowID": @1500,
+            @"startSeconds": @1000, @"startMicroseconds": @7, @"bundleID": @"test.calculator"};
+        NSDictionary *blockerCG = @{@"pid": @42, @"windowID": @1500,
+            @"frame": Frame(200, 200, 230, 408), @"layer": @0, @"onScreen": @YES, @"alpha": @1};
+        NSDictionary *blockerAX = @{@"identity": blockerIdentity, @"frame": Frame(2100, 50, 230, 408),
+            @"ordinary": @NO, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *mixed = YMWorkspaceNormalizeWindowSnapshot(@[cg, blockerCG], @[ax, blockerAX], YES, displays);
+        Check([mixed[@"windows"] count] == 1, @"ordinary window on source 5 remains after known other-screen blocker");
+        Check([mixed[@"blockers"] count] == 1, @"known other-screen non-ordinary stays a single blocker");
+        Check([First(mixed[@"blockers"])[@"displayID"] isEqual:@8], @"blocker keeps reliable real source");
+        Check(YMWorkspaceSnapshotAllowsSource(mixed, @5), @"known other-screen blocker does not block unrelated source");
+        Check(!YMWorkspaceSnapshotAllowsSource(mixed, @8), @"known blocker source itself is refused");
+        Check(!YMWorkspaceSnapshotAllowsSource(mixed, nil), @"whole-app drop still sees the known blocker");
+        Check(YMWorkspaceSnapshotAllowsSource(mixed, @0), @"physical card is unaffected by virtual blocker");
+
+        NSDictionary *unknownBlockerAX = @{@"identity": blockerIdentity, @"frame": Frame(9000, 0, 230, 408),
+            @"ordinary": @NO, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *unknown = YMWorkspaceNormalizeWindowSnapshot(@[cg, blockerCG], @[ax, unknownBlockerAX], YES, displays);
+        Check([unknown[@"windows"] count] == 1, @"ordinary window remains listed beside unknown-source blocker");
+        Check([unknown[@"blockers"] count] == 1, @"off-desktop non-ordinary remains a blocker");
+        Check(First(unknown[@"blockers"])[@"displayID"] == nil, @"unknown blocker omits unreliable displayID");
+        Check(!YMWorkspaceSnapshotAllowsSource(unknown, @5), @"unknown-source blocker refuses every source");
+        Check(!YMWorkspaceSnapshotAllowsSource(unknown, @8), @"unknown-source blocker refuses agent sources");
+        Check(!YMWorkspaceSnapshotAllowsSource(unknown, @0), @"unknown-source blocker refuses physical card");
+        Check(!YMWorkspaceSnapshotAllowsSource(unknown, nil), @"unknown-source blocker refuses whole-app drop");
+
         if (failures) { fprintf(stderr, "%lu of %lu checks failed.\n", (unsigned long)failures, (unsigned long)checks); return 1; }
         printf("Passed %lu App workspace policy checks; no displays, applications or GUI were accessed.\n", (unsigned long)checks);
         return 0;
