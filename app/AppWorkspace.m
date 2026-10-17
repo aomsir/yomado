@@ -70,6 +70,10 @@ static BOOL YMWOrdinaryWindow(id element) {
 @property(nonatomic) NSTimeInterval inventoryPublishedAt;
 @property(nonatomic, copy) NSArray<NSDictionary *> *inventoryCachedCG;
 @property(nonatomic) BOOL inventoryJobScheduled;
+@property(nonatomic) BOOL inventoryHasObservedTrust;
+@property(nonatomic) BOOL inventoryObservedTrusted;
+@property(nonatomic) BOOL inventoryHasObservedCG;
+@property(nonatomic, copy) NSString *inventoryObservedCGSignature;
 @end
 
 @implementation YMAppWorkspace
@@ -116,7 +120,9 @@ static BOOL YMWOrdinaryWindow(id element) {
     self.inventoryLatestKey = [self inventoryRequestKeyForCG:self.inventoryCachedCG
                                                     trusted:self.accessibilityTrusted];
     self.inventoryLatestGeneration = self.inventoryGeneration;
-    [self scheduleInventoryIfNeeded];
+    // Never schedule/publish inventory that can rewrite placements while a write
+    // is still settling on the run loop. The write's @finally re-invalidates.
+    if (!self.operationInProgress) [self scheduleInventoryIfNeeded];
 }
 - (void)notifyInventoryDidChange {
     void (^callback)(void) = self.inventoryDidChange;
@@ -176,9 +182,9 @@ static BOOL YMWOrdinaryWindow(id element) {
     }
     BOOL topologyChanged = ![previousOwned isEqualToArray:self.ownedIDs] ||
         ![self.displays isEqualToArray:normalized];
-    BOOL trustChanged = previousTrusted != self.accessibilityTrusted;
     self.displays = normalized;
-    if (topologyChanged || trustChanged) self.inventoryGeneration += 1;
+    if (topologyChanged) self.inventoryGeneration += 1;
+    (void)previousTrusted; // trust flaps are tracked irreversibly in refreshInventory
     [self refreshInventory];
 }
 - (NSString *)normalizedCGSignature:(NSArray<NSDictionary *> *)cgWindows {
@@ -225,19 +231,42 @@ static BOOL YMWOrdinaryWindow(id element) {
     if (status.length) self.statusText = status;
     if (wasReady) [self notifyInventoryDidChange];
 }
-- (NSArray<NSDictionary *> *)admittedCGCandidates:(NSArray<NSDictionary *> *)cgWindows {
+- (NSArray<NSDictionary *> *)admittedCGCandidates:(NSArray<NSDictionary *> *)cgWindows
+                                       truncated:(BOOL *)truncated {
     NSMutableArray *candidates = [NSMutableArray array];
+    BOOL overflow = NO;
     for (NSDictionary *cg in cgWindows) {
         if (!YMWorkspaceCGCandidateVisible(cg)) continue;
         pid_t pid = [cg[@"pid"] intValue];
         NSRunningApplication *app = [self.windowAccess applicationForPID:pid];
         if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) continue;
+        if (candidates.count >= kYMInventoryMaxCGCandidates) {
+            overflow = YES;
+            break;
+        }
         [candidates addObject:cg];
-        if (candidates.count >= kYMInventoryMaxCGCandidates) break;
     }
+    if (truncated) *truncated = overflow;
     return candidates;
 }
+- (NSArray<NSDictionary *> *)admittedCGCandidates:(NSArray<NSDictionary *> *)cgWindows {
+    return [self admittedCGCandidates:cgWindows truncated:NULL];
+}
+- (BOOL)cgHasUnclassifiableEvidence:(NSArray<NSDictionary *> *)cgWindows {
+    for (NSDictionary *cg in cgWindows) {
+        if (![cg isKindOfClass:NSDictionary.class]) return YES;
+        if (!YMWorkspaceCGCandidateIdentity(cg)) return YES;
+        if (!YMWorkspaceGeometry(cg[@"frame"])) return YES;
+        if (YMWorkspaceCGCandidateClearlyInvisible(cg)) continue;
+        if (YMWorkspaceCGCandidateVisible(cg)) continue;
+        // Identity+frame present but visibility fields missing/invalid: both
+        // Visible and ClearlyInvisible filters drop it — must not prove empty.
+        return YES;
+    }
+    return NO;
+}
 - (void)scheduleInventoryIfNeeded {
+    if (self.operationInProgress) return;
     if (self.inventoryJobScheduled) return;
     NSString *key = self.inventoryLatestKey;
     NSUInteger generation = self.inventoryLatestGeneration;
@@ -272,21 +301,22 @@ static BOOL YMWOrdinaryWindow(id element) {
         NSMutableArray *axRecords = [NSMutableArray array];
         BOOL complete = YES;
         NSString *reason = @"";
+        NSArray *normalizeCG = cgSnapshot;
         if (trusted) {
-            NSUInteger visibleCount = 0;
-            for (NSDictionary *cg in cgSnapshot)
-                if (YMWorkspaceCGCandidateVisible(cg)) visibleCount++;
-            NSArray *candidates = [strongSelf admittedCGCandidates:cgSnapshot];
-            BOOL hitCGCap = visibleCount > kYMInventoryMaxCGCandidates ||
-                candidates.count >= kYMInventoryMaxCGCandidates;
-            NSMutableOrderedSet *pids = [NSMutableOrderedSet orderedSet];
-            for (NSDictionary *cg in candidates) {
-                [pids addObject:cg[@"pid"]];
-                if (pids.count >= kYMInventoryMaxPIDs) break;
-            }
-            BOOL hitPIDCap = pids.count >= kYMInventoryMaxPIDs;
+            BOOL cgTruncated = NO;
+            NSArray *candidates = [strongSelf admittedCGCandidates:cgSnapshot truncated:&cgTruncated];
+            BOOL hitCGCap = cgTruncated;
+            NSMutableOrderedSet *allPIDs = [NSMutableOrderedSet orderedSet];
+            for (NSDictionary *cg in candidates) [allPIDs addObject:cg[@"pid"]];
+            BOOL hitPIDCap = allPIDs.count > kYMInventoryMaxPIDs;
+            NSArray *observePIDs = hitPIDCap
+                ? [allPIDs.array subarrayWithRange:NSMakeRange(0, kYMInventoryMaxPIDs)]
+                : allPIDs.array;
+            // Normalizer must share the AX admission set so non-admitted system
+            // surfaces do not become unmatched; admitted unknowns still fail closed.
+            normalizeCG = candidates;
             NSTimeInterval deadline = [strongSelf inventoryTime] + kYMInventoryBudget;
-            for (NSNumber *pidValue in pids) {
+            for (NSNumber *pidValue in observePIDs) {
                 if ([strongSelf inventoryTime] >= deadline) {
                     complete = NO; reason = @"timeout"; break;
                 }
@@ -308,7 +338,7 @@ static BOOL YMWOrdinaryWindow(id element) {
             if (hitPIDCap) { complete = NO; if (!reason.length) reason = @"pidLimit"; }
         }
         NSDictionary *snapshot = trusted
-            ? YMWorkspaceNormalizeWindowSnapshot(cgSnapshot, axRecords, complete, displays)
+            ? YMWorkspaceNormalizeWindowSnapshot(normalizeCG, axRecords, complete, displays)
             : nil;
         [strongSelf publishInventoryRead:^{
             YMAppWorkspace *publisher = weakSelf;
@@ -359,17 +389,21 @@ static BOOL YMWOrdinaryWindow(id element) {
 - (BOOL)snapshotHasUnresolvedEvidence:(NSDictionary *)snapshot cg:(NSArray *)cgWindows {
     if (![snapshot[@"complete"] boolValue]) return YES;
     if ([snapshot[@"blockers"] count]) return YES;
+    BOOL truncated = NO;
+    NSArray *admitted = [self admittedCGCandidates:cgWindows truncated:&truncated];
+    if (truncated) return YES;
     // Any visible CG candidate that did not become a published window remains unknown.
     NSMutableSet *published = [NSMutableSet set];
     for (NSDictionary *window in snapshot[@"windows"])
         [published addObject:YMWorkspaceWindowKey(window[@"pid"], window[@"windowID"])];
-    for (NSDictionary *cg in [self admittedCGCandidates:cgWindows]) {
+    for (NSDictionary *cg in admitted) {
         if (![published containsObject:YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"])])
             return YES;
     }
     return NO;
 }
 - (void)retirePlacementsAgainstWindows:(NSArray<NSDictionary *> *)windows {
+    if (self.operationInProgress) return;
     for (YMWPlacement *placement in self.placements.copy) {
         if (placement.application.terminated) { [self.placements removeObject:placement]; continue; }
         for (NSDictionary *window in windows) {
@@ -377,7 +411,7 @@ static BOOL YMWOrdinaryWindow(id element) {
                 [window[@"pid"] intValue] != placement.application.processIdentifier) continue;
             if ([window[@"isVirtual"] boolValue])
                 placement.lastDisplayID = [window[@"displayID"] unsignedIntValue];
-            else if (!self.operationInProgress && self.accessibilityTrusted) {
+            else if (self.accessibilityTrusted) {
                 // Use AX geometry already gathered by this generation's inventory job.
                 // Insufficient/missing frame keeps the checkpoint — never sync AX here.
                 NSDictionary *axFrame = YMWorkspaceGeometry(window[@"frame"]);
@@ -417,6 +451,15 @@ static BOOL YMWOrdinaryWindow(id element) {
                      complete:(BOOL)complete reason:(NSString *)reason
                     snapshot:(NSDictionary *)snapshot axRecords:(NSArray *)axRecords {
     (void)axRecords;
+    if (self.operationInProgress) {
+        // Write still settling: keep latest request but do not publish/retire.
+        self.inventoryReady = NO;
+        self.inventoryValid = NO;
+        self.inventoryLatestKey = [self inventoryRequestKeyForCG:self.inventoryCachedCG
+                                                        trusted:self.accessibilityTrusted];
+        self.inventoryLatestGeneration = self.inventoryGeneration;
+        return;
+    }
     NSArray *liveCG = [self.windowAccess visibleWindows];
     if (!liveCG) {
         [self markInventoryNotReady:@"暂时无法读取窗口清单；保留显示器，稍后刷新。"];
@@ -428,6 +471,18 @@ static BOOL YMWOrdinaryWindow(id element) {
     NSString *liveKey = [self inventoryRequestKeyForCG:liveCG trusted:liveTrusted];
     NSString *jobCGSignature = [self normalizedCGSignature:cgSnapshot];
     NSString *liveCGSignature = [self normalizedCGSignature:liveCG];
+    BOOL topologyCurrent = YES;
+    for (NSDictionary *display in self.displays) {
+        if (![self displayStillCurrent:display]) { topologyCurrent = NO; break; }
+    }
+    if (!topologyCurrent) {
+        // Cached self.displays no longer match live topology. Do not publish,
+        // retire, or busy-reschedule — wait for refreshWithVirtualDisplayIDs.
+        self.inventoryReady = NO;
+        self.inventoryValid = NO;
+        self.inventoryLatestKey = nil;
+        return;
+    }
     if (jobGeneration != self.inventoryGeneration || ![jobKey isEqual:liveKey] ||
         trusted != liveTrusted || ![jobCGSignature isEqual:liveCGSignature]) {
         // World moved: discard stale result and merge the latest request.
@@ -441,10 +496,11 @@ static BOOL YMWOrdinaryWindow(id element) {
     if (!trusted) {
         NSArray *windows = [self windowsFromNoAXCG:liveCG];
         // Pure CG may still display/lock classified windows, but unresolved
-        // visible candidates (e.g. Stage Manager thumbnails) must not prove
-        // an owned virtual display empty.
-        BOOL unresolved = [self snapshotHasUnresolvedEvidence:
-            @{@"windows": windows, @"blockers": @[], @"complete": @YES} cg:liveCG];
+        // visible candidates (e.g. Stage Manager thumbnails), unclassifiable
+        // missing fields, and over-cap tails must not prove an owned virtual empty.
+        BOOL unresolved = [self cgHasUnclassifiableEvidence:liveCG] ||
+            [self snapshotHasUnresolvedEvidence:
+                @{@"windows": windows, @"blockers": @[], @"complete": @YES} cg:liveCG];
         [self publishWindows:windows ready:!unresolved key:liveKey generation:jobGeneration];
         [self drainLatestInventoryRequest];
         return;
@@ -494,6 +550,22 @@ static BOOL YMWOrdinaryWindow(id element) {
     }
     self.inventoryCachedCG = cg;
     BOOL trusted = self.accessibilityTrusted;
+    NSString *cgSignature = [self normalizedCGSignature:cg];
+    // Remember observed trust/CG source. Intermediate flaps advance generation
+    // irreversibly so a later equal key cannot revive an older in-flight job.
+    if (self.inventoryHasObservedTrust) {
+        if (self.inventoryObservedTrusted != trusted) self.inventoryGeneration += 1;
+    } else {
+        self.inventoryHasObservedTrust = YES;
+    }
+    self.inventoryObservedTrusted = trusted;
+    if (self.inventoryHasObservedCG) {
+        if (![cgSignature isEqual:self.inventoryObservedCGSignature])
+            self.inventoryGeneration += 1;
+    } else {
+        self.inventoryHasObservedCG = YES;
+    }
+    self.inventoryObservedCGSignature = cgSignature;
     NSString *key = [self inventoryRequestKeyForCG:cg trusted:trusted];
     // Reuse same-key observation within TTL (ready or incomplete). Incomplete
     // never sets inventoryReady, so close/export stay blocked.
@@ -843,8 +915,15 @@ static BOOL YMWOrdinaryWindow(id element) {
     NSMutableArray *result = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
     for (YMWPlacement *placement in self.placements) {
-        if (!placement.origin || !YMWorkspaceCheckpointWindow(placement.application.processIdentifier,
-            placement.windowID,self.windows,self.ownedIDs)) continue;
+        if (!placement.origin) continue;
+        // Retained checkpoints not present in current owned windows are unresolved
+        // (e.g. independent CG/AX disagree). Never silent-skip into empty success.
+        NSDictionary *owned = YMWorkspaceCheckpointWindow(placement.application.processIdentifier,
+            placement.windowID, self.windows, self.ownedIDs);
+        if (!owned) {
+            [self fail:error code:31 text:@"已有窗口的原位置无法精确交接，已暂停更新。"];
+            return nil;
+        }
         NSDictionary *identity = YMUpdateIdentityForWindowElement(placement.element);
         NSDictionary *frame = YMWFrame(placement.element);
         NSDictionary *display = YMWorkspaceDisplayForFrame(frame, self.displays);

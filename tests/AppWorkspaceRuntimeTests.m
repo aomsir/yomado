@@ -580,6 +580,314 @@ int main(void) {
             Check(callbacks <= 2, @"incomplete failure path does not spin callbacks");
         }
 
+        // --- Fix2 / Important 1: write-in-flight must not rewrite placement ownership ---
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            YMFakeRunningApp *app = [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            NSDictionary *virtualFrame = Frame(2700, 100, 230, 408);
+            id element = @"el-write-ownership";
+            NSDictionary *identity = Identity(42, 1490);
+            access.elementFrames[[NSString stringWithFormat:@"%p", element]] = virtualFrame;
+            access.elementIdentities[[NSString stringWithFormat:@"%p", element]] = identity;
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
+                @"frame": virtualFrame, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            access.axByPID[@42] = @[@{@"identity": identity, @"frame": virtualFrame, @"ordinary": @YES,
+                @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES, @"element": element}];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            NSDictionary *origin = YMWorkspaceOrigin(Frame(100, 100, 230, 408),
+                                                     RuntimeDisplay(5, 0, NO, @"physical"));
+            [workspace installPlacementElement:element application:app windowID:1490
+                                        origin:origin lastDisplayID:8];
+            // Schedule observation, then enter a write before it publishes — mirrors
+            // placeElement runloop allowing an in-flight job to finish mid-move.
+            [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:displays];
+            Check(workspace.pendingReads.count == 1, @"write probe starts with one pending job");
+            id placement = [[workspace valueForKey:@"placements"] firstObject];
+            // A→B move already recorded; stale observation still shows screen A (8).
+            [placement setValue:@9 forKey:@"lastDisplayID"];
+            workspace.operationInProgress = YES;
+            [workspace invalidateInventoryForMutation];
+            Check(workspace.pendingReads.count == 1,
+                  @"invalidate during write does not schedule an additional job");
+            [workspace finishNextRead]; // in-flight job completes during write
+            Check([[placement valueForKey:@"lastDisplayID"] unsignedIntValue] == 9,
+                  @"write-in-flight publish must not revert placement ownership to stale screen");
+            Check(!workspace.inventoryReady,
+                  @"write-in-flight inventory must not publish ready");
+            Check([[workspace valueForKey:@"placements"] count] == 1,
+                  @"target-screen placement record must survive stale publish during write");
+            workspace.operationInProgress = NO;
+            [workspace invalidateInventoryForMutation];
+            [workspace drainReads];
+            Check(workspace.pendingReads.count == 0,
+                  @"bounded reads resume after write ends");
+        }
+
+        // --- Fix2 / Important 2: publish revalidates live topology ---
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            YMFakeRunningApp *app = access.appsByPID[@42];
+            id element = access.axByPID[@42].firstObject[@"element"];
+            NSDictionary *origin = YMWorkspaceOrigin(Frame(830, 719, 230, 408),
+                                                     RuntimeDisplay(5, 0, NO, @"physical"));
+            [workspace installPlacementElement:element application:app windowID:1490
+                                        origin:origin lastDisplayID:8];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            Check(workspace.pendingReads.count == 1, @"topology probe schedules one job");
+            workspace.displayCurrent = NO; // topology moved; manager not refreshed yet
+            [workspace drainReads];
+            Check(!workspace.inventoryReady,
+                  @"stale topology must not publish ready without manager refresh");
+            Check([[workspace valueForKey:@"placements"] count] == 1,
+                  @"stale topology must not retire checkpoints");
+        }
+
+        // --- Fix2 / Important 3: normalizer uses admitted app set ---
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:Frame(2700, 100, 400, 300)
+                             axFrame:Frame(2700, 100, 400, 300)];
+            // Layer-zero system surface without bundle admission.
+            [access.cgWindows addObject:@{@"pid": @999, @"windowID": @77,
+                @"frame": Frame(2800, 200, 120, 90), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady,
+                  @"non-admitted system surface must not create unmatched blockers");
+            Check([[workspace rowsForDisplayID:8] count] == 1,
+                  @"admitted app still publishes");
+
+            // Admitted app with CG but missing AX remains unknown — not silently skipped.
+            YMFakeWindowAccess *unknownAccess = [YMFakeWindowAccess new];
+            [unknownAccess installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            [unknownAccess.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
+                @"frame": Frame(2700, 100, 400, 300), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            YMWorkspaceFixture *unknownWS = [[YMWorkspaceFixture alloc] initWithWindowAccess:unknownAccess];
+            [unknownWS refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [unknownWS drainReads];
+            Check(!unknownWS.inventoryReady,
+                  @"admitted app with unknown AX metadata still refuses ready");
+        }
+
+        // --- Fix2 / Important 4: retained checkpoint must not silent-export empty ---
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            YMFakeRunningApp *app = [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            // Independent evidence disagree: CG still virtual, AX already physical.
+            NSDictionary *cgVirtual = Frame(2700, 100, 230, 408);
+            NSDictionary *axPhysical = Frame(830, 675, 230, 408);
+            id element = @"el-retained-checkpoint";
+            NSDictionary *identity = Identity(42, 1490);
+            access.elementFrames[[NSString stringWithFormat:@"%p", element]] = axPhysical;
+            access.elementIdentities[[NSString stringWithFormat:@"%p", element]] = identity;
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
+                @"frame": cgVirtual, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            access.axByPID[@42] = @[@{@"identity": identity, @"frame": axPhysical, @"ordinary": @YES,
+                @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES, @"element": element}];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            NSDictionary *origin = YMWorkspaceOrigin(axPhysical, RuntimeDisplay(5, 0, NO, @"physical"));
+            [workspace installPlacementElement:element application:app windowID:1490
+                                        origin:origin lastDisplayID:8];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady,
+                  @"disagreeing CG/AX inventory can still be ready");
+            Check([[workspace valueForKey:@"placements"] count] == 1,
+                  @"disagreeing evidence retains checkpoint");
+            NSError *exportError = nil;
+            NSArray *exported = [workspace restartOriginCheckpointsWithError:&exportError];
+            Check(exported == nil && exportError != nil,
+                  @"retained checkpoint absent from owned windows must export error, not empty success");
+        }
+
+        // --- Fix2 / Important 5: observed trust/CG source transitions bump generation ---
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSUInteger gen0 = workspace.inventoryGeneration;
+            Check(workspace.pendingReads.count == 1, @"trust probe starts with one job");
+            // YES → NO → YES while first job still in-flight.
+            access.trusted = NO;
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSUInteger genAfterNO = workspace.inventoryGeneration;
+            Check(genAfterNO > gen0, @"observed trust YES→NO advances generation");
+            access.trusted = YES;
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSUInteger genAfterYES = workspace.inventoryGeneration;
+            Check(genAfterYES > genAfterNO, @"observed trust NO→YES advances generation again");
+            [workspace finishNextRead]; // completes the original in-flight job
+            Check(!workspace.inventoryReady,
+                  @"old job must not revive on final equal key after trust flap");
+            [workspace drainReads];
+        }
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSUInteger gen0 = workspace.inventoryGeneration;
+            // Source A → B → A while first job in-flight.
+            NSDictionary *altFrame = Frame(100, 100, 200, 200);
+            [access.cgWindows removeAllObjects];
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
+                @"frame": altFrame, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSUInteger genAfterB = workspace.inventoryGeneration;
+            Check(genAfterB > gen0, @"observed CG source A→B advances generation");
+            [access.cgWindows removeAllObjects];
+            [access.axByPID removeAllObjects];
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:Frame(15, 982, 37, 102)
+                             axFrame:Frame(830, 719, 230, 408)];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSUInteger genAfterA = workspace.inventoryGeneration;
+            Check(genAfterA > genAfterB, @"observed CG source B→A advances generation again");
+            [workspace finishNextRead];
+            Check(!workspace.inventoryReady,
+                  @"old job must not revive on final equal CG key after source flap");
+            [workspace drainReads];
+        }
+
+        // --- Fix2 / Important 6: exact budget ceilings remain complete ---
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            for (NSUInteger i = 0; i < 64; i++) {
+                pid_t pid = (pid_t)(1000 + i);
+                [access installApp:pid name:[NSString stringWithFormat:@"App%lu", (unsigned long)i]
+                            bundle:[NSString stringWithFormat:@"test.app%lu", (unsigned long)i]];
+                [access installWindowPID:pid windowID:(CGWindowID)(2000 + i)
+                                 cgFrame:Frame(2700, 100, 200, 200)
+                                 axFrame:Frame(2700, 100, 200, 200)];
+            }
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"exactly 64 PIDs remains a complete observation");
+            Check(access.observedPIDs.count == 64, @"exactly 64 PIDs are all observed");
+
+            pid_t extra = 1064;
+            [access installApp:extra name:@"Extra" bundle:@"test.extra"];
+            [access installWindowPID:extra windowID:2064
+                             cgFrame:Frame(2700, 100, 200, 200)
+                             axFrame:Frame(2700, 100, 200, 200)];
+            [access.observedPIDs removeAllObjects];
+            access.observeCount = 0;
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady, @"65 PIDs is truncated and incomplete");
+            Check(access.observedPIDs.count == 64,
+                  @"exactly 64 of 65 PIDs are observed; the extra is truncated");
+            Check(![access.observedPIDs containsObject:@(extra)],
+                  @"65th PID is not observed after the ceiling");
+        }
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            for (NSUInteger i = 0; i < 512; i++) {
+                // Same PID so PID cap does not trip; exercise CG candidate ceiling.
+                if (i == 0) [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+                CGWindowID wid = (CGWindowID)(3000 + i);
+                NSDictionary *frame = Frame(2700 + (i % 10), 100 + (i % 20), 200, 200);
+                [access.cgWindows addObject:@{@"pid": @42, @"windowID": @(wid),
+                    @"frame": frame, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+                NSMutableArray *list = [access.axByPID[@42] mutableCopy] ?: [NSMutableArray array];
+                id element = [NSString stringWithFormat:@"el-cg-%u", wid];
+                NSDictionary *identity = Identity(42, wid);
+                [list addObject:@{@"identity": identity, @"frame": frame, @"ordinary": @YES,
+                    @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES, @"element": element}];
+                access.axByPID[@42] = list;
+            }
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"exactly 512 CG candidates remains complete");
+
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @9999,
+                @"frame": Frame(2710, 110, 200, 200), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            NSMutableArray *list = [access.axByPID[@42] mutableCopy];
+            [list addObject:@{@"identity": Identity(42, 9999),
+                @"frame": Frame(2710, 110, 200, 200), @"ordinary": @YES,
+                @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES,
+                @"element": @"el-cg-9999"}];
+            access.axByPID[@42] = list;
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady, @"513 CG candidates is incomplete");
+        }
+        {
+            // Boundary neighbors: 63 PIDs complete; 511 candidates complete.
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            for (NSUInteger i = 0; i < 63; i++) {
+                pid_t pid = (pid_t)(2000 + i);
+                [access installApp:pid name:[NSString stringWithFormat:@"P%lu", (unsigned long)i]
+                            bundle:[NSString stringWithFormat:@"test.p%lu", (unsigned long)i]];
+                [access installWindowPID:pid windowID:(CGWindowID)(4000 + i)
+                                 cgFrame:Frame(2700, 100, 200, 200)
+                                 axFrame:Frame(2700, 100, 200, 200)];
+            }
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"exactly 63 PIDs remains complete");
+        }
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            for (NSUInteger i = 0; i < 511; i++) {
+                CGWindowID wid = (CGWindowID)(5000 + i);
+                NSDictionary *frame = Frame(2700, 100, 200, 200);
+                [access.cgWindows addObject:@{@"pid": @42, @"windowID": @(wid),
+                    @"frame": frame, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+                NSMutableArray *list = [access.axByPID[@42] mutableCopy] ?: [NSMutableArray array];
+                [list addObject:@{@"identity": Identity(42, wid), @"frame": frame, @"ordinary": @YES,
+                    @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES,
+                    @"element": [NSString stringWithFormat:@"el-511-%u", wid]}];
+                access.axByPID[@42] = list;
+            }
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"exactly 511 CG candidates remains complete");
+        }
+
+        // --- Fix2 / no-AX acceptance remnant: illegal CG and over-cap tail ---
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            // Missing layer/onScreen/alpha: dropped by both Visible and ClearlyInvisible.
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
+                @"frame": Frame(2700, 100, 400, 300)}];
+            access.trusted = NO;
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady,
+                  @"illegal/missing CG fields must not publish empty no-AX ready");
+            Check([workspace needsRestoreForDisplayID:8],
+                  @"illegal/missing CG keeps needsRestore");
+        }
+        {
+            // Over-cap tail unknown must not be missed after truncation.
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            for (NSUInteger i = 0; i < 512; i++) {
+                [access.cgWindows addObject:@{@"pid": @42, @"windowID": @(6000 + i),
+                    @"frame": Frame(2700, 100, 400, 300), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            }
+            // 513th: small unknown thumbnail beyond the admitted truncation set.
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @9998,
+                @"frame": Frame(15, 982, 37, 102), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            access.trusted = NO;
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady,
+                  @"over-cap unknown tail must not authorize empty no-AX close");
+        }
+
         // Default init must not be used by these fixtures.
         {
             // Ensure runtime tests never construct the native default manager path

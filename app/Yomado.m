@@ -204,6 +204,8 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 - (void)buildWindow;
 - (void)preparePanelPresenter;
 - (void)updateInventory;
+// Private test seam: production returns DisplaySnapshot(); tests override with fixtures.
+- (NSArray<NSDictionary *> *)controllerDisplaySnapshot;
 - (void)beginUpdater;
 - (void)automaticUpdateStateDidChange;
 - (void)restoreUpdateWorkspace;
@@ -1282,6 +1284,9 @@ static NSView *YMSpacer(void) {
     [window orderOut:nil];
     return NO;
 }
+- (NSArray<NSDictionary *> *)controllerDisplaySnapshot {
+    return DisplaySnapshot();
+}
 - (void)updateInventory {
     if (self.updatingInventory) return;
     self.updatingInventory = YES;
@@ -1627,7 +1632,8 @@ static NSView *YMSpacer(void) {
     // authorizes restoreDisplayID. Do not restore/move inside the wait.
     BOOL ownsPendingWeChat = self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay && self.wechatDisplayID == displayID;
     if (ownsPendingWeChat) {
-        [self.windowRecovery refreshWithVirtualDisplayID:displayID displaySnapshot:DisplaySnapshot()];
+        [self.windowRecovery refreshWithVirtualDisplayID:displayID
+                                       displaySnapshot:[self controllerDisplaySnapshot]];
         NSError *error = nil;
         if (![self.windowRecovery restoreWeChat:&error]) {
             [self reportApplicationError:error fallback:@"微信尚未返回实体屏；保留这个虚拟屏。"];
