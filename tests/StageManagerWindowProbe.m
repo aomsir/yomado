@@ -124,12 +124,18 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
     ProbeFixtureIdentityChangedAfterWrite,
     ProbeFixtureAmbiguousCGAfterWrite,
     ProbeFixtureUncertainOutboundWrite,
+    ProbeFixtureIdentityChangedDuringHold,
+    ProbeFixtureTopologyChangedDuringHold,
 };
 
 @interface ProbeFixture : NSObject <ProbeBackend>
 @property(nonatomic) ProbeFixtureKind kind;
 @property(nonatomic) NSUInteger identityReads;
 @property(nonatomic) NSUInteger writeCalls;
+@property(nonatomic) NSUInteger waitCalls;
+@property(nonatomic) NSUInteger holdWaits;
+@property(nonatomic) NSUInteger convergeWaits;
+@property(nonatomic, strong) NSMutableArray<NSString *> *events;
 @property(nonatomic, copy) NSDictionary *stableIdentity;
 @property(nonatomic, copy) NSDictionary *currentFrame;
 @property(nonatomic, copy) NSDictionary *originFrame;
@@ -143,12 +149,15 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
 @property(nonatomic) BOOL keepOffTargetAfterWrite;
 @property(nonatomic) BOOL keepOffOriginAfterRestore;
 @property(nonatomic) BOOL reportFailureAfterOutboundWrite;
+@property(nonatomic) BOOL mutateIdentityDuringHold;
+@property(nonatomic) BOOL mutateTopologyDuringHold;
 @end
 
 @implementation ProbeFixture
 + (instancetype)fixture:(ProbeFixtureKind)kind {
     ProbeFixture *f = [ProbeFixture new];
     f.kind = kind;
+    f.events = [NSMutableArray array];
     f.originFrame = ProbeFrame(100, 100, 230, 408);
     f.currentFrame = f.originFrame;
     f.stableIdentity = ProbeIdentity(4242, 100, @"com.apple.calculator");
@@ -192,6 +201,12 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
         case ProbeFixtureUncertainOutboundWrite:
             f.reportFailureAfterOutboundWrite = YES;
             break;
+        case ProbeFixtureIdentityChangedDuringHold:
+            f.mutateIdentityDuringHold = YES;
+            break;
+        case ProbeFixtureTopologyChangedDuringHold:
+            f.mutateTopologyDuringHold = YES;
+            break;
         case ProbeFixtureNormal:
             break;
     }
@@ -209,8 +224,22 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
 - (NSArray<NSDictionary *> *)visibleWindowRecords { return self.records; }
 - (NSArray<NSDictionary *> *)displaySnapshot { return self.displays; }
 - (CGDirectDisplayID)targetDisplayID { return self.targetID; }
-- (void)waitForNextObservation {}
+- (void)waitForNextObservation {
+    [self.events addObject:@"wait"];
+    self.waitCalls++;
+    NSDictionary *target = ProbeFindDisplay(self.displays, self.targetID);
+    BOOL onTarget = target && ProbeFrameOnTarget(self.currentFrame, target);
+    if (self.writeCalls >= 1 && onTarget) {
+        self.holdWaits++;
+        if (self.mutateIdentityDuringHold) self.identityMutated = YES;
+        if (self.mutateTopologyDuringHold)
+            self.displays = @[ProbeDisplay(1, NO, 0, 0, 1280, 800)];
+    } else {
+        self.convergeWaits++;
+    }
+}
 - (BOOL)writePosition:(CGPoint)position expectedIdentity:(NSDictionary *)identity {
+    [self.events addObject:@"write"];
     self.writeCalls++;
     if (![self.stableIdentity isEqual:identity]) return NO;
     if (self.changeIdentityBeforeWrite) return NO;
@@ -243,6 +272,24 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
     return YES;
 }
 @end
+
+static NSUInteger ProbeWaitsBetweenFirstAndSecondWrite(NSArray<NSString *> *events) {
+    NSInteger first = -1, second = -1;
+    for (NSUInteger i = 0; i < events.count; i++) {
+        if (![events[i] isEqualToString:@"write"]) continue;
+        if (first < 0) first = (NSInteger)i;
+        else {
+            second = (NSInteger)i;
+            break;
+        }
+    }
+    if (first < 0 || second < 0) return NSUIntegerMax;
+    NSUInteger waits = 0;
+    for (NSInteger i = first + 1; i < second; i++) {
+        if ([events[(NSUInteger)i] isEqualToString:@"wait"]) waits++;
+    }
+    return waits;
+}
 
 static ProbeResult RunProbeWithMode(NSString *mode, id<ProbeBackend> backend) {
     ProbeResult result = {0};
@@ -298,6 +345,20 @@ static ProbeResult RunProbeWithMode(NSString *mode, id<ProbeBackend> backend) {
         NSDictionary *target = ProbeFindDisplay([backend displaySnapshot], targetID);
         return ProbeFrameOnTarget(frame, target);
     });
+
+    // Observation dwell only after a verified landing; exhausting it is not landing evidence.
+    if (result.destinationVerified) {
+        for (NSUInteger i = 0; i < 20; i++) {
+            liveIdentity = [backend identity];
+            liveDisplays = [backend displaySnapshot] ?: @[];
+            if (![liveIdentity isEqual:identity] || !ProbeDisplaysEqual(displays, liveDisplays) ||
+                !ProbeFindDisplay(liveDisplays, targetID) || !ProbeFindDisplay(liveDisplays, sourceID)) {
+                result.displayTopologyUnchanged = ProbeDisplaysEqual(displays, liveDisplays);
+                break;
+            }
+            [backend waitForNextObservation];
+        }
+    }
 
     liveIdentity = [backend identity];
     liveDisplays = [backend displaySnapshot] ?: @[];
@@ -607,8 +668,10 @@ static int ProbeRunNative(NSString *mode, pid_t pid, CGWindowID windowID, CGDire
 }
 
 static void RunSelfTests(void) {
-    ProbeFixture *normal = [ProbeFixture fixture:ProbeFixtureNormal];
-    Check(RunProbeWithMode(@"--check", normal).writes == 0,
+    ProbeFixture *checkFixture = [ProbeFixture fixture:ProbeFixtureNormal];
+    ProbeResult checkResult = RunProbeWithMode(@"--check", checkFixture);
+    Check(checkResult.writes == 0 && checkFixture.writeCalls == 0 && checkFixture.waitCalls == 0 &&
+              checkFixture.holdWaits == 0,
           @"read-only mode never writes a window");
 
     ProbeFixture *changedIdentity = [ProbeFixture fixture:ProbeFixtureChangedIdentity];
@@ -621,6 +684,8 @@ static void RunSelfTests(void) {
     Check(failedDestinationResult.restoreAttempts == 1 && failedDestinationResult.writes == 2 &&
               !failedDestinationResult.destinationVerified && !failedDestinationResult.passed,
           @"failed destination still makes one guarded origin restore attempt");
+    Check(failedDestination.holdWaits == 0 && failedDestination.convergeWaits == 20,
+          @"failed destination keeps convergence waits and does not add a hold");
 
     ProbeFixture *uncertainWrite = [ProbeFixture fixture:ProbeFixtureUncertainOutboundWrite];
     ProbeResult uncertainWriteResult = RunProbeWithMode(@"--move-and-return", uncertainWrite);
@@ -659,10 +724,30 @@ static void RunSelfTests(void) {
     Check(!ambiguousCG.destinationVerified && !ambiguousCG.passed,
           @"ambiguous CG identity after write cannot verify destination");
 
-    ProbeResult success = RunProbeWithMode(@"--move-and-return", [ProbeFixture fixture:ProbeFixtureNormal]);
+    ProbeFixture *successFixture = [ProbeFixture fixture:ProbeFixtureNormal];
+    ProbeResult success = RunProbeWithMode(@"--move-and-return", successFixture);
     Check(success.passed && success.destinationVerified && success.originRestored &&
-              success.displayTopologyUnchanged && success.writes >= 2 && success.restoreAttempts == 1,
+              success.displayTopologyUnchanged && success.writes == 2 && success.restoreAttempts == 1 &&
+              successFixture.writeCalls == 2,
           @"normal move-and-return verifies destination and origin");
+    Check(successFixture.holdWaits == 20 && successFixture.convergeWaits == 0 &&
+              ProbeWaitsBetweenFirstAndSecondWrite(successFixture.events) == 20,
+          @"verified destination holds with exactly twenty waits before the guarded restore write");
+
+    ProbeFixture *holdIdentity = [ProbeFixture fixture:ProbeFixtureIdentityChangedDuringHold];
+    ProbeResult holdIdentityResult = RunProbeWithMode(@"--move-and-return", holdIdentity);
+    Check(holdIdentityResult.destinationVerified && holdIdentityResult.writes == 1 &&
+              holdIdentityResult.restoreAttempts == 0 && !holdIdentityResult.passed &&
+              holdIdentity.writeCalls == 1 && holdIdentity.holdWaits >= 1 && holdIdentity.holdWaits < 20,
+          @"identity change during hold ends the dwell and refuses blind restore");
+
+    ProbeFixture *holdTopology = [ProbeFixture fixture:ProbeFixtureTopologyChangedDuringHold];
+    ProbeResult holdTopologyResult = RunProbeWithMode(@"--move-and-return", holdTopology);
+    Check(holdTopologyResult.destinationVerified && holdTopologyResult.writes == 1 &&
+              holdTopologyResult.restoreAttempts == 0 && !holdTopologyResult.displayTopologyUnchanged &&
+              !holdTopologyResult.passed && holdTopology.writeCalls == 1 &&
+              holdTopology.holdWaits >= 1 && holdTopology.holdWaits < 20,
+          @"topology change during hold ends the dwell and refuses blind restore");
 
     fprintf(stderr, "PASS %u self-test checks\n", (unsigned)gChecks);
 }
