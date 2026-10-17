@@ -65,6 +65,10 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 @property(nonatomic) NSUInteger failNextPositionWrites;
 @property(nonatomic) BOOL syncCGOnWrite;
 @property(nonatomic) BOOL flipIdentityOnNextObserveElement;
+/// 1-based: when observeElementCount reaches this value, apply observeElementMutation once.
+@property(nonatomic) NSUInteger mutateOnObserveElementCount;
+@property(nonatomic, copy) NSDictionary *observeElementMutation;
+@property(nonatomic, copy) void (^observeElementSideEffect)(NSUInteger count);
 @property(nonatomic, strong) NSMutableArray<NSNumber *> *observedPIDs;
 @end
 
@@ -144,6 +148,65 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     return [NSString stringWithFormat:@"%p", element];
 }
 
+- (void)applyObserveElementMutationForElement:(id)element {
+    NSString *key = [self elementKey:element];
+    NSDictionary *mutation = self.observeElementMutation;
+    if (!mutation.count) return;
+    NSDictionary *prior = self.elementIdentities[key];
+    if (prior) {
+        NSMutableDictionary *changed = [prior mutableCopy];
+        if (mutation[@"startSecondsDelta"])
+            changed[@"startSeconds"] = @([prior[@"startSeconds"] unsignedLongLongValue]
+                + [mutation[@"startSecondsDelta"] unsignedLongLongValue]);
+        if (mutation[@"windowID"]) changed[@"windowID"] = mutation[@"windowID"];
+        if (mutation[@"pid"]) changed[@"pid"] = mutation[@"pid"];
+        if (mutation[@"bundleID"]) changed[@"bundleID"] = mutation[@"bundleID"];
+        self.elementIdentities[key] = changed;
+        pid_t listPID = [prior[@"pid"] intValue];
+        NSMutableArray *list = [self.axByPID[@(listPID)] mutableCopy] ?: [NSMutableArray array];
+        for (NSUInteger i = 0; i < list.count; i++) {
+            NSMutableDictionary *ax = [list[i] mutableCopy];
+            if ([ax[@"element"] isEqual:element]) {
+                ax[@"identity"] = changed;
+                if (mutation[@"frame"]) ax[@"frame"] = mutation[@"frame"];
+                if (mutation[@"ordinary"]) ax[@"ordinary"] = mutation[@"ordinary"];
+                if (mutation[@"minimized"]) ax[@"minimized"] = mutation[@"minimized"];
+                if (mutation[@"positionSettable"]) ax[@"positionSettable"] = mutation[@"positionSettable"];
+                list[i] = ax;
+            }
+        }
+        self.axByPID[@(listPID)] = list;
+        if (mutation[@"pid"] && [mutation[@"pid"] intValue] != listPID) {
+            self.axByPID[mutation[@"pid"]] = list;
+            [self.axByPID removeObjectForKey:@(listPID)];
+        }
+        if (mutation[@"windowID"] || mutation[@"pid"]) {
+            for (NSUInteger i = 0; i < self.cgWindows.count; i++) {
+                NSDictionary *cg = self.cgWindows[i];
+                if ([cg[@"pid"] intValue] == listPID &&
+                    [cg[@"windowID"] unsignedIntValue] == [prior[@"windowID"] unsignedIntValue]) {
+                    NSMutableDictionary *updated = [cg mutableCopy];
+                    if (mutation[@"windowID"]) updated[@"windowID"] = mutation[@"windowID"];
+                    if (mutation[@"pid"]) updated[@"pid"] = mutation[@"pid"];
+                    if (mutation[@"frame"]) updated[@"frame"] = mutation[@"frame"];
+                    self.cgWindows[i] = updated;
+                    break;
+                }
+            }
+        }
+    }
+    if (mutation[@"frame"]) self.elementFrames[key] = mutation[@"frame"];
+    if (mutation[@"ordinary"] || mutation[@"minimized"] || mutation[@"positionSettable"]) {
+        NSMutableDictionary *state = [self.elementStates[key] mutableCopy]
+            ?: [@{@"ordinary": @YES, @"minimized": @NO, @"positionSettable": @YES} mutableCopy];
+        if (mutation[@"ordinary"]) state[@"ordinary"] = mutation[@"ordinary"];
+        if (mutation[@"minimized"]) state[@"minimized"] = mutation[@"minimized"];
+        if (mutation[@"positionSettable"]) state[@"positionSettable"] = mutation[@"positionSettable"];
+        self.elementStates[key] = state;
+    }
+    self.observeElementMutation = nil;
+}
+
 - (void)updateAXFrame:(NSDictionary *)frame forElement:(id)element {
     NSString *key = [self elementKey:element];
     self.elementFrames[key] = frame;
@@ -212,22 +275,15 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     NSString *key = [self elementKey:element];
     if (self.flipIdentityOnNextObserveElement) {
         self.flipIdentityOnNextObserveElement = NO;
-        NSDictionary *prior = self.elementIdentities[key];
-        if (prior) {
-            NSMutableDictionary *changed = [prior mutableCopy];
-            changed[@"startSeconds"] = @([prior[@"startSeconds"] unsignedLongLongValue] + 1);
-            self.elementIdentities[key] = changed;
-            NSMutableArray *list = [self.axByPID[prior[@"pid"]] mutableCopy];
-            for (NSUInteger i = 0; i < list.count; i++) {
-                NSMutableDictionary *ax = [list[i] mutableCopy];
-                if ([ax[@"element"] isEqual:element]) {
-                    ax[@"identity"] = changed;
-                    list[i] = ax;
-                }
-            }
-            self.axByPID[prior[@"pid"]] = list;
-        }
+        self.mutateOnObserveElementCount = self.observeElementCount;
+        self.observeElementMutation = @{@"startSecondsDelta": @1};
     }
+    if (self.mutateOnObserveElementCount &&
+        self.observeElementCount == self.mutateOnObserveElementCount) {
+        [self applyObserveElementMutationForElement:element];
+        self.mutateOnObserveElementCount = 0;
+    }
+    if (self.observeElementSideEffect) self.observeElementSideEffect(self.observeElementCount);
     NSDictionary *frame = self.elementFrames[key];
     NSDictionary *identity = self.elementIdentities[key];
     NSDictionary *state = self.elementStates[key];
@@ -1353,6 +1409,85 @@ int main(void) {
             Check(access.positionWrites.count == 0, @"identity change writes nothing");
         }
         {
+            // Fix1 / Important 2: candidate→write mutations stop before first unsafe write.
+            NSArray *mutations = @[
+                @{@"name": @"windowID", @"mutation": @{@"windowID": @9991}},
+                @{@"name": @"pid", @"mutation": @{@"pid": @99}},
+                @{@"name": @"frame", @"mutation": @{@"frame": Frame(120, 120, 230, 408)}},
+                @{@"name": @"ordinary", @"mutation": @{@"ordinary": @NO}},
+                @{@"name": @"minimized", @"mutation": @{@"minimized": @YES}},
+                @{@"name": @"settable", @"mutation": @{@"positionSettable": @NO}},
+                @{@"name": @"source", @"mutation": @{@"frame": Frame(2700, 100, 230, 408)}},
+            ];
+            for (NSDictionary *caseInfo in mutations) {
+                YMFakeWindowAccess *access = nil;
+                NSURL *fixtureURL = nil;
+                YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                    Frame(100, 100, 230, 408), Frame(100, 100, 230, 408));
+                [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+                access.mutateOnObserveElementCount = 1;
+                access.observeElementMutation = caseInfo[@"mutation"];
+                NSError *error = nil;
+                NSString *label = [NSString stringWithFormat:
+                    @"%@ change after candidates stops before first write", caseInfo[@"name"]];
+                Check(![workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8
+                                                 error:&error], label);
+                Check(error.code == 11, [NSString stringWithFormat:@"%@ uses code 11", caseInfo[@"name"]]);
+                Check(access.positionWrites.count == 0,
+                      [NSString stringWithFormat:@"%@ writes nothing", caseInfo[@"name"]]);
+            }
+            // Target display invalidated on the pre-write observe — also stops with zero writes.
+            {
+                YMFakeWindowAccess *access = nil;
+                NSURL *fixtureURL = nil;
+                YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                    Frame(100, 100, 230, 408), Frame(100, 100, 230, 408));
+                [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+                __weak YMWorkspaceFixture *weakWS = workspace;
+                access.observeElementSideEffect = ^(NSUInteger count) {
+                    if (count == 1) {
+                        weakWS.liveDisplayStates[@8] = @{
+                            @"isActive": @NO, @"isOnline": @NO,
+                            @"isInMirrorSet": @NO, @"mirrorsDisplay": @(kCGNullDirectDisplay),
+                            @"bounds": Frame(2560, 0, 2560, 1440)
+                        };
+                    }
+                };
+                NSError *error = nil;
+                Check(![workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8
+                                                 error:&error],
+                      @"target display invalidation after candidates stops before write");
+                Check(error.code == 11, @"target invalidation uses code 11");
+                Check(access.positionWrites.count == 0, @"target invalidation writes nothing");
+            }
+        }
+        {
+            // Fix1 / Important 3: identity change after destination write → rollback writes zero.
+            YMFakeWindowAccess *access = nil;
+            NSURL *fixtureURL = nil;
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &fixtureURL,
+                Frame(100, 100, 230, 408), Frame(100, 100, 230, 408));
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            // observe#1 pre-write, #2 placeElement start, setPosition records then fails,
+            // observe#3 rollback placeElement start → flip identity so rollback must not write.
+            access.failNextPositionWrites = 1;
+            access.mutateOnObserveElementCount = 3;
+            access.observeElementMutation = @{@"startSecondsDelta": @1};
+            NSDictionary *originalIdentity = Identity(42, 1490);
+            NSError *error = nil;
+            Check(![workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"identity change after failed destination write refuses move");
+            Check(error.code == 12, @"failed write with identity-changed rollback uses code 12");
+            Check(access.positionWrites.count == 1,
+                  @"only the destination write attempt is recorded; rollback writes zero");
+            if (access.positionWrites.count) {
+                Check([access.positionWrites[0][@"identity"] isEqual:originalIdentity],
+                      @"recorded write targets original identity, never replacement");
+                Check(access.positionWrites[0][@"x"] != nil && access.positionWrites[0][@"y"] != nil,
+                      @"fake records write position not only BOOL");
+            }
+        }
+        {
             // Replacement window ID must not inherit a prior origin checkpoint.
             YMFakeWindowAccess *access = nil;
             NSURL *fixtureURL = nil;
@@ -1458,17 +1593,18 @@ int main(void) {
                   @"other physical target centers rather than reusing old offsets");
         }
         {
-            // Delayed CG: CG physical thumbnail while AX already on virtual8 — keep origin.
+            // Delayed CG: CG physical thumbnail while AX already on virtual8 — keep origin,
+            // restore through manager uses preserved origin; independent CG/AX must agree to retire.
             NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
             YMFakeWindowAccess *access = [YMFakeWindowAccess new];
             access.syncCGOnWrite = NO;
             [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
             NSDictionary *cgPhysical = Frame(15, 982, 37, 102);
             NSDictionary *axVirtual = Frame(2700, 100, 230, 408);
+            NSDictionary *remembered = Frame(830, 719, 230, 408);
             [access installWindowPID:42 windowID:1490 cgFrame:cgPhysical axFrame:axVirtual];
             YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
-            NSDictionary *origin = YMWorkspaceOrigin(Frame(830, 719, 230, 408),
-                                                     RuntimeDisplay(5, 0, NO, @"physical"));
+            NSDictionary *origin = YMWorkspaceOrigin(remembered, RuntimeDisplay(5, 0, NO, @"physical"));
             id element = access.axByPID[@42].firstObject[@"element"];
             [workspace installPlacementElement:element application:access.appsByPID[@42]
                                       windowID:1490 origin:origin lastDisplayID:8
@@ -1479,10 +1615,43 @@ int main(void) {
                   @"delayed physical CG keeps origin while AX owns virtual");
             Check([[workspace rowsForDisplayID:8] count] == 1,
                   @"AX virtual geometry owns the window for inventory rows");
+            id placementBefore = [[workspace valueForKey:@"placements"] firstObject];
+            Check([[placementBefore valueForKey:@"origin"] isEqual:origin],
+                  @"delayed CG restore path still holds the remembered physical origin");
+            NSError *error = nil;
+            Check([workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:8 toPhysicalDisplayID:5 error:&error],
+                  @"delayed CG state still restores through the real manager entry");
+            Check(YMWorkspaceSameFrame(access.currentFrame, remembered),
+                  @"delayed CG restore uses preserved origin, not thumbnail geometry");
+
+            // Retirement: AX already physical but CG still thumbnail → keep checkpoint.
+            access = [YMFakeWindowAccess new];
+            access.syncCGOnWrite = NO;
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:1490 cgFrame:cgPhysical axFrame:remembered];
+            workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            element = access.axByPID[@42].firstObject[@"element"];
+            [workspace installPlacementElement:element application:access.appsByPID[@42]
+                                      windowID:1490 origin:origin lastDisplayID:8
+                                      identity:Identity(42, 1490)];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check([[workspace valueForKey:@"placements"] count] == 1,
+                  @"independent disagreeing CG thumbnail + physical AX does not retire");
+            // Agreeing independent CG+AX evidence finally retires.
+            for (NSUInteger i = 0; i < access.cgWindows.count; i++) {
+                NSMutableDictionary *cg = [access.cgWindows[i] mutableCopy];
+                cg[@"frame"] = remembered;
+                access.cgWindows[i] = cg;
+            }
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check([[workspace valueForKey:@"placements"] count] == 0,
+                  @"independent agreeing CG+AX physical evidence retires checkpoint");
         }
         {
-            // Unrelated app inventory timeout does not block selected-app move;
-            // close still requires full evidence.
+            // Fix1 / Important 1: close gate verified before move — independent of post-move pending.
             NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
             YMFakeWindowAccess *access = [YMFakeWindowAccess new];
             [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
@@ -1496,12 +1665,54 @@ int main(void) {
             [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
             [workspace drainReads];
             Check(!workspace.inventoryReady, @"unrelated app timeout leaves inventory not ready");
+            NSError *closeError = nil;
+            Check(![workspace restoreDisplayID:8 error:&closeError],
+                  @"close refuses before move while unrelated app timeout leaves inventory not ready");
+            Check(closeError.code == 3, @"pre-move close refusal uses inventory evidence code");
             NSError *error = nil;
             Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
                   @"unrelated app timeout does not block selected-app move");
             Check(access.positionWrites.count == 1, @"selected app still writes once");
-            Check(![workspace restoreDisplayID:8 error:&error],
-                  @"close still requires full-range inventory evidence");
+            Check([access.positionWrites[0][@"identity"] isEqual:Identity(42, 1490)],
+                  @"selected-app write records exact identity");
+        }
+        {
+            // Fix1 / Important 5: physical→virtual8→virtual9→physical keeps physical origin.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator" bundleURL:fixtureURL];
+            NSDictionary *physicalFrame = Frame(830, 719, 230, 408);
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:physicalFrame axFrame:physicalFrame];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:displays];
+            NSError *error = nil;
+            Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:5 toDisplayID:8 error:&error],
+                  @"physical→virtual8 move succeeds");
+            id placement = [[workspace valueForKey:@"placements"] firstObject];
+            NSDictionary *originAfter8 = [placement valueForKey:@"origin"];
+            Check(originAfter8 != nil, @"physical→8 stores a physical origin");
+            Check([originAfter8[@"displayUUID"] isEqual:@"physical"],
+                  @"physical→8 origin UUID is the physical screen");
+            Check(YMWorkspaceSameFrame(originAfter8[@"relative"], physicalFrame),
+                  @"physical→8 origin relative matches the real physical frame");
+            NSUInteger writesAfter8 = access.positionWrites.count;
+            Check([workspace moveApplicationAtURL:fixtureURL fromDisplayID:8 toDisplayID:9 error:&error],
+                  @"virtual8→virtual9 move succeeds");
+            placement = [[workspace valueForKey:@"placements"] firstObject];
+            NSDictionary *originAfter9 = [placement valueForKey:@"origin"];
+            Check([originAfter9 isEqual:originAfter8],
+                  @"virtual→virtual does not overwrite the physical origin");
+            Check(access.positionWrites.count > writesAfter8,
+                  @"virtual→virtual still performs real writes");
+            for (NSDictionary *write in access.positionWrites)
+                Check([write[@"identity"] isEqual:Identity(42, 1490)],
+                      @"origin-chain writes always target the same identity");
+            Check([workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:9 toPhysicalDisplayID:5 error:&error],
+                  @"virtual9→physical restore succeeds");
+            Check(YMWorkspaceSameFrame(access.currentFrame, physicalFrame),
+                  @"full chain returns to the original physical origin frame");
         }
         {
             // Adopt then restore uses checkpoint origin; closed/unresolvable rejects export.
