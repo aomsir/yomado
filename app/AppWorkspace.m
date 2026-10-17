@@ -895,36 +895,46 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 }
 - (BOOL)performRestoreBundle:(NSString *)bundle sourceID:(CGDirectDisplayID)sourceID physicalTarget:(NSDictionary *)physicalTarget error:(NSError **)error {
     if (!YMWorkspaceGenericRestoreAllowed(bundle)) return [self fail:error code:4 text:@"请先把 yomado 控制面板移回实体屏，再关闭此虚拟屏。"];
-    NSUInteger restored = 0, fallback = 0;
+    // Collect every same-bundle process candidate before the first restore write —
+    // a sibling timeout/blocker must not leave earlier processes already moved.
+    NSMutableArray *operations = [NSMutableArray array];
+    NSNumber *sourceFilter = sourceID ? @(sourceID) : nil;
     for (NSRunningApplication *app in [self.windowAccess applicationsForBundleIdentifier:bundle]) {
         if (app.terminated) continue;
-        NSArray *candidates = [self candidatesForApplication:app sourceFilter:sourceID ? @(sourceID) : nil error:error]; if (!candidates) return NO;
+        NSArray *candidates = [self candidatesForApplication:app sourceFilter:sourceFilter error:error];
+        if (!candidates) return NO;
         for (NSDictionary *candidate in candidates) {
             NSDictionary *source = [self display:[candidate[@"displayID"] unsignedIntValue]];
             if (![self.ownedIDs containsObject:source[@"displayID"]]) continue;
-            id element = candidate[@"element"];
-            NSDictionary *expectedIdentity = candidate[@"identity"];
-            YMWPlacement *placement = [self placementForElement:element application:app
-                                                       windowID:[candidate[@"windowID"] unsignedIntValue]
-                                                       identity:expectedIdentity];
-            NSDictionary *live = [self.windowAccess observeElement:element];
-            if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], expectedIdentity) ||
-                !YMWorkspaceSameFrame(live[@"frame"], candidate[@"frame"]) ||
-                ![live[@"ordinary"] boolValue] || [live[@"minimized"] boolValue] ||
-                ![live[@"positionSettable"] boolValue])
-                return [self fail:error code:13 text:@"窗口身份或位置已变化，已停止恢复；请刷新后再试。"];
-            NSDictionary *origin = placement.origin, *before = live[@"frame"];
-            NSDictionary *target = physicalTarget ?: YMWorkspacePhysicalDisplay(origin[@"displayUUID"], self.displays);
-            NSDictionary *destination = physicalTarget ? YMWorkspaceFrameForExplicitPhysicalReturn(origin, before, target) :
-                YMWorkspaceFrameOnDisplay(origin[@"relative"] ?: before, origin[@"relative"], target);
-            if (!target || !destination) return [self fail:error code:14 text:@"没有可用的实体显示器；保留虚拟屏和窗口记录。"];
-            if (![self placeElement:element frame:destination display:target application:app
-                   expectedIdentity:expectedIdentity])
-                return [self fail:error code:15 text:@"尚未确认窗口已返回实体屏；保留虚拟屏和原位置记录。"];
-            if (!origin || (physicalTarget && !YMWorkspaceOriginBelongsToDisplay(origin, target))) fallback++;
-            if (placement) [self.placements removeObject:placement];
-            restored++;
+            [operations addObject:@{@"application": app, @"candidate": candidate}];
         }
+    }
+    NSUInteger restored = 0, fallback = 0;
+    for (NSDictionary *operation in operations) {
+        NSRunningApplication *app = operation[@"application"];
+        NSDictionary *candidate = operation[@"candidate"];
+        id element = candidate[@"element"];
+        NSDictionary *expectedIdentity = candidate[@"identity"];
+        YMWPlacement *placement = [self placementForElement:element application:app
+                                                   windowID:[candidate[@"windowID"] unsignedIntValue]
+                                                   identity:expectedIdentity];
+        NSDictionary *live = [self.windowAccess observeElement:element];
+        if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], expectedIdentity) ||
+            !YMWorkspaceSameFrame(live[@"frame"], candidate[@"frame"]) ||
+            ![live[@"ordinary"] boolValue] || [live[@"minimized"] boolValue] ||
+            ![live[@"positionSettable"] boolValue])
+            return [self fail:error code:13 text:@"窗口身份或位置已变化，已停止恢复；请刷新后再试。"];
+        NSDictionary *origin = placement.origin, *before = live[@"frame"];
+        NSDictionary *target = physicalTarget ?: YMWorkspacePhysicalDisplay(origin[@"displayUUID"], self.displays);
+        NSDictionary *destination = physicalTarget ? YMWorkspaceFrameForExplicitPhysicalReturn(origin, before, target) :
+            YMWorkspaceFrameOnDisplay(origin[@"relative"] ?: before, origin[@"relative"], target);
+        if (!target || !destination) return [self fail:error code:14 text:@"没有可用的实体显示器；保留虚拟屏和窗口记录。"];
+        if (![self placeElement:element frame:destination display:target application:app
+               expectedIdentity:expectedIdentity])
+            return [self fail:error code:15 text:@"尚未确认窗口已返回实体屏；保留虚拟屏和原位置记录。"];
+        if (!origin || (physicalTarget && !YMWorkspaceOriginBelongsToDisplay(origin, target))) fallback++;
+        if (placement) [self.placements removeObject:placement];
+        restored++;
     }
     for (YMWPlacement *placement in self.placements)
         if ([placement.bundleID isEqual:bundle] && (!sourceID || placement.lastDisplayID == sourceID))

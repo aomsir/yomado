@@ -252,6 +252,12 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     NSMutableArray *result = [NSMutableArray array];
     for (YMFakeRunningApp *app in self.appsByPID.allValues)
         if ([app.bundleIdentifier isEqual:bundleID]) [result addObject:(id)app];
+    // Stable PID order so multi-process restore regressions hit process A before B.
+    [result sortUsingComparator:^NSComparisonResult(YMFakeRunningApp *a, YMFakeRunningApp *b) {
+        if (a.processIdentifier < b.processIdentifier) return NSOrderedAscending;
+        if (a.processIdentifier > b.processIdentifier) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
     return result;
 }
 
@@ -1750,6 +1756,132 @@ int main(void) {
             Check(![workspace adoptRestartOriginCheckpoints:@[@{@"identity": missing, @"origin": origin}]
                                                       error:&error],
                   @"unresolvable identity refuses adopt");
+        }
+        {
+            // Fix2 / P2: same-bundle multi-process restore must finish every process
+            // candidate check before the first position/size write.
+            NSURL *fixtureURL = WriteTempFixtureApp(@"test.calculator");
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            YMFakeRunningApp *appA = [access installApp:42 name:@"Calculator"
+                                                bundle:@"test.calculator" bundleURL:fixtureURL];
+            YMFakeRunningApp *appB = [access installApp:43 name:@"Calculator"
+                                                bundle:@"test.calculator" bundleURL:fixtureURL];
+            NSDictionary *frameA = Frame(2700, 100, 230, 408);
+            NSDictionary *frameB = Frame(2800, 200, 230, 408);
+            NSDictionary *originA = @{@"displayUUID": @"physical",
+                @"relative": Frame(830, 719, 230, 408)};
+            NSDictionary *originB = @{@"displayUUID": @"physical",
+                @"relative": Frame(900, 700, 230, 408)};
+            [access installWindowPID:42 windowID:1490 cgFrame:frameA axFrame:frameA];
+            [access installWindowPID:43 windowID:1491 cgFrame:frameB axFrame:frameB];
+            [access.forceIncompletePIDs addObject:@43];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            id elementA = access.axByPID[@42].firstObject[@"element"];
+            id elementB = access.axByPID[@43].firstObject[@"element"];
+            [workspace installPlacementElement:elementA application:appA windowID:1490
+                                       origin:originA lastDisplayID:8 identity:Identity(42, 1490)];
+            [workspace installPlacementElement:elementB application:appB windowID:1491
+                                       origin:originB lastDisplayID:8 identity:Identity(43, 1491)];
+            NSError *error = nil;
+            Check(![workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:8 toPhysicalDisplayID:5 error:&error],
+                  @"same-bundle process B timeout fails restore before any write");
+            Check(error.code == 6, @"process B timeout uses incomplete observation code");
+            Check(access.positionWrites.count == 0,
+                  @"same-bundle timeout restore writes no positions");
+            Check(access.sizeWrites.count == 0,
+                  @"same-bundle timeout restore writes no sizes");
+            NSDictionary *frameAAfter =
+                access.elementFrames[[NSString stringWithFormat:@"%p", elementA]];
+            Check(YMWorkspaceSameFrame(frameAAfter, frameA),
+                  @"process A frame stays on virtual source after sibling timeout");
+            NSArray *placements = [workspace valueForKey:@"placements"];
+            Check(placements.count == 2, @"process A checkpoint retained after sibling timeout");
+            id keptA = nil;
+            for (id placement in placements) {
+                if ([[placement valueForKey:@"windowID"] unsignedIntValue] == 1490)
+                    keptA = placement;
+            }
+            Check(keptA != nil, @"process A placement still present");
+            Check([[keptA valueForKey:@"origin"] isEqual:originA],
+                  @"process A origin checkpoint is not deleted on sibling failure");
+
+            // Blocker on process B also refuses before any write.
+            access = [YMFakeWindowAccess new];
+            appA = [access installApp:42 name:@"Calculator" bundle:@"test.calculator"
+                            bundleURL:fixtureURL];
+            appB = [access installApp:43 name:@"Calculator" bundle:@"test.calculator"
+                            bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:1490 cgFrame:frameA axFrame:frameA];
+            [access installWindowPID:43 windowID:1491 cgFrame:frameB axFrame:frameB];
+            elementA = access.axByPID[@42].firstObject[@"element"];
+            elementB = access.axByPID[@43].firstObject[@"element"];
+            [access.cgWindows addObject:@{@"pid": @43, @"windowID": @1500,
+                @"frame": Frame(2900, 150, 200, 200), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            NSMutableArray *axB = [access.axByPID[@43] mutableCopy];
+            id dialog = @"el-43-dialog";
+            [axB addObject:@{@"identity": Identity(43, 1500), @"frame": Frame(2900, 150, 200, 200),
+                @"ordinary": @NO, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES,
+                @"element": dialog}];
+            access.axByPID[@43] = axB;
+            access.elementFrames[[NSString stringWithFormat:@"%p", dialog]] = Frame(2900, 150, 200, 200);
+            access.elementIdentities[[NSString stringWithFormat:@"%p", dialog]] = Identity(43, 1500);
+            workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace installPlacementElement:elementA application:appA windowID:1490
+                                       origin:originA lastDisplayID:8 identity:Identity(42, 1490)];
+            [workspace installPlacementElement:elementB application:appB windowID:1491
+                                       origin:originB lastDisplayID:8 identity:Identity(43, 1491)];
+            error = nil;
+            Check(![workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:8 toPhysicalDisplayID:5 error:&error],
+                  @"same-bundle process B dialog blocker fails restore before any write");
+            Check(error.code == 7, @"process B blocker uses source integrity code");
+            Check(access.positionWrites.count == 0,
+                  @"same-bundle blocker restore writes no positions");
+            Check(access.sizeWrites.count == 0,
+                  @"same-bundle blocker restore writes no sizes");
+            Check([[workspace valueForKey:@"placements"] count] == 2,
+                  @"process A checkpoint retained after sibling blocker");
+
+            // Both processes reliable: restore still succeeds with exact identities.
+            access = [YMFakeWindowAccess new];
+            appA = [access installApp:42 name:@"Calculator" bundle:@"test.calculator"
+                            bundleURL:fixtureURL];
+            appB = [access installApp:43 name:@"Calculator" bundle:@"test.calculator"
+                            bundleURL:fixtureURL];
+            [access installWindowPID:42 windowID:1490 cgFrame:frameA axFrame:frameA];
+            [access installWindowPID:43 windowID:1491 cgFrame:frameB axFrame:frameB];
+            elementA = access.axByPID[@42].firstObject[@"element"];
+            elementB = access.axByPID[@43].firstObject[@"element"];
+            workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace installPlacementElement:elementA application:appA windowID:1490
+                                       origin:originA lastDisplayID:8 identity:Identity(42, 1490)];
+            [workspace installPlacementElement:elementB application:appB windowID:1491
+                                       origin:originB lastDisplayID:8 identity:Identity(43, 1491)];
+            error = nil;
+            Check([workspace restoreApplicationWithBundleIdentifier:@"test.calculator"
+                fromDisplayID:8 toPhysicalDisplayID:5 error:&error],
+                  @"same-bundle two reliable processes restore successfully");
+            NSMutableSet *written = [NSMutableSet set];
+            for (NSDictionary *write in access.positionWrites)
+                [written addObject:write[@"identity"]];
+            Check(access.positionWrites.count == 2 &&
+                  [written containsObject:Identity(42, 1490)] &&
+                  [written containsObject:Identity(43, 1491)],
+                  @"reliable multi-process restore writes both exact identities");
+            Check([[workspace valueForKey:@"placements"] count] == 0,
+                  @"reliable multi-process restore retires both checkpoints");
+            Check(YMWorkspaceSameFrame(
+                      access.elementFrames[[NSString stringWithFormat:@"%p", elementA]],
+                      originA[@"relative"]),
+                  @"process A restores its remembered physical origin");
+            Check(YMWorkspaceSameFrame(
+                      access.elementFrames[[NSString stringWithFormat:@"%p", elementB]],
+                      originB[@"relative"]),
+                  @"process B restores its remembered physical origin");
         }
 
         printf("App workspace runtime tests: %lu passed, %lu failed; no GUI or display calls executed.\n",
