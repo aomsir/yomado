@@ -230,14 +230,20 @@
 @property(nonatomic) NSUInteger readyPolls;
 @property(nonatomic) NSUInteger needsRestorePolls;
 @property(nonatomic) NSUInteger refreshesBeforeReady;
+@property(nonatomic, strong) NSMutableArray<NSString *> *events;
 @end
 @implementation YMCloseGateWorkspace
 - (instancetype)init {
-    if ((self = [super init])) { _gateReady = YES; _restoreResult = YES; }
+    if ((self = [super init])) {
+        _gateReady = YES;
+        _restoreResult = YES;
+        _events = [NSMutableArray array];
+    }
     return self;
 }
 - (void)refreshWithVirtualDisplayIDs:(NSArray *)ids displaySnapshot:(NSArray *)snapshot {
     (void)ids; (void)snapshot;
+    [self.events addObject:@"refresh"];
     if (self.refreshesBeforeReady > 0) {
         self.refreshesBeforeReady--;
         _gateReady = self.refreshesBeforeReady == 0;
@@ -245,6 +251,7 @@
 }
 - (BOOL)inventoryReady {
     self.readyPolls++;
+    [self.events addObject:_gateReady ? @"readyYES" : @"readyNO"];
     return _gateReady;
 }
 - (void)setInventoryReady:(BOOL)inventoryReady {
@@ -258,6 +265,12 @@
 - (BOOL)restoreDisplayID:(CGDirectDisplayID)displayID error:(NSError **)error {
     (void)displayID; (void)error;
     self.restoreCalls++;
+    [self.events addObject:@"restore"];
+    // restoreDisplayID itself requires ready evidence (mirrors production gate).
+    if (!_gateReady) {
+        if (error) *error = [NSError errorWithDomain:@"fixture" code:3 userInfo:nil];
+        return NO;
+    }
     return self.restoreResult;
 }
 - (BOOL)accessibilityTrusted { return YES; }
@@ -278,8 +291,31 @@
 @end
 @interface YMControllerLegacyRecovery : NSObject
 @property BOOL needsRestoreBeforeRemovingVirtualDisplay;
+@property(nonatomic, weak) YMCloseGateWorkspace *workspaceToInvalidate;
+@property(nonatomic) NSUInteger restoreWeChatCalls;
+@property(nonatomic, strong) NSMutableArray<NSString *> *events;
 @end
 @implementation YMControllerLegacyRecovery
+- (instancetype)init {
+    if ((self = [super init])) _events = [NSMutableArray array];
+    return self;
+}
+- (void)refreshWithVirtualDisplayID:(CGDirectDisplayID)displayID displaySnapshot:(NSArray *)snapshot {
+    (void)displayID; (void)snapshot;
+    [self.events addObject:@"wechatRefresh"];
+}
+- (BOOL)restoreWeChat:(NSError **)error {
+    (void)error;
+    self.restoreWeChatCalls++;
+    [self.events addObject:@"wechatRestore"];
+    // World change after WeChat: inventory key/TTL no longer authorizes close.
+    YMCloseGateWorkspace *gate = self.workspaceToInvalidate;
+    if (gate) {
+        gate.inventoryReady = NO;
+        gate.refreshesBeforeReady = 2;
+    }
+    return YES;
+}
 @end
 @interface YMUpdateCompletionController : YMFakeController
 @property NSMutableArray *events;
@@ -618,6 +654,53 @@ int main(void) {
             Expect(closeD.live && closeD.destroys == 0,
                    "timeout does not remove the virtual display");
             Expect(closeController.reports >= 1, "timeout reports and retains the screen");
+
+            // Ready after several refreshes, then a single restore write.
+            gate.restoreCalls = 0; gate.readyPolls = 0; gate.needsRestorePolls = 0;
+            gate.needsRestoreFlag = NO;
+            gate.restoreResult = YES;
+            gate.inventoryReady = NO;
+            gate.refreshesBeforeReady = 3;
+            [gate.events removeAllObjects];
+            restored = [closeController restoreApplicationsForDisplayID:202];
+            Expect(restored && gate.restoreCalls == 1,
+                   "ready after several refreshes restores the display exactly once");
+            Expect(gate.readyPolls >= 3, "controller waits through refreshesBeforeReady");
+
+            // WeChat world-change must happen before the ready wait that authorizes restore.
+            // If wait runs first, WeChat invalidates ready and restoreDisplayID refuses.
+            YMControllerLegacyRecovery *wechatRecovery = [YMControllerLegacyRecovery new];
+            wechatRecovery.needsRestoreBeforeRemovingVirtualDisplay = YES;
+            wechatRecovery.workspaceToInvalidate = gate;
+            closeController.windowRecovery = (YMWindowRecovery *)(id)wechatRecovery;
+            closeController.wechatDisplayID = 202;
+            gate.restoreCalls = 0; gate.readyPolls = 0; gate.needsRestorePolls = 0;
+            gate.needsRestoreFlag = NO;
+            gate.restoreResult = YES;
+            gate.inventoryReady = YES;
+            gate.refreshesBeforeReady = 0;
+            [gate.events removeAllObjects];
+            [wechatRecovery.events removeAllObjects];
+            restored = [closeController restoreApplicationsForDisplayID:202];
+            Expect(wechatRecovery.restoreWeChatCalls == 1, "pending WeChat restore runs during close");
+            Expect(restored && gate.restoreCalls == 1,
+                   "ready wait after WeChat world-change still restores once");
+            NSUInteger wechatIdx = [wechatRecovery.events indexOfObject:@"wechatRestore"];
+            NSUInteger restoreIdx = [gate.events indexOfObject:@"restore"];
+            NSUInteger readyAfterWeChat = NSNotFound;
+            if (wechatIdx != NSNotFound) {
+                for (NSUInteger i = 0; i < gate.events.count; i++) {
+                    if ([gate.events[i] isEqual:@"readyYES"]) {
+                        // Find a readyYES that is observed in the same restore pass after WeChat.
+                        // Events arrays are separate; use restoreCalls success + WeChat ran.
+                        readyAfterWeChat = i;
+                    }
+                }
+            }
+            Expect(wechatIdx != NSNotFound && restoreIdx != NSNotFound,
+                   "WeChat restore and app restore both recorded");
+            Expect(restored, "WeChat-then-ready-then-restore close path succeeds");
+            (void)readyAfterWeChat;
         }
 
         Expect(NSApp == nil,"all controller tests leave NSApplication uninitialized");

@@ -246,8 +246,10 @@ static BOOL YMWOrdinaryWindow(id element) {
         // One in-flight + one latest slot; identical key waits for completion.
         return;
     }
+    // Same-key reuse within TTL covers complete and incomplete observations.
+    // Incomplete reuse never sets inventoryReady, so it cannot authorize close.
     if ([key isEqual:self.inventoryPublishedKey] && generation == self.inventoryPublishedGeneration &&
-        [self inventoryCacheFresh] && self.inventoryReady) {
+        [self inventoryCacheFresh]) {
         self.inventoryLatestKey = nil;
         return;
     }
@@ -376,8 +378,10 @@ static BOOL YMWOrdinaryWindow(id element) {
             if ([window[@"isVirtual"] boolValue])
                 placement.lastDisplayID = [window[@"displayID"] unsignedIntValue];
             else if (!self.operationInProgress && self.accessibilityTrusted) {
-                NSDictionary *live = [self.windowAccess observeElement:placement.element];
-                NSDictionary *axFrame = live[@"frame"];
+                // Use AX geometry already gathered by this generation's inventory job.
+                // Insufficient/missing frame keeps the checkpoint — never sync AX here.
+                NSDictionary *axFrame = YMWorkspaceGeometry(window[@"frame"]);
+                if (!axFrame) break;
                 // Independent raw CG evidence only — never normalized AX as cgFrame.
                 if (YMWorkspacePhysicalReturnConfirmed(window[@"cgFrame"], axFrame, self.displays, NO))
                     [self.placements removeObject:placement];
@@ -393,18 +397,18 @@ static BOOL YMWOrdinaryWindow(id element) {
     [self retirePlacementsAgainstWindows:windows];
     self.windows = windows;
     self.rows = [self groupedRowsForDisplay:0 ownedOnly:YES];
-    if (ready) {
+    // Record the observation key for both ready and incomplete results so the
+    // same key can reuse within TTL. Only ready=YES authorizes close/export.
+    if (key.length) {
         self.inventoryPublishedKey = key;
         self.inventoryPublishedGeneration = generation;
         self.inventoryPublishedAt = [self inventoryTime];
-        self.inventoryReady = YES;
-        self.inventoryValid = YES;
     } else {
         self.inventoryPublishedKey = nil;
         self.inventoryPublishedAt = 0;
-        self.inventoryReady = NO;
-        self.inventoryValid = NO;
     }
+    self.inventoryReady = ready;
+    self.inventoryValid = ready;
     BOOL rowsChanged = ![previousRows isEqual:self.rows];
     if (rowsChanged || previousReady != self.inventoryReady) [self notifyInventoryDidChange];
 }
@@ -436,7 +440,12 @@ static BOOL YMWOrdinaryWindow(id element) {
     }
     if (!trusted) {
         NSArray *windows = [self windowsFromNoAXCG:liveCG];
-        [self publishWindows:windows ready:YES key:liveKey generation:jobGeneration];
+        // Pure CG may still display/lock classified windows, but unresolved
+        // visible candidates (e.g. Stage Manager thumbnails) must not prove
+        // an owned virtual display empty.
+        BOOL unresolved = [self snapshotHasUnresolvedEvidence:
+            @{@"windows": windows, @"blockers": @[], @"complete": @YES} cg:liveCG];
+        [self publishWindows:windows ready:!unresolved key:liveKey generation:jobGeneration];
         [self drainLatestInventoryRequest];
         return;
     }
@@ -444,16 +453,26 @@ static BOOL YMWOrdinaryWindow(id element) {
         [self snapshotHasUnresolvedEvidence:snapshot cg:liveCG]) {
         NSArray *partial = snapshot ? [self assembledWindowsFromSnapshot:snapshot] : self.windows;
         // Keep prior display rows when partial; never claim ready/empty.
+        // Bound incomplete results to liveKey so same-key refresh reuses TTL.
+        NSString *previousStatus = self.statusText;
+        BOOL previousReady = self.inventoryReady;
+        NSArray *previousRows = self.rows;
         if (snapshot && [snapshot[@"windows"] count])
-            [self publishWindows:partial ready:NO key:nil generation:jobGeneration];
+            [self publishWindows:partial ready:NO key:liveKey generation:jobGeneration];
         else {
+            self.inventoryPublishedKey = liveKey;
+            self.inventoryPublishedGeneration = jobGeneration;
+            self.inventoryPublishedAt = [self inventoryTime];
             self.inventoryReady = NO;
             self.inventoryValid = NO;
             if ([reason isEqual:@"timeout"])
                 self.statusText = @"窗口清单核对超时；保留显示器，稍后刷新。";
             else
                 self.statusText = @"暂时无法完整核对窗口清单；保留显示器，稍后刷新。";
-            [self notifyInventoryDidChange];
+            BOOL statusChanged = previousStatus.length == 0 || ![previousStatus isEqual:self.statusText];
+            BOOL rowsChanged = ![previousRows isEqual:self.rows];
+            if (statusChanged || rowsChanged || previousReady != self.inventoryReady)
+                [self notifyInventoryDidChange];
         }
         [self drainLatestInventoryRequest];
         return;
@@ -476,9 +495,11 @@ static BOOL YMWOrdinaryWindow(id element) {
     self.inventoryCachedCG = cg;
     BOOL trusted = self.accessibilityTrusted;
     NSString *key = [self inventoryRequestKeyForCG:cg trusted:trusted];
+    // Reuse same-key observation within TTL (ready or incomplete). Incomplete
+    // never sets inventoryReady, so close/export stay blocked.
     if ([key isEqual:self.inventoryPublishedKey] &&
         self.inventoryPublishedGeneration == self.inventoryGeneration &&
-        [self inventoryCacheFresh] && self.inventoryReady) {
+        [self inventoryCacheFresh]) {
         return;
     }
     // Pending until a matching generation publishes.

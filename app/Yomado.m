@@ -1622,16 +1622,9 @@ static NSView *YMSpacer(void) {
     self.appOperationInProgress = YES;
     @try {
     [self updateInventory];
-    // Wait for a published ready inventory before any restore write. Never
-    // restore/move inside this predicate — only refresh and observe readiness.
-    BOOL inventoryReady = WaitUntil(^BOOL{
-        [self updateInventory];
-        return self.appWorkspace.inventoryReady;
-    }, 1.5);
-    if (!inventoryReady) {
-        [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留这个虚拟屏。请稍后重试关闭。"];
-        return NO;
-    }
+    // World-changing steps first (WeChat restore / control-panel move). Their
+    // CG signature or TTL impact must settle before the ready gate that
+    // authorizes restoreDisplayID. Do not restore/move inside the wait.
     BOOL ownsPendingWeChat = self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay && self.wechatDisplayID == displayID;
     if (ownsPendingWeChat) {
         [self.windowRecovery refreshWithVirtualDisplayID:displayID displaySnapshot:DisplaySnapshot()];
@@ -1660,6 +1653,14 @@ static NSView *YMSpacer(void) {
         frame.origin = NSMakePoint(NSMidX(visible) - frame.size.width / 2, NSMidY(visible) - frame.size.height / 2);
         [self.window setFrame:frame display:YES];
         [self updateInventory];
+    }
+    BOOL inventoryReady = WaitUntil(^BOOL{
+        [self updateInventory];
+        return self.appWorkspace.inventoryReady;
+    }, 1.5);
+    if (!inventoryReady) {
+        [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留这个虚拟屏。请稍后重试关闭。"];
+        return NO;
     }
     NSError *error = nil;
     if (![self.appWorkspace restoreDisplayID:displayID error:&error]) {

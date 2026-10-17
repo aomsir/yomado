@@ -60,6 +60,7 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 @property(nonatomic) NSUInteger readCount;
 @property(nonatomic) NSUInteger writeCount;
 @property(nonatomic) NSUInteger observeCount;
+@property(nonatomic) NSUInteger observeElementCount;
 @property(nonatomic) BOOL failVisibleWindows;
 @property(nonatomic) BOOL forceIncompleteObserve;
 @property(nonatomic, copy) NSString *incompleteReason;
@@ -143,6 +144,7 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 }
 
 - (nullable NSDictionary *)observeElement:(id)element {
+    self.observeElementCount++;
     NSString *key = [NSString stringWithFormat:@"%p", element];
     NSDictionary *frame = self.elementFrames[key];
     NSDictionary *identity = self.elementIdentities[key];
@@ -377,12 +379,14 @@ int main(void) {
             [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
             [workspace drainReads];
             // No AX: pure CG path. Small thumbnail fails old size gate → not shown,
-            // but unresolved small candidate on a display must not fake an empty close
-            // for a screen that still needs AX to classify. Physical thumbnail alone
-            // does not prove virtual empty; ready only when CG classification is decisive.
-            Check([workspace needsRestoreForDisplayID:8] || !workspace.inventoryReady ||
-                  [[workspace rowsForDisplayID:8] count] == 0,
-                  @"trust revoke never pretends unknown thumbnails are absent");
+            // but unresolved small candidate must not prove any owned virtual empty.
+            Check(!workspace.inventoryReady,
+                  @"unknown no-AX thumbnail does not publish ready empty proof");
+            Check([workspace needsRestoreForDisplayID:8],
+                  @"unknown no-AX thumbnail keeps needsRestore on owned virtual");
+            NSError *revokeError = nil;
+            Check(![workspace restoreDisplayID:8 error:&revokeError],
+                  @"unknown no-AX thumbnail refuses restoreDisplayID");
             // Large CG on virtual without AX should show and allow classification.
             [access.cgWindows removeAllObjects];
             [access.axByPID removeAllObjects];
@@ -449,51 +453,76 @@ int main(void) {
             Check([workspace needsRestoreForDisplayID:8], @"expired cache keeps needsRestore");
         }
 
-        // --- Group 6: delayed physical CG + virtual AX must not clear checkpoint ---
+        // --- Group 6: checkpoint retirement uses independent cgFrame + job AX ---
         {
+            // Delayed physical CG A + different physical AX B: keep. Using frame as
+            // cgFrame would wrongly confirm (SameFrame(ax,ax) on physical).
             YMFakeWindowAccess *access = [YMFakeWindowAccess new];
             YMFakeRunningApp *app = [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
-            NSDictionary *physical = Frame(830, 675, 230, 408);
-            NSDictionary *virtualAX = Frame(3405, 352, 230, 408);
-            id element = @"el-checkpoint";
+            NSDictionary *physicalCG = Frame(100, 100, 230, 408);
+            NSDictionary *physicalAX = Frame(500, 200, 230, 408);
+            id element = @"el-checkpoint-disagree";
             NSDictionary *identity = Identity(42, 1490);
-            access.elementFrames[[NSString stringWithFormat:@"%p", element]] = virtualAX;
+            access.elementFrames[[NSString stringWithFormat:@"%p", element]] = physicalAX;
             access.elementIdentities[[NSString stringWithFormat:@"%p", element]] = identity;
             [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
-                @"frame": physical, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
-            access.axByPID[@42] = @[@{@"identity": identity, @"frame": virtualAX, @"ordinary": @YES,
+                @"frame": physicalCG, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            access.axByPID[@42] = @[@{@"identity": identity, @"frame": physicalAX, @"ordinary": @YES,
                 @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES, @"element": element}];
             YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
-            NSDictionary *origin = YMWorkspaceOrigin(physical, RuntimeDisplay(5, 0, NO, @"physical"));
+            NSDictionary *origin = YMWorkspaceOrigin(physicalCG, RuntimeDisplay(5, 0, NO, @"physical"));
             [workspace installPlacementElement:element application:app windowID:1490
                                         origin:origin lastDisplayID:8];
+            NSUInteger elementObservesBefore = access.observeElementCount;
             [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
             [workspace drainReads];
             NSArray *placements = [workspace valueForKey:@"placements"];
             Check(placements.count == 1,
-                  @"delayed physical CG snapshot cannot discard a successful virtual AX move checkpoint");
-
-            // Variant: if production wrongly used normalized AX frame as cgFrame,
-            // PhysicalReturnConfirmed(virtual, virtual) would still be virtual and
-            // must not clear. Prove cgFrame stays the independent physical CG.
+                  @"disagreeing physical CG+AX must not retire checkpoint");
             NSDictionary *published = nil;
             for (NSDictionary *window in workspace.windows)
                 if ([window[@"windowID"] unsignedIntValue] == 1490) published = window;
             Check(published[@"cgFrame"] != nil, @"published window retains cgFrame");
-            Check([published[@"cgFrame"] isEqual:physical],
+            Check([published[@"cgFrame"] isEqual:physicalCG],
                   @"cgFrame must stay independent raw CG, not normalizer.frame");
-            Check([published[@"frame"] isEqual:virtualAX], @"frame uses AX geometry");
+            Check([published[@"frame"] isEqual:physicalAX], @"frame uses AX geometry");
             Check(!YMWorkspacePhysicalReturnConfirmed(published[@"cgFrame"], published[@"frame"],
                                                       displays, NO),
-                  @"independent cgFrame+AX disagree on display so checkpoint stays");
-            // Cheating variant would equate them:
+                  @"independent disagreeing cgFrame+AX keep checkpoint");
             Check(YMWorkspacePhysicalReturnConfirmed(published[@"frame"], published[@"frame"],
-                                                     displays, NO) == NO ||
-                  [published[@"frame"] isEqual:published[@"cgFrame"]] == NO,
-                  @"using normalizer.frame as cgFrame must not silently agree here");
+                                                     displays, NO),
+                  @"using normalizer.frame as cgFrame would wrongly confirm physical return");
+            Check(access.observeElementCount == elementObservesBefore,
+                  @"checkpoint retirement must not sync observeElement on publish");
+        }
+        {
+            // Agreeing physical CG+AX enters physical-return branch and clears.
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            YMFakeRunningApp *app = [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            NSDictionary *physical = Frame(830, 675, 230, 408);
+            id element = @"el-checkpoint-agree";
+            NSDictionary *identity = Identity(42, 1491);
+            access.elementFrames[[NSString stringWithFormat:@"%p", element]] = physical;
+            access.elementIdentities[[NSString stringWithFormat:@"%p", element]] = identity;
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1491,
+                @"frame": physical, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            access.axByPID[@42] = @[@{@"identity": identity, @"frame": physical, @"ordinary": @YES,
+                @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES, @"element": element}];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            NSDictionary *origin = YMWorkspaceOrigin(physical, RuntimeDisplay(5, 0, NO, @"physical"));
+            [workspace installPlacementElement:element application:app windowID:1491
+                                        origin:origin lastDisplayID:8];
+            NSUInteger elementObservesBefore = access.observeElementCount;
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            NSArray *placements = [workspace valueForKey:@"placements"];
+            Check(placements.count == 0,
+                  @"agreeing physical CG+AX retires checkpoint via physical-return branch");
+            Check(access.observeElementCount == elementObservesBefore,
+                  @"physical-return retirement uses job AX evidence, not sync observeElement");
         }
 
-        // --- Group 7: callback on main, weak lifetime, no recursive refresh loop ---
+        // --- Group 7: callback on main; incomplete failure path terminates ---
         {
             YMFakeWindowAccess *access = nil;
             YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
@@ -517,6 +546,38 @@ int main(void) {
             Check(callbacks == 1, @"same-key reuse does not reenter callback");
             workspace = nil;
             Check(weakWorkspace == nil || callbacks >= 1, @"callback captures workspace weakly");
+        }
+        {
+            // Incomplete same-key: notify only on real change; bounded reuse; no close;
+            // callback-driven refresh must terminate without a new job.
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            access.forceIncompleteObserve = YES;
+            access.incompleteReason = @"timeout";
+            __block NSUInteger callbacks = 0;
+            __weak YMWorkspaceFixture *weakWorkspace = workspace;
+            workspace.inventoryDidChange = ^{
+                callbacks++;
+                YMWorkspaceFixture *strong = weakWorkspace;
+                if (strong)
+                    [strong refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            };
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            NSUInteger schedulesAfterFail = workspace.scheduleCount;
+            NSUInteger callbacksAfterFail = callbacks;
+            Check(!workspace.inventoryReady, @"incomplete observation is not ready");
+            Check([workspace needsRestoreForDisplayID:8], @"incomplete never authorizes close");
+            Check(workspace.pendingReads.count == 0, @"failure path has no leftover in-flight job");
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            Check(workspace.scheduleCount == schedulesAfterFail,
+                  @"same-key incomplete result reuses observation without new job");
+            Check(workspace.pendingReads.count == 0,
+                  @"callback-driven refresh on failure path does not restart a job");
+            [workspace drainReads];
+            Check(callbacks == callbacksAfterFail,
+                  @"same-key incomplete reuse does not reenter callback");
+            Check(callbacks <= 2, @"incomplete failure path does not spin callbacks");
         }
 
         // Default init must not be used by these fixtures.
