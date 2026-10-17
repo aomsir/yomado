@@ -505,7 +505,10 @@ static BOOL YMWOrdinaryWindow(id element) {
         [self drainLatestInventoryRequest];
         return;
     }
+    // Admission Visible filtering must not erase unclassifiable CG (missing
+    // identity/frame/layer/onScreen/alpha); those still block ready/empty close.
     if (!complete || !snapshot || ![snapshot[@"complete"] boolValue] ||
+        [self cgHasUnclassifiableEvidence:liveCG] ||
         [self snapshotHasUnresolvedEvidence:snapshot cg:liveCG]) {
         NSArray *partial = snapshot ? [self assembledWindowsFromSnapshot:snapshot] : self.windows;
         // Keep prior display rows when partial; never claim ready/empty.

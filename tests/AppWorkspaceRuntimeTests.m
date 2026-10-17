@@ -869,6 +869,61 @@ int main(void) {
             Check([workspace needsRestoreForDisplayID:8],
                   @"illegal/missing CG keeps needsRestore");
         }
+
+        // --- Fix3: trusted AX path must keep unclassifiable CG fail-closed ---
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            // Missing layer/onScreen/alpha — admission Visible drops it before normalizer.
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
+                @"frame": Frame(2700, 100, 400, 300)}];
+            access.trusted = YES;
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady,
+                  @"trusted illegal/missing CG fields must not publish ready");
+            Check([workspace needsRestoreForDisplayID:8],
+                  @"trusted illegal/missing CG keeps needsRestore");
+            NSError *restoreError = nil;
+            Check(![workspace restoreDisplayID:8 error:&restoreError],
+                  @"trusted illegal CG refuses restoreDisplayID empty close");
+        }
+        {
+            // Missing identity must also block trusted ready (not only visibility fields).
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            [access.cgWindows addObject:@{@"pid": @42,
+                @"frame": Frame(2700, 100, 400, 300), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            access.trusted = YES;
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady,
+                  @"trusted CG missing identity must not publish ready");
+            Check([workspace needsRestoreForDisplayID:8],
+                  @"trusted CG missing identity keeps needsRestore");
+        }
+        {
+            // Mixed: one legal AX-matched window + one unclassifiable sibling.
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:Frame(2700, 100, 400, 300)
+                             axFrame:Frame(2700, 100, 400, 300)];
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1491,
+                @"frame": Frame(2800, 200, 400, 300)}];
+            access.trusted = YES;
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady,
+                  @"trusted mixed legal+illegal CG must not publish ready");
+            Check([workspace needsRestoreForDisplayID:8],
+                  @"trusted mixed legal+illegal CG keeps needsRestore");
+            Check([[workspace rowsForDisplayID:8] count] == 1,
+                  @"trusted mixed case still publishes the legal window row");
+        }
         {
             // Over-cap tail unknown must not be missed after truncation.
             YMFakeWindowAccess *access = [YMFakeWindowAccess new];
