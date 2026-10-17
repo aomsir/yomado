@@ -310,6 +310,11 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     self.viewportPreferredHeight.active = !self.collapsed;
     self.collapseButton.title = self.collapsed ? @"展开" : @"折叠";
     self.collapseButton.accessibilityLabel = self.collapsed ? @"展开未启动列表" : @"折叠未启动列表";
+    // Collapse skips height refresh; recompute from current rows on expand
+    // (manual toggle or error reveal) so viewport matches latest count.
+    if (!self.collapsed) {
+        [self refreshPreferredHeight];
+    }
 }
 
 - (void)refreshPreferredHeight {

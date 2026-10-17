@@ -419,6 +419,63 @@ static void SavedRowsViewportRange(void) {
     AssertVisibleRowButtonsReachable(view, "re-expand keeps visible action buttons reachable");
 }
 
+static NSArray<YMSavedDisplayProfileRow *> *ManyRows(NSUInteger count) {
+    NSMutableArray<YMSavedDisplayProfileRow *> *rows = [NSMutableArray array];
+    for (NSUInteger index = 1; index <= count; index++) {
+        [rows addObject:Row(index, [NSString stringWithFormat:@"P%lu", (unsigned long)index], YES)];
+    }
+    return rows;
+}
+
+static void SavedRowsViewportAfterCollapseDataChange(void) {
+    NSWindow *window = SavedListWindow(760);
+    YMSavedDisplayProfilesView *view = EmbedSavedList(window);
+
+    [view updateRows:@[Row(1, @"Only", YES)] revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    AssertViewportHeight(view, 56, 56, "start with one-row viewport");
+
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(view.collapsed, "collapse before growing while hidden");
+    [view updateRows:ManyRows(30) revealOrdinal:nil];
+    Check(view.collapsed, "growth while collapsed keeps collapsed");
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(!view.collapsed, "manual expand after growth");
+    AssertViewportHeight(view, 184, 184, "manual expand after 1→30 uses clamped height");
+
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(view.collapsed, "collapse before shrinking while hidden");
+    [view updateRows:@[Row(1, @"Only", YES)] revealOrdinal:nil];
+    Check(view.collapsed, "shrink while collapsed keeps collapsed");
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(!view.collapsed, "manual expand after shrink");
+    AssertViewportHeight(view, 56, 56, "manual expand after 30→1 uses one-row height");
+
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(view.collapsed, "collapse before reveal growth");
+    [view updateRows:ManyRows(30) revealOrdinal:@30];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(!view.collapsed, "reveal expands after growth while collapsed");
+    AssertViewportHeight(view, 184, 184, "reveal after 1→30 uses clamped height");
+    NSRect target = [view.rowsByOrdinal[@30] convertRect:view.rowsByOrdinal[@30].bounds
+                                                  toView:view.scrollView.documentView];
+    Check(NSIntersectsRect(target, view.scrollView.documentVisibleRect),
+          "reveal after growth shows failed row");
+
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(view.collapsed, "collapse before reveal shrink");
+    [view updateRows:@[Row(1, @"Only", YES)] revealOrdinal:@1];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(!view.collapsed, "reveal expands after shrink while collapsed");
+    AssertViewportHeight(view, 56, 56, "reveal after 30→1 uses one-row height");
+}
+
 static void SavedRowsCollapseScrollAndLayout(void) {
     NSMutableArray<YMSavedDisplayProfileRow *> *rows = [NSMutableArray array];
     NSString *longName = [@"N" stringByPaddingToLength:60 withString:@"x" startingAtIndex:0];
@@ -512,6 +569,8 @@ int main(void) {
         printf("PASS saved rows reorder keeps width\n");
         SavedRowsViewportRange();
         printf("PASS saved rows viewport range\n");
+        SavedRowsViewportAfterCollapseDataChange();
+        printf("PASS saved rows viewport after collapse data change\n");
         return 0;
     }
 }
