@@ -7,15 +7,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <description>Signed stable updates for yomado.</description>
     <language>en</language>
     <item>
-      <title>yomado 0.3.6</title>
-      <sparkle:version>12</sparkle:version>
-      <sparkle:shortVersionString>0.3.6</sparkle:shortVersionString>
+      <title>yomado 0.3.7</title>
+      <sparkle:version>13</sparkle:version>
+      <sparkle:shortVersionString>0.3.7</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-      <description>Install signed updates in yomado and restore supported virtual-screen workspaces after relaunch.</description>
-      <enclosure url="https://github.com/chekusu/yomado/releases/download/v0.3.6/Yomado.zip" length="2684613" type="application/octet-stream" sparkle:edSignature="oLeJWx1rCNLaVywyrh8YH586mLqyx2qQG14Abfh+31zGyj8uChglUKJkNlYK9GvpcjJrfPZV5sG3fi5rlnRWBQ=="></enclosure>
+      <description>Download the latest stable yomado release.</description>
+      <enclosure url="https://github.com/chekusu/yomado/releases/download/v0.3.7/Yomado.zip" length="2684825" type="application/octet-stream" sparkle:edSignature="ffhPSVgtR6K+Bab+tnDCVOsba+j+58uPyAGjOHBcCBEaERH/z4Rcui1EDOmA8Jb8jAd10Ldkl33OwLkzE+EKDA=="></enclosure>
     </item>
   </channel>
 </rss><!-- sparkle-signatures:
-edSignature: 1xx67TyJjhoPWSp218WbLzk4VtPxBwHK6uiwTgZjmg9CinE0mOaCGNR4Dnb2olbaklUcYzff7qTlDmMNzT6pDw==
-length: 1212
+edSignature: znGnk5VxMwTb5e3FS2omCXnw0l86dowHAP+rPGjZu6arO87D39UDl0F0ibGeUmf/54IesnEKv9w5ZdGL17KNDg==
+length: 1158
 -->
