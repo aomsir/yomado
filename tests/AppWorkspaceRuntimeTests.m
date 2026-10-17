@@ -69,6 +69,7 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 @property(nonatomic) NSUInteger mutateOnObserveElementCount;
 @property(nonatomic, copy) NSDictionary *observeElementMutation;
 @property(nonatomic, copy) void (^observeElementSideEffect)(NSUInteger count);
+@property(nonatomic, copy) void (^observeApplicationSideEffect)(pid_t pid, NSTimeInterval deadline);
 @property(nonatomic, strong) NSMutableArray<NSNumber *> *observedPIDs;
 /// When YES, applicationForPID returns a fresh equal wrapper (not pointer-identical).
 @property(nonatomic) BOOL reboxApplicationWrappers;
@@ -288,11 +289,11 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 }
 
 - (NSDictionary *)observeApplication:(NSRunningApplication *)application
-                            deadline:(NSTimeInterval)deadline {
-    (void)deadline;
+                             deadline:(NSTimeInterval)deadline {
     self.observeCount++;
     pid_t pid = application.processIdentifier;
     [self.observedPIDs addObject:@(pid)];
+    if (self.observeApplicationSideEffect) self.observeApplicationSideEffect(pid, deadline);
     if (self.forceIncompleteObserve || [self.forceIncompletePIDs containsObject:@(pid)])
         return @{@"windows": self.axByPID[@(pid)] ?: @[], @"complete": @NO,
                  @"reason": self.incompleteReason ?: @"timeout"};
@@ -412,6 +413,8 @@ static NSURL *WriteTempFixtureApp(NSString *bundleID) {
                      snapshot:(NSDictionary *)snapshot axRecords:(NSArray *)axRecords
                  observedApps:(NSDictionary *)observedApps;
 - (void)scheduleInventoryIfNeeded;
+- (void)publishWindows:(NSArray<NSDictionary *> *)windows ready:(BOOL)ready key:(NSString *)key
+             generation:(NSUInteger)generation excludedKeys:(NSSet<NSString *> *)excludedKeys;
 @end
 
 @interface YMWorkspaceFixture : YMAppWorkspace
@@ -538,6 +541,253 @@ static YMWorkspaceFixture *ManagerFixture(YMFakeWindowAccess **outAccess, NSURL 
 int main(void) {
     @autoreleasepool {
         NSArray *displays = RuntimeDisplays();
+
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            NSArray *physicalWindows = workspace.windows;
+            __block NSUInteger callbacks = 0;
+            workspace.inventoryDidChange = ^{ callbacks++; };
+            [workspace publishWindows:physicalWindows ready:NO key:@"partial-physical"
+                           generation:workspace.inventoryGeneration excludedKeys:nil];
+            callbacks = 0;
+            [workspace publishWindows:@[] ready:NO key:@"partial-empty"
+                           generation:workspace.inventoryGeneration excludedKeys:nil];
+            Check(callbacks == 1, @"physical-only row removal notifies while inventory stays incomplete");
+            [workspace publishWindows:physicalWindows ready:NO key:@"partial-physical"
+                           generation:workspace.inventoryGeneration excludedKeys:nil];
+            Check(callbacks == 2, @"physical-only row arrival notifies without virtual rows changing");
+            [workspace publishWindows:physicalWindows ready:NO key:@"partial-physical"
+                           generation:workspace.inventoryGeneration excludedKeys:nil];
+            Check(callbacks == 2, @"unchanged physical inventory does not loop callbacks");
+            Check(!workspace.inventoryReady, @"physical row notifications do not authorize close");
+            Check(access.writeCount == 0, @"physical row notification regression performs no window writes");
+        }
+
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            [access installWindowPID:42 windowID:1490
+                             cgFrame:Frame(2700, 100, 230, 408)
+                             axFrame:Frame(2700, 100, 230, 408)];
+            [access installApp:77 name:@"Unresponsive" bundle:@"test.unresponsive"];
+            [access installWindowPID:77 windowID:1770
+                             cgFrame:Frame(100, 100, 400, 300)
+                             axFrame:Frame(100, 100, 400, 300)];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"multi-app baseline is complete");
+            [access.forceIncompletePIDs addObject:@77];
+            // Even duplicate records from the failed PID must not poison a fully
+            // observed app's presentation or become authority for any write.
+            access.axByPID[@77] = @[access.axByPID[@77][0], access.axByPID[@77][0]];
+            id element = access.axByPID[@42][0][@"element"];
+            [access updateAXFrame:Frame(830, 719, 230, 408) forElement:element];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check([[workspace rowsForDisplayID:8] count] == 0,
+                  @"unrelated PID failure does not leave returned Calculator on virtual screen");
+            Check([[[workspace rowsForDisplayID:5] valueForKey:@"bundleIdentifier"]
+                   containsObject:@"test.calculator"],
+                  @"fully observed Calculator publishes physical return despite unrelated failure");
+            Check(!workspace.inventoryReady, @"partial app presentation never becomes ready");
+            Check([workspace needsRestoreForDisplayID:8], @"partial presentation retains close gate");
+            NSError *error = nil;
+            Check(![workspace restoreDisplayID:8 error:&error], @"partial display rows cannot authorize close");
+            Check([workspace restartOriginCheckpointsWithError:&error] == nil,
+                  @"partial display rows cannot authorize update export");
+            Check(access.writeCount == 0, @"partial inventory and blocked gates perform no writes");
+        }
+
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [access installApp:77 name:@"Unresponsive" bundle:@"test.unresponsive"];
+            [access installWindowPID:77 windowID:1770
+                             cgFrame:Frame(100, 100, 400, 300)
+                             axFrame:Frame(100, 100, 400, 300)];
+            [access.forceIncompletePIDs addObject:@77];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check([[[workspace rowsForDisplayID:5] valueForKey:@"bundleIdentifier"]
+                   containsObject:@"test.calculator"],
+                  @"initial partial inventory still shows fully observed physical app");
+            Check(!workspace.inventoryReady, @"initial partial inventory remains fail-closed");
+        }
+
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            for (pid_t pid = 100; pid <= 106; pid++) {
+                [access installApp:pid name:@"Budget fixture"
+                            bundle:[NSString stringWithFormat:@"test.budget.%d", pid]];
+                [access installWindowPID:pid windowID:(CGWindowID)(2000 + pid)
+                                 cgFrame:Frame(100, 100, 400, 300)
+                                 axFrame:Frame(100, 100, 400, 300)];
+                if (pid != 106) [access.forceIncompletePIDs addObject:@(pid)];
+            }
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            __weak YMWorkspaceFixture *weakWorkspace = workspace;
+            access.observeApplicationSideEffect = ^(pid_t pid, NSTimeInterval deadline) {
+                YMWorkspaceFixture *current = weakWorkspace;
+                Check(deadline - current.clock <= 0.200001, @"each PID gets a bounded share of inventory budget");
+                if (pid != 106) current.clock = deadline;
+            };
+            BOOL healthyAppPublished = NO;
+            NSDictionary *healthyCG = access.cgWindows.lastObject;
+            for (NSUInteger round = 0; round < 3; round++) {
+                NSMutableArray *reordered = [access.cgWindows mutableCopy];
+                [reordered removeObject:healthyCG];
+                NSUInteger cursor = [[workspace valueForKey:@"inventoryPIDCursor"] unsignedIntegerValue];
+                [reordered insertObject:healthyCG atIndex:(cursor + 6) % 7];
+                [access.cgWindows setArray:reordered];
+                [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+                [workspace drainReads];
+                if ([[[workspace rowsForDisplayID:5] valueForKey:@"bundleIdentifier"]
+                     containsObject:@"test.budget.106"]) healthyAppPublished = YES;
+                Check(!workspace.inventoryReady, @"budget-exhausted rounds remain incomplete");
+                [workspace advanceClock:1.1];
+            }
+            Check([access.observedPIDs containsObject:@106], @"slow leading PIDs cannot starve trailing app forever");
+            Check(healthyAppPublished, @"healthy app publishes despite adversarial CG Z-order changes");
+            Check(access.writeCount == 0, @"budget fairness never writes or activates apps");
+        }
+
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            YMFakeRunningApp *system = [access installApp:999 name:@"System surface" bundle:@""];
+            system.bundleURL = nil;
+            [access.cgWindows addObject:@{@"pid": @999, @"windowID": @9990,
+                @"frame": Frame(100, 100, 200, 200), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @9991,
+                @"frame": Frame(100, 100, 200, 200), @"layer": @101, @"onScreen": @YES, @"alpha": @1}];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            NSUInteger generation = workspace.inventoryGeneration;
+            NSUInteger schedules = workspace.scheduleCount;
+            for (NSUInteger index = 1; index < access.cgWindows.count; index++) {
+                NSMutableDictionary *changed = [access.cgWindows[index] mutableCopy];
+                changed[@"frame"] = Frame(200, 200, 300, 300);
+                access.cgWindows[index] = changed;
+            }
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryGeneration == generation,
+                  @"classified system and non-candidate surfaces do not churn generation");
+            Check(workspace.scheduleCount == schedules, @"irrelevant CG churn does not discard and restart AX job");
+            Check(workspace.inventoryReady, @"current app evidence publishes despite irrelevant CG movement");
+            Check([[workspace rowsForDisplayID:5] count] == 1, @"system churn cannot hide Calculator row");
+        }
+
+        for (NSNumber *trusted in @[@YES, @NO]) {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            access.trusted = trusted.boolValue;
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"empty baseline ready before unresolved process appears");
+            [access.cgWindows addObject:@{@"pid": @999, @"windowID": @77,
+                @"frame": Frame(2800, 200, 400, 300), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            Check(!workspace.inventoryReady, @"unresolved visible process cannot reuse empty ready TTL");
+            [workspace drainReads];
+            Check(!workspace.inventoryReady, @"unresolved visible process stays pending after observation");
+            Check([workspace needsRestoreForDisplayID:8], @"unresolved process retains virtual display");
+            NSError *error = nil;
+            Check(![workspace restoreDisplayID:8 error:&error], @"unresolved process refuses empty close");
+            Check([workspace restartOriginCheckpointsWithError:&error] == nil,
+                  @"unresolved process refuses empty export");
+            Check(access.writeCount == 0, @"unresolved-process guard performs no window writes");
+            [access.cgWindows removeAllObjects];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"empty inventory can recover after unresolved surface disappears");
+        }
+
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            NSUInteger schedules = workspace.scheduleCount;
+            [access updateAXFrame:Frame(2700, 100, 230, 408)
+                      forElement:access.axByPID[@42][0][@"element"]];
+            [workspace invalidateInventoryForMutation];
+            [workspace drainReads];
+            Check(workspace.scheduleCount == schedules + 1,
+                  @"post-mutation inventory captures fresh CG before scheduling, without stale first pass");
+            Check([[workspace rowsForDisplayID:8] count] == 1, @"fresh post-mutation pass publishes destination");
+        }
+
+        {
+            YMFakeWindowAccess *access = nil;
+            NSURL *url = nil;
+            NSDictionary *origin = Frame(830, 719, 230, 408);
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &url, origin, origin);
+            [access installApp:1014 name:@"WindowManager" bundle:@"com.apple.WindowManager"
+                     bundleURL:[NSURL fileURLWithPath:@"/System/Library/CoreServices/WindowManager.app"]];
+            [access.cgWindows addObjectsFromArray:@[
+                @{@"pid": @1014, @"windowID": @705, @"frame": Frame(15, 982, 37, 102),
+                  @"layer": @0, @"onScreen": @YES, @"alpha": @1},
+                @{@"pid": @1014, @"windowID": @5430, @"frame": Frame(2700, 100, 1800, 1000),
+                  @"layer": @0, @"onScreen": @YES, @"alpha": @1}
+            ]];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"real-path Stage Manager surfaces without AX windows do not block inventory");
+            Check(![access.observedPIDs containsObject:@1014], @"system presentation process is not enumerated as ordinary app");
+            Check([[workspace rowsForDisplayID:5] count] == 1, @"physical rows include Calculator but not WindowManager");
+            Check([[workspace rowsForDisplayID:8] count] == 0, @"large virtual system surface is not an app window");
+            NSError *error = nil;
+            BOOL moved = [workspace moveApplicationAtURL:url fromDisplayID:5 toDisplayID:8 error:&error];
+            [workspace drainReads];
+            Check(moved && workspace.inventoryReady, @"ordinary window move remains ready alongside system surfaces");
+            BOOL restored = [workspace restoreDisplayID:8 error:&error];
+            Check(restored, @"close restore can return Calculator despite Stage Manager surfaces");
+            Check(YMWorkspaceSameFrame(access.currentFrame, origin), @"close restore retains original Calculator geometry");
+            for (NSDictionary *write in access.positionWrites)
+                Check([write[@"identity"][@"pid"] intValue] == 42, @"close never writes system presentation windows");
+            [[NSFileManager defaultManager] removeItemAtURL:[url URLByDeletingLastPathComponent] error:nil];
+        }
+
+        for (NSNumber *trusted in @[@YES, @NO]) {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            access.trusted = trusted.boolValue;
+            [access installApp:1014 name:@"WindowManager" bundle:@"com.apple.WindowManager"
+                     bundleURL:[NSURL fileURLWithPath:@"/System/Library/CoreServices/WindowManager.app"]];
+            [access.cgWindows addObject:@{@"pid": @1014, @"windowID": @5430,
+                @"frame": Frame(2700, 100, 1800, 1000), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"known system-only surface is empty ordinary inventory with or without AX");
+            Check([[workspace rowsForDisplayID:8] count] == 0, @"no-AX fallback also excludes system presentation surface");
+            NSMutableDictionary *malformed = [access.cgWindows[0] mutableCopy];
+            [malformed removeObjectForKey:@"alpha"];
+            access.cgWindows[0] = malformed;
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady, @"malformed system-owner metadata still fails closed");
+        }
+
+        for (NSDictionary *spoof in @[
+            @{@"bundle": @"com.apple.WindowManager", @"path": @"/Applications/WindowManager.app"},
+            @{@"bundle": @"test.other-app", @"path": @"/System/Library/CoreServices/WindowManager.app"}
+        ]) {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access installApp:1014 name:@"Not verified system process" bundle:spoof[@"bundle"]
+                     bundleURL:[NSURL fileURLWithPath:spoof[@"path"]]];
+            [access.cgWindows addObject:@{@"pid": @1014, @"windowID": @5430,
+                @"frame": Frame(2700, 100, 1800, 1000), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(!workspace.inventoryReady, @"matching only system name or path cannot bypass unmatched AX blocker");
+            Check([workspace needsRestoreForDisplayID:8], @"unverified system lookalike retains close gate");
+            Check([access.observedPIDs containsObject:@1014], @"system lookalike is still observed as an ordinary app");
+        }
 
         // --- Group 0 / Step 1 smoke: pending then publish small thumbnail ---
         {
@@ -995,6 +1245,8 @@ int main(void) {
                              cgFrame:Frame(2700, 100, 400, 300)
                              axFrame:Frame(2700, 100, 400, 300)];
             // Layer-zero system surface without bundle admission.
+            YMFakeRunningApp *system = [access installApp:999 name:@"System surface" bundle:@""];
+            system.bundleURL = nil;
             [access.cgWindows addObject:@{@"pid": @999, @"windowID": @77,
                 @"frame": Frame(2800, 200, 120, 90), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
             YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
@@ -2087,6 +2339,8 @@ int main(void) {
         }
         {
             YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            YMFakeRunningApp *system = [access installApp:999 name:@"System surface" bundle:@""];
+            system.bundleURL = nil;
             [access.cgWindows addObject:@{@"pid": @999, @"windowID": @77,
                 @"frame": Frame(2800, 200, 120, 90), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
             YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];

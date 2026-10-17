@@ -7,6 +7,7 @@
 NSString * const YMAppWorkspaceErrorDomain = @"dev.chekusu.yomado.app-workspace";
 
 static const NSTimeInterval kYMInventoryBudget = 1.0;
+static const NSTimeInterval kYMInventoryPIDBudget = 0.2;
 static const NSTimeInterval kYMInventoryCacheTTL = 1.0;
 static const NSUInteger kYMInventoryMaxPIDs = 64;
 static const NSUInteger kYMInventoryMaxCGCandidates = 512;
@@ -51,6 +52,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 @property(nonatomic) BOOL inventoryHasObservedCG;
 @property(nonatomic, copy) NSString *inventoryObservedCGSignature;
 @property(nonatomic, copy) NSSet<NSString *> *inventoryConfirmedExcludedKeys;
+@property(nonatomic) NSUInteger inventoryPIDCursor;
 @end
 
 @implementation YMAppWorkspace
@@ -69,6 +71,14 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     return self;
 }
 - (BOOL)accessibilityTrusted { return [self.windowAccess accessibilityTrusted]; }
+- (BOOL)isSystemPresentationApplication:(NSRunningApplication *)application {
+    // Stage Manager's system-owned surfaces have no ordinary AX counterpart.
+    // A bundle identifier alone must not let a third-party app evade close guards.
+    return application && !application.terminated &&
+        [application.bundleIdentifier isEqualToString:@"com.apple.WindowManager"] &&
+        [[application.bundleURL URLByResolvingSymlinksInPath].path
+            isEqualToString:@"/System/Library/CoreServices/WindowManager.app"];
+}
 - (BOOL)inventoryReady {
     return self.inventoryReadyPublished && [self inventoryCacheFresh];
 }
@@ -100,7 +110,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     self.inventoryLatestGeneration = self.inventoryGeneration;
     // Never schedule/publish inventory that can rewrite placements while a write
     // is still settling on the run loop. The write's @finally re-invalidates.
-    if (!self.operationInProgress) [self scheduleInventoryIfNeeded];
+    if (!self.operationInProgress) [self refreshInventory];
 }
 - (void)notifyInventoryDidChange {
     void (^callback)(void) = self.inventoryDidChange;
@@ -167,7 +177,25 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 }
 - (NSString *)normalizedCGSignature:(NSArray<NSDictionary *> *)cgWindows {
     NSMutableArray *parts = [NSMutableArray array];
-    NSArray *sorted = [cgWindows sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+    NSMutableArray *relevant = [NSMutableArray array];
+    for (NSDictionary *cg in cgWindows) {
+        if (![cg isKindOfClass:NSDictionary.class]) {
+            [parts addObject:@"invalidCG"];
+            continue;
+        }
+        // Classified non-candidates cannot change the application inventory. Keep
+        // malformed evidence in the key so it can never revive a ready snapshot.
+        if (YMWorkspaceCGCandidateIdentity(cg) && YMWorkspaceGeometry(cg[@"frame"])) {
+            if (YMWorkspaceCGCandidateClearlyInvisible(cg)) continue;
+            if (YMWorkspaceCGCandidateVisible(cg)) {
+                NSRunningApplication *app = [self.windowAccess applicationForPID:[cg[@"pid"] intValue]];
+                if ([self isSystemPresentationApplication:app]) continue;
+                if (app && !app.terminated && (!app.bundleIdentifier.length || !app.bundleURL)) continue;
+            }
+        }
+        [relevant addObject:cg];
+    }
+    NSArray *sorted = [relevant sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         NSComparisonResult pid = [a[@"pid"] compare:b[@"pid"]];
         return pid != NSOrderedSame ? pid : [a[@"windowID"] compare:b[@"windowID"]];
     }];
@@ -241,6 +269,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         pid_t pid = [cg[@"pid"] intValue];
         NSRunningApplication *app = [self.windowAccess applicationForPID:pid];
         if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) continue;
+        if ([self isSystemPresentationApplication:app]) continue;
         if (candidates.count >= kYMInventoryMaxCGCandidates) {
             overflow = YES;
             break;
@@ -259,7 +288,11 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         if (!YMWorkspaceCGCandidateIdentity(cg)) return YES;
         if (!YMWorkspaceGeometry(cg[@"frame"])) return YES;
         if (YMWorkspaceCGCandidateClearlyInvisible(cg)) continue;
-        if (YMWorkspaceCGCandidateVisible(cg)) continue;
+        if (YMWorkspaceCGCandidateVisible(cg)) {
+            NSRunningApplication *app = [self.windowAccess applicationForPID:[cg[@"pid"] intValue]];
+            if (!app || app.terminated) return YES;
+            continue;
+        }
         // Identity+frame present but visibility fields missing/invalid: both
         // Visible and ClearlyInvisible filters drop it — must not prove empty.
         return YES;
@@ -292,6 +325,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 
     NSArray *cgSnapshot = [self.inventoryCachedCG copy] ?: @[];
     NSArray *displays = [self.displays copy] ?: @[];
+    NSUInteger pidCursor = self.inventoryPIDCursor;
     BOOL trusted = self.accessibilityTrusted;
     NSUInteger jobGeneration = generation;
     NSString *jobKey = [key copy];
@@ -301,6 +335,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         if (!strongSelf) return;
         NSMutableArray *axRecords = [NSMutableArray array];
         NSMutableDictionary *observedApps = [NSMutableDictionary dictionary];
+        NSUInteger nextPIDCursor = 0;
         BOOL complete = YES;
         NSString *reason = @"";
         NSArray *normalizeCG = cgSnapshot;
@@ -311,16 +346,21 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
             NSMutableOrderedSet *allPIDs = [NSMutableOrderedSet orderedSet];
             for (NSDictionary *cg in candidates) [allPIDs addObject:cg[@"pid"]];
             BOOL hitPIDCap = allPIDs.count > kYMInventoryMaxPIDs;
+            NSArray *sortedPIDs = [allPIDs.array sortedArrayUsingSelector:@selector(compare:)];
             NSArray *observePIDs = hitPIDCap
-                ? [allPIDs.array subarrayWithRange:NSMakeRange(0, kYMInventoryMaxPIDs)]
-                : allPIDs.array;
+                ? [sortedPIDs subarrayWithRange:NSMakeRange(0, kYMInventoryMaxPIDs)]
+                : sortedPIDs;
             // Normalizer must share the AX admission set so non-admitted system
             // surfaces do not become unmatched; admitted unknowns still fail closed.
             normalizeCG = candidates;
             NSTimeInterval deadline = [strongSelf inventoryTime] + kYMInventoryBudget;
-            for (NSNumber *pidValue in observePIDs) {
+            for (NSUInteger index = 0; index < observePIDs.count; index++) {
+                NSUInteger pidIndex = (pidCursor + index) % observePIDs.count;
+                NSNumber *pidValue = observePIDs[pidIndex];
                 if ([strongSelf inventoryTime] >= deadline) {
-                    complete = NO; reason = @"timeout"; break;
+                    complete = NO; reason = @"timeout";
+                    nextPIDCursor = pidIndex;
+                    break;
                 }
                 NSRunningApplication *app = [strongSelf.windowAccess applicationForPID:pidValue.intValue];
                 if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) {
@@ -331,19 +371,23 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
                 // Bind the concrete process object observed for this job. Publish
                 // must refuse if that process exits or a same-PID replacement appears.
                 observedApps[pidValue] = app;
-                NSDictionary *observation = [strongSelf.windowAccess observeApplication:app deadline:deadline];
-                if (![observation[@"complete"] boolValue]) {
+                NSTimeInterval pidDeadline = fmin(deadline, [strongSelf inventoryTime] + kYMInventoryPIDBudget);
+                NSDictionary *observation = [strongSelf.windowAccess observeApplication:app deadline:pidDeadline];
+                BOOL pidComplete = [observation[@"complete"] boolValue];
+                if (!pidComplete) {
                     complete = NO;
                     if (!reason.length) reason = observation[@"reason"] ?: @"incomplete";
                 }
                 NSArray *windows = observation[@"windows"];
-                if ([windows isKindOfClass:NSArray.class]) [axRecords addObjectsFromArray:windows];
+                // An incomplete PID cannot prove that its remaining AX windows
+                // are unambiguous. Other fully observed apps can still update UI.
+                if (pidComplete && [windows isKindOfClass:NSArray.class]) [axRecords addObjectsFromArray:windows];
             }
             if (hitCGCap) { complete = NO; if (!reason.length) reason = @"cgLimit"; }
             if (hitPIDCap) { complete = NO; if (!reason.length) reason = @"pidLimit"; }
         }
         NSDictionary *snapshot = trusted
-            ? YMWorkspaceNormalizeWindowSnapshot(normalizeCG, axRecords, complete, displays)
+            ? YMWorkspaceNormalizeWindowSnapshot(normalizeCG, axRecords, YES, displays)
             : nil;
         NSDictionary *observedAppsCopy = [observedApps copy];
         [strongSelf publishInventoryRead:^{
@@ -351,6 +395,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
             if (!publisher) return;
             publisher.inventoryJobScheduled = NO;
             publisher.inventoryInflightKey = nil;
+            publisher.inventoryPIDCursor = nextPIDCursor;
             [publisher finishInventoryJobKey:jobKey generation:jobGeneration
                                   cgSnapshot:cgSnapshot trusted:trusted
                                     complete:complete reason:reason
@@ -369,6 +414,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         pid_t pid = [cg[@"pid"] intValue];
         NSRunningApplication *app = [self.windowAccess applicationForPID:pid];
         if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) continue;
+        if ([self isSystemPresentationApplication:app]) continue;
         NSDictionary *display = YMWorkspaceDisplayForFrame(frame, self.displays);
         if (!display) continue;
         [windows addObject:@{@"windowID": cg[@"windowID"], @"pid": @(pid),
@@ -495,7 +541,8 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
 }
 - (void)publishWindows:(NSArray<NSDictionary *> *)windows ready:(BOOL)ready key:(NSString *)key
-            generation:(NSUInteger)generation excludedKeys:(NSSet<NSString *> *)excludedKeys {
+             generation:(NSUInteger)generation excludedKeys:(NSSet<NSString *> *)excludedKeys {
+    NSArray *previousWindows = self.windows;
     NSArray *previousRows = self.rows;
     BOOL previousReady = self.inventoryReady;
     [self retirePlacementsAgainstWindows:windows];
@@ -515,7 +562,9 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     self.inventoryValid = ready;
     self.inventoryConfirmedExcludedKeys = ready ? [excludedKeys copy] : nil;
     BOOL rowsChanged = ![previousRows isEqual:self.rows];
-    if (rowsChanged || previousReady != self.inventoryReady) [self notifyInventoryDidChange];
+    BOOL windowsChanged = ![previousWindows isEqual:self.windows];
+    if (rowsChanged || windowsChanged || previousReady != self.inventoryReady)
+        [self notifyInventoryDidChange];
 }
 - (void)finishInventoryJobKey:(NSString *)jobKey generation:(NSUInteger)jobGeneration
                    cgSnapshot:(NSArray *)cgSnapshot trusted:(BOOL)trusted
