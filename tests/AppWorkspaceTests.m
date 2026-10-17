@@ -295,6 +295,67 @@ int main(void) {
         Check(!YMWorkspaceSnapshotAllowsSource(unknown, @0), @"unknown-source blocker refuses physical card");
         Check(!YMWorkspaceSnapshotAllowsSource(unknown, nil), @"unknown-source blocker refuses whole-app drop");
 
+        NSDictionary *nanCG = @{@"pid": @42, @"windowID": @1490,
+            @"frame": Frame(NAN, 982, 37, 102), @"layer": @0, @"onScreen": @YES, @"alpha": @1};
+        NSDictionary *nanCGResult = YMWorkspaceNormalizeWindowSnapshot(@[nanCG], @[ax], YES, displays);
+        Check([nanCGResult[@"windows"] count] == 0, @"NaN CG frame cannot become movable");
+        Check(![nanCGResult[@"complete"] boolValue] || [nanCGResult[@"blockers"] count] > 0,
+            @"NaN CG frame fails closed rather than pretending complete emptiness");
+        Check(!YMWorkspaceSnapshotAllowsSource(nanCGResult, @5), @"NaN CG frame refuses sources");
+        NSDictionary *missingCGFrame = @{@"pid": @42, @"windowID": @1490,
+            @"layer": @0, @"onScreen": @YES, @"alpha": @1};
+        NSDictionary *missingCGResult = YMWorkspaceNormalizeWindowSnapshot(@[missingCGFrame], @[ax], YES, displays);
+        Check([missingCGResult[@"windows"] count] == 0, @"missing CG frame cannot become movable");
+        Check(!YMWorkspaceSnapshotAllowsSource(missingCGResult, @5), @"missing CG frame refuses sources");
+        NSDictionary *nanCGOther = @{@"pid": @42, @"windowID": @1500,
+            @"frame": Frame(NAN, 200, 230, 408), @"layer": @0, @"onScreen": @YES, @"alpha": @1};
+        NSDictionary *mixedIllegalCG = YMWorkspaceNormalizeWindowSnapshot(
+            @[cg, nanCGOther], @[ax], YES, displays);
+        Check(!YMWorkspaceSnapshotAllowsSource(mixedIllegalCG, @5),
+            @"illegal CG candidate must not let mixed snapshot authorize other windows");
+        NSDictionary *offscreenOnly = YMWorkspaceNormalizeWindowSnapshot(@[offscreen], @[ax], YES, displays);
+        Check([offscreenOnly[@"windows"] count] == 0 && [offscreenOnly[@"blockers"] count] == 0,
+            @"explicit off-screen CG may be excluded without unknown blocker");
+        Check([offscreenOnly[@"complete"] boolValue], @"explicit off-screen exclusion stays complete");
+        NSDictionary *transparentOnly = YMWorkspaceNormalizeWindowSnapshot(@[transparent], @[ax], YES, displays);
+        Check([transparentOnly[@"windows"] count] == 0 && [transparentOnly[@"blockers"] count] == 0,
+            @"explicit transparent CG may be excluded without unknown blocker");
+        NSDictionary *floatingOnly = YMWorkspaceNormalizeWindowSnapshot(@[floating], @[ax], YES, displays);
+        Check([floatingOnly[@"windows"] count] == 0 && [floatingOnly[@"blockers"] count] == 0,
+            @"explicit non-zero layer CG may be excluded without unknown blocker");
+
+        NSMutableDictionary *missingMinimizedAX = [ax mutableCopy];
+        [missingMinimizedAX removeObjectForKey:@"minimized"];
+        NSDictionary *missingMinimized = YMWorkspaceNormalizeWindowSnapshot(
+            @[cg], @[missingMinimizedAX], YES, displays);
+        Check([missingMinimized[@"windows"] count] == 0, @"missing minimized state cannot become movable");
+        Check([missingMinimized[@"blockers"] count] > 0 || ![missingMinimized[@"complete"] boolValue],
+            @"missing minimized state fails closed");
+        Check(!YMWorkspaceSnapshotAllowsSource(missingMinimized, @5), @"missing minimized state refuses sources");
+        NSMutableDictionary *missingOrdinaryAX = [@{@"identity": identity, @"frame": Frame(15, 982, 37, 102),
+            @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES} mutableCopy];
+        NSDictionary *missingOrdinary = YMWorkspaceNormalizeWindowSnapshot(
+            @[cg], @[missingOrdinaryAX], YES, displays);
+        Check([missingOrdinary[@"windows"] count] == 0, @"missing ordinary state cannot become movable");
+        Check([missingOrdinary[@"blockers"] count] > 0,
+            @"missing ordinary on small window must not silently drop as confirmed aux");
+        Check(!YMWorkspaceSnapshotAllowsSource(missingOrdinary, @5), @"missing ordinary state refuses sources");
+        NSDictionary *badMinimizedAX = @{@"identity": identity, @"frame": Frame(830, 719, 230, 408),
+            @"ordinary": @YES, @"minimized": @"no", @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *badMinimized = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[badMinimizedAX], YES, displays);
+        Check([badMinimized[@"windows"] count] == 0, @"non-boolean minimized cannot become movable");
+        Check(!YMWorkspaceSnapshotAllowsSource(badMinimized, @5), @"non-boolean minimized refuses sources");
+
+        NSMutableDictionary *partialIdentity = [identity mutableCopy];
+        [partialIdentity removeObjectForKey:@"startSeconds"];
+        NSDictionary *partialAX = @{@"identity": partialIdentity, @"frame": Frame(830, 719, 230, 408),
+            @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *dupPartialAX = YMWorkspaceNormalizeWindowSnapshot(@[cg], @[ax, partialAX], YES, displays);
+        Check([dupPartialAX[@"windows"] count] == 0, @"partial-identity AX duplicate cannot uniquely authorize");
+        Check([dupPartialAX[@"blockers"] count] > 0, @"recognizable pid/windowID AX duplicate becomes blocker");
+        Check(!YMWorkspaceSnapshotAllowsSource(dupPartialAX, @5),
+            @"valid-plus-incomplete AX duplicate refuses sources");
+
         if (failures) { fprintf(stderr, "%lu of %lu checks failed.\n", (unsigned long)failures, (unsigned long)checks); return 1; }
         printf("Passed %lu App workspace policy checks; no displays, applications or GUI were accessed.\n", (unsigned long)checks);
         return 0;
