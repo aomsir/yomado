@@ -3,6 +3,7 @@
 #import <stdlib.h>
 
 #import "DisplayProfileEditor.m"
+#import "SavedDisplayProfilesView.m"
 
 @interface YMMarkedTextFixture : NSTextView
 @property(nonatomic) BOOL fixtureMarked;
@@ -238,6 +239,113 @@ static void EditorPixelNote(void) {
     assertNote(2560, YES, 1440, 2);
 }
 
+static YMSavedDisplayProfileRow *Row(NSUInteger ordinal, NSString *name, BOOL canStart) {
+    return [[YMSavedDisplayProfileRow alloc] initWithOrdinal:ordinal name:name
+        detail:@"1920 × 1080" message:@"" starting:NO canStart:canStart canEdit:canStart];
+}
+
+static void SavedRowsUseIdentity(void) {
+    YMSavedDisplayProfilesView *view = [[YMSavedDisplayProfilesView alloc] initWithFrame:NSMakeRect(0, 0, 700, 220)];
+    __block NSUInteger chosen = 0;
+    view.onStart = ^(NSUInteger ordinal) { chosen = ordinal; };
+    [view updateRows:@[Row(1, @"same", YES), Row(2, @"same", YES)] revealOrdinal:nil];
+    YMSavedDisplayProfileRowView *first = view.rowsByOrdinal[@1];
+    [view updateRows:@[Row(2, @"same", YES), Row(1, @"same", YES)] revealOrdinal:nil];
+    Check(view.rowsByOrdinal[@1] == first, "unchanged identity retains row view");
+    [view.rowsByOrdinal[@2].startButton performClick:nil];
+    Check(chosen == 2, "same names and reorder do not change target");
+    [view updateRows:@[Row(2, @"same", NO)] revealOrdinal:nil];
+    Check(!view.rowsByOrdinal[@2].startButton.enabled, "disabled state is represented");
+    [view updateRows:@[] revealOrdinal:nil];
+    Check(view.hidden, "zero saved rows hides complete section");
+}
+
+static BOOL FramesOverlap(NSRect a, NSRect b) {
+    return NSIntersectsRect(NSInsetRect(a, 0.5, 0.5), NSInsetRect(b, 0.5, 0.5));
+}
+
+static void AssertRowLayout(YMSavedDisplayProfilesView *view, const char *scenario) {
+    Check(!view.hasAmbiguousLayout, scenario);
+    for (YMSavedDisplayProfileRowView *row in view.rowsByOrdinal.allValues) {
+        Check(!row.hasAmbiguousLayout, scenario);
+        NSRect nameInRow = [row.nameLabel convertRect:row.nameLabel.bounds toView:row];
+        NSRect startInRow = [row.startButton convertRect:row.startButton.bounds toView:row];
+        NSRect editInRow = [row.editButton convertRect:row.editButton.bounds toView:row];
+        Check(NSContainsRect(row.bounds, startInRow), "start button stays inside row");
+        Check(NSContainsRect(row.bounds, editInRow), "edit button stays inside row");
+        Check(!FramesOverlap(nameInRow, startInRow), "name does not overlap start");
+        Check(!FramesOverlap(nameInRow, editInRow), "name does not overlap edit");
+        Check(!FramesOverlap(editInRow, startInRow), "edit does not overlap start");
+    }
+}
+
+static void SavedRowsCollapseScrollAndLayout(void) {
+    NSMutableArray<YMSavedDisplayProfileRow *> *rows = [NSMutableArray array];
+    NSString *longName = [@"N" stringByPaddingToLength:60 withString:@"x" startingAtIndex:0];
+    for (NSUInteger index = 1; index <= 30; index++) {
+        NSString *name = (index == 15) ? longName : [NSString stringWithFormat:@"Profile %lu", (unsigned long)index];
+        NSString *message = (index == 30) ? @"启动失败，可稍后重试。" : @"";
+        [rows addObject:[[YMSavedDisplayProfileRow alloc] initWithOrdinal:index name:name
+            detail:@"1920 × 1080" message:message starting:NO canStart:YES canEdit:YES]];
+    }
+
+    NSWindow *window = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, 1000, 400)
+                  styleMask:NSWindowStyleMaskBorderless
+                    backing:NSBackingStoreBuffered
+                      defer:YES];
+    YMSavedDisplayProfilesView *view = [[YMSavedDisplayProfilesView alloc] initWithFrame:NSZeroRect];
+    view.translatesAutoresizingMaskIntoConstraints = NO;
+    [window.contentView addSubview:view];
+    [NSLayoutConstraint activateConstraints:@[
+        [view.leadingAnchor constraintEqualToAnchor:window.contentView.leadingAnchor constant:20],
+        [view.trailingAnchor constraintEqualToAnchor:window.contentView.trailingAnchor constant:-20],
+        [view.topAnchor constraintEqualToAnchor:window.contentView.topAnchor constant:20],
+        [view.heightAnchor constraintGreaterThanOrEqualToConstant:220]
+    ]];
+    [view updateRows:rows revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+
+    YMSavedDisplayProfileRowView *mid = view.rowsByOrdinal[@15];
+    Check(mid != nil, "middle row exists before scroll fixture");
+    NSRect midRect = [mid convertRect:mid.bounds toView:view.scrollView.documentView];
+    [view.scrollView.documentView scrollRectToVisible:midRect];
+    [window.contentView layoutSubtreeIfNeeded];
+    NSPoint before = view.scrollView.contentView.bounds.origin;
+    Check(!NSEqualPoints(before, NSZeroPoint), "fixture records a non-zero scroll origin");
+
+    [view toggleCollapsed:nil];
+    for (NSUInteger pass = 0; pass < 40; pass++) [view updateRows:rows revealOrdinal:nil];
+    Check(view.collapsed, "periodic refresh preserves collapse");
+
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    [view.scrollView.contentView scrollToPoint:before];
+    [view.scrollView reflectScrolledClipView:view.scrollView.contentView];
+    for (NSUInteger pass = 0; pass < 40; pass++) [view updateRows:rows revealOrdinal:nil];
+    Check(NSEqualPoints(before, view.scrollView.contentView.bounds.origin), "periodic refresh preserves scroll");
+
+    [view toggleCollapsed:nil];
+    [view updateRows:rows revealOrdinal:@30];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(!view.collapsed, "explicit failure reveals collapsed section");
+    NSRect target = [view.rowsByOrdinal[@30] convertRect:view.rowsByOrdinal[@30].bounds
+                                                  toView:view.scrollView.documentView];
+    Check(NSIntersectsRect(target, view.scrollView.documentVisibleRect), "failed item is visible");
+
+    for (NSString *appearanceName in @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]) {
+        window.appearance = [NSAppearance appearanceNamed:appearanceName];
+        for (NSNumber *widthNumber in @[@760, @1000]) {
+            CGFloat width = widthNumber.doubleValue;
+            [window setFrame:NSMakeRect(0, 0, width, 400) display:NO];
+            [window.contentView layoutSubtreeIfNeeded];
+            char scenario[96];
+            snprintf(scenario, sizeof(scenario), "layout %.0fpt %s", width, appearanceName.UTF8String);
+            AssertRowLayout(view, scenario);
+        }
+    }
+}
+
 int main(void) {
     @autoreleasepool {
         // Hidden AppKit fixture: ActivationPolicyProhibited, never orderFront/activate.
@@ -256,6 +364,10 @@ int main(void) {
         printf("PASS editor commands and marked text\n");
         EditorPixelNote();
         printf("PASS editor pixel note\n");
+        SavedRowsUseIdentity();
+        printf("PASS saved rows use identity\n");
+        SavedRowsCollapseScrollAndLayout();
+        printf("PASS saved rows collapse scroll and layout\n");
         return 0;
     }
 }
