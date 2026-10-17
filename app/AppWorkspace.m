@@ -2,6 +2,7 @@
 #import "AppWorkspaceAccess.h"
 #import "AppWorkspacePolicy.h"
 #import <CoreGraphics/CoreGraphics.h>
+#import <math.h>
 
 NSString * const YMAppWorkspaceErrorDomain = @"dev.chekusu.yomado.app-workspace";
 
@@ -49,6 +50,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 @property(nonatomic) BOOL inventoryObservedTrusted;
 @property(nonatomic) BOOL inventoryHasObservedCG;
 @property(nonatomic, copy) NSString *inventoryObservedCGSignature;
+@property(nonatomic, copy) NSSet<NSString *> *inventoryConfirmedExcludedKeys;
 @end
 
 @implementation YMAppWorkspace
@@ -92,6 +94,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     self.inventoryValid = NO;
     self.inventoryPublishedKey = nil;
     self.inventoryPublishedAt = 0;
+    self.inventoryConfirmedExcludedKeys = nil;
     self.inventoryLatestKey = [self inventoryRequestKeyForCG:self.inventoryCachedCG
                                                     trusted:self.accessibilityTrusted];
     self.inventoryLatestGeneration = self.inventoryGeneration;
@@ -170,10 +173,23 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }];
     for (NSDictionary *cg in sorted) {
         NSDictionary *frame = YMWorkspaceGeometry(cg[@"frame"]);
+        // Preserve presence/validity: missing or non-number fields must not encode
+        // as legal defaults (layer=0 / onScreen=NO / alpha=0), or TTL reuse can
+        // treat unclassifiable CG as a prior ready observation.
+        NSString *fx = frame ? [NSString stringWithFormat:@"%@", frame[@"x"]] : @"?";
+        NSString *fy = frame ? [NSString stringWithFormat:@"%@", frame[@"y"]] : @"?";
+        NSString *fw = frame ? [NSString stringWithFormat:@"%@", frame[@"width"]] : @"?";
+        NSString *fh = frame ? [NSString stringWithFormat:@"%@", frame[@"height"]] : @"?";
+        NSString *layer = [cg[@"layer"] isKindOfClass:NSNumber.class]
+            ? [NSString stringWithFormat:@"%@", cg[@"layer"]] : @"?";
+        NSString *onScreen = [cg[@"onScreen"] isKindOfClass:NSNumber.class]
+            ? [NSString stringWithFormat:@"%@", cg[@"onScreen"]] : @"?";
+        NSString *alpha = [cg[@"alpha"] isKindOfClass:NSNumber.class] &&
+            isfinite([cg[@"alpha"] doubleValue])
+            ? [NSString stringWithFormat:@"%@", cg[@"alpha"]] : @"?";
         [parts addObject:[NSString stringWithFormat:@"%@:%@:%@:%@:%@:%@:%@:%@:%@",
-            cg[@"pid"], cg[@"windowID"],
-            frame[@"x"] ?: @0, frame[@"y"] ?: @0, frame[@"width"] ?: @0, frame[@"height"] ?: @0,
-            cg[@"layer"] ?: @0, cg[@"onScreen"] ?: @NO, cg[@"alpha"] ?: @0]];
+            cg[@"pid"] ?: @"?", cg[@"windowID"] ?: @"?",
+            fx, fy, fw, fh, layer, onScreen, alpha]];
     }
     return [parts componentsJoinedByString:@"|"];
 }
@@ -203,8 +219,18 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     BOOL wasReady = self.inventoryReady;
     self.inventoryReady = NO;
     self.inventoryValid = NO;
+    self.inventoryConfirmedExcludedKeys = nil;
     if (status.length) self.statusText = status;
     if (wasReady) [self notifyInventoryDidChange];
+}
+- (void)invalidateInventoryReuseForCGFailure {
+    // CG read failure is irreversible for in-flight/published reuse: advance
+    // generation and drop the published key so a later equal observation cannot
+    // revive a job collected before the failure.
+    self.inventoryGeneration += 1;
+    self.inventoryPublishedKey = nil;
+    self.inventoryPublishedAt = 0;
+    self.inventoryConfirmedExcludedKeys = nil;
 }
 - (NSArray<NSDictionary *> *)admittedCGCandidates:(NSArray<NSDictionary *> *)cgWindows
                                        truncated:(BOOL *)truncated {
@@ -274,6 +300,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         YMAppWorkspace *strongSelf = weakSelf;
         if (!strongSelf) return;
         NSMutableArray *axRecords = [NSMutableArray array];
+        NSMutableDictionary *observedApps = [NSMutableDictionary dictionary];
         BOOL complete = YES;
         NSString *reason = @"";
         NSArray *normalizeCG = cgSnapshot;
@@ -301,6 +328,9 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
                     if (!reason.length) reason = @"missingApplication";
                     continue;
                 }
+                // Bind the concrete process object observed for this job. Publish
+                // must refuse if that process exits or a same-PID replacement appears.
+                observedApps[pidValue] = app;
                 NSDictionary *observation = [strongSelf.windowAccess observeApplication:app deadline:deadline];
                 if (![observation[@"complete"] boolValue]) {
                     complete = NO;
@@ -315,6 +345,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         NSDictionary *snapshot = trusted
             ? YMWorkspaceNormalizeWindowSnapshot(normalizeCG, axRecords, complete, displays)
             : nil;
+        NSDictionary *observedAppsCopy = [observedApps copy];
         [strongSelf publishInventoryRead:^{
             YMAppWorkspace *publisher = weakSelf;
             if (!publisher) return;
@@ -323,7 +354,8 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
             [publisher finishInventoryJobKey:jobKey generation:jobGeneration
                                   cgSnapshot:cgSnapshot trusted:trusted
                                     complete:complete reason:reason
-                                   snapshot:snapshot axRecords:axRecords];
+                                   snapshot:snapshot axRecords:axRecords
+                               observedApps:observedAppsCopy];
         }];
     }];
 }
@@ -347,12 +379,30 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
     return windows;
 }
-- (NSArray<NSDictionary *> *)assembledWindowsFromSnapshot:(NSDictionary *)snapshot {
+- (BOOL)observedAppsStillCurrent:(NSDictionary *)observedApps {
+    if (![observedApps isKindOfClass:NSDictionary.class]) return NO;
+    for (NSNumber *pidValue in observedApps) {
+        NSRunningApplication *observed = observedApps[pidValue];
+        if (![observed isKindOfClass:NSRunningApplication.class] &&
+            ![observed respondsToSelector:@selector(isTerminated)]) return NO;
+        if (observed.terminated) return NO;
+        NSRunningApplication *live = [self.windowAccess applicationForPID:pidValue.intValue];
+        // Same-PID replacement must not reuse AX collected against the prior process.
+        if (live != observed) return NO;
+        if (!live.bundleIdentifier.length || !live.bundleURL) return NO;
+    }
+    return YES;
+}
+- (NSArray<NSDictionary *> *)assembledWindowsFromSnapshot:(NSDictionary *)snapshot
+                                             observedApps:(NSDictionary *)observedApps {
     NSMutableArray *windows = [NSMutableArray array];
     for (NSDictionary *entry in snapshot[@"windows"]) {
         pid_t pid = [entry[@"pid"] intValue];
-        NSRunningApplication *app = [self.windowAccess applicationForPID:pid];
+        NSRunningApplication *observed = observedApps[@(pid)];
+        NSRunningApplication *app = observed ?: [self.windowAccess applicationForPID:pid];
         if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) continue;
+        if (observed && (observed.terminated || [self.windowAccess applicationForPID:pid] != observed))
+            continue;
         NSMutableDictionary *window = [entry mutableCopy];
         window[@"bundleIdentifier"] = app.bundleIdentifier;
         window[@"appName"] = app.localizedName ?: app.bundleIdentifier;
@@ -367,13 +417,18 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     BOOL truncated = NO;
     NSArray *admitted = [self admittedCGCandidates:cgWindows truncated:&truncated];
     if (truncated) return YES;
-    // Any visible CG candidate that did not become a published window remains unknown.
+    // Any visible CG candidate that did not become a published window remains unknown,
+    // unless the normalizer retained exact confirmed-exclusion evidence for it.
     NSMutableSet *published = [NSMutableSet set];
     for (NSDictionary *window in snapshot[@"windows"])
         [published addObject:YMWorkspaceWindowKey(window[@"pid"], window[@"windowID"])];
+    NSSet *excluded = [NSSet setWithArray:[snapshot[@"excluded"] isKindOfClass:NSArray.class]
+        ? snapshot[@"excluded"] : @[]];
     for (NSDictionary *cg in admitted) {
-        if (![published containsObject:YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"])])
-            return YES;
+        NSString *key = YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"]);
+        if ([published containsObject:key]) continue;
+        if ([excluded containsObject:key]) continue;
+        return YES;
     }
     return NO;
 }
@@ -400,7 +455,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
 }
 - (void)publishWindows:(NSArray<NSDictionary *> *)windows ready:(BOOL)ready key:(NSString *)key
-            generation:(NSUInteger)generation {
+            generation:(NSUInteger)generation excludedKeys:(NSSet<NSString *> *)excludedKeys {
     NSArray *previousRows = self.rows;
     BOOL previousReady = self.inventoryReady;
     [self retirePlacementsAgainstWindows:windows];
@@ -418,18 +473,21 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
     self.inventoryReady = ready;
     self.inventoryValid = ready;
+    self.inventoryConfirmedExcludedKeys = ready ? [excludedKeys copy] : nil;
     BOOL rowsChanged = ![previousRows isEqual:self.rows];
     if (rowsChanged || previousReady != self.inventoryReady) [self notifyInventoryDidChange];
 }
 - (void)finishInventoryJobKey:(NSString *)jobKey generation:(NSUInteger)jobGeneration
                    cgSnapshot:(NSArray *)cgSnapshot trusted:(BOOL)trusted
                      complete:(BOOL)complete reason:(NSString *)reason
-                    snapshot:(NSDictionary *)snapshot axRecords:(NSArray *)axRecords {
+                     snapshot:(NSDictionary *)snapshot axRecords:(NSArray *)axRecords
+                 observedApps:(NSDictionary *)observedApps {
     (void)axRecords;
     if (self.operationInProgress) {
         // Write still settling: keep latest request but do not publish/retire.
         self.inventoryReady = NO;
         self.inventoryValid = NO;
+        self.inventoryConfirmedExcludedKeys = nil;
         self.inventoryLatestKey = [self inventoryRequestKeyForCG:self.inventoryCachedCG
                                                         trusted:self.accessibilityTrusted];
         self.inventoryLatestGeneration = self.inventoryGeneration;
@@ -437,6 +495,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
     NSArray *liveCG = [self.windowAccess visibleWindows];
     if (!liveCG) {
+        [self invalidateInventoryReuseForCGFailure];
         [self markInventoryNotReady:@"暂时无法读取窗口清单；保留显示器，稍后刷新。"];
         [self drainLatestInventoryRequest];
         return;
@@ -457,6 +516,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         // retire, or busy-reschedule — wait for refreshWithVirtualDisplayIDs.
         self.inventoryReady = NO;
         self.inventoryValid = NO;
+        self.inventoryConfirmedExcludedKeys = nil;
         self.inventoryLatestKey = nil;
         return;
     }
@@ -467,6 +527,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         self.inventoryLatestGeneration = self.inventoryGeneration;
         self.inventoryReady = NO;
         self.inventoryValid = NO;
+        self.inventoryConfirmedExcludedKeys = nil;
         [self drainLatestInventoryRequest];
         return;
     }
@@ -477,8 +538,25 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         // missing fields, and over-cap tails must not prove an owned virtual empty.
         BOOL unresolved = [self cgHasUnclassifiableEvidence:liveCG] ||
             [self snapshotHasUnresolvedEvidence:
-                @{@"windows": windows, @"blockers": @[], @"complete": @YES} cg:liveCG];
-        [self publishWindows:windows ready:!unresolved key:liveKey generation:jobGeneration];
+                @{@"windows": windows, @"blockers": @[], @"excluded": @[], @"complete": @YES}
+                                                   cg:liveCG];
+        [self publishWindows:windows ready:!unresolved key:liveKey generation:jobGeneration
+                excludedKeys:nil];
+        [self drainLatestInventoryRequest];
+        return;
+    }
+    NSSet *excludedKeys = [NSSet setWithArray:[snapshot[@"excluded"] isKindOfClass:NSArray.class]
+        ? snapshot[@"excluded"] : @[]];
+    // Observed process must still be the same object; same-PID relaunch discards.
+    if (observedApps.count && ![self observedAppsStillCurrent:observedApps]) {
+        self.inventoryPublishedKey = liveKey;
+        self.inventoryPublishedGeneration = jobGeneration;
+        self.inventoryPublishedAt = [self inventoryTime];
+        self.inventoryReady = NO;
+        self.inventoryValid = NO;
+        self.inventoryConfirmedExcludedKeys = nil;
+        self.statusText = @"暂时无法完整核对窗口清单；保留显示器，稍后刷新。";
+        [self notifyInventoryDidChange];
         [self drainLatestInventoryRequest];
         return;
     }
@@ -487,20 +565,24 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     if (!complete || !snapshot || ![snapshot[@"complete"] boolValue] ||
         [self cgHasUnclassifiableEvidence:liveCG] ||
         [self snapshotHasUnresolvedEvidence:snapshot cg:liveCG]) {
-        NSArray *partial = snapshot ? [self assembledWindowsFromSnapshot:snapshot] : self.windows;
+        NSArray *partial = snapshot
+            ? [self assembledWindowsFromSnapshot:snapshot observedApps:observedApps]
+            : self.windows;
         // Keep prior display rows when partial; never claim ready/empty.
         // Bound incomplete results to liveKey so same-key refresh reuses TTL.
         NSString *previousStatus = self.statusText;
         BOOL previousReady = self.inventoryReady;
         NSArray *previousRows = self.rows;
         if (snapshot && [snapshot[@"windows"] count])
-            [self publishWindows:partial ready:NO key:liveKey generation:jobGeneration];
+            [self publishWindows:partial ready:NO key:liveKey generation:jobGeneration
+                    excludedKeys:nil];
         else {
             self.inventoryPublishedKey = liveKey;
             self.inventoryPublishedGeneration = jobGeneration;
             self.inventoryPublishedAt = [self inventoryTime];
             self.inventoryReady = NO;
             self.inventoryValid = NO;
+            self.inventoryConfirmedExcludedKeys = nil;
             if ([reason isEqual:@"timeout"])
                 self.statusText = @"窗口清单核对超时；保留显示器，稍后刷新。";
             else
@@ -513,8 +595,9 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         [self drainLatestInventoryRequest];
         return;
     }
-    NSArray *windows = [self assembledWindowsFromSnapshot:snapshot];
-    [self publishWindows:windows ready:YES key:liveKey generation:jobGeneration];
+    NSArray *windows = [self assembledWindowsFromSnapshot:snapshot observedApps:observedApps];
+    [self publishWindows:windows ready:YES key:liveKey generation:jobGeneration
+            excludedKeys:excludedKeys];
     [self drainLatestInventoryRequest];
 }
 - (void)drainLatestInventoryRequest {
@@ -525,6 +608,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
     NSArray *cg = [self.windowAccess visibleWindows];
     if (!cg) {
+        [self invalidateInventoryReuseForCGFailure];
         [self markInventoryNotReady:@"暂时无法读取窗口清单；保留显示器，稍后刷新。"];
         return;
     }
@@ -548,10 +632,12 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     self.inventoryObservedCGSignature = cgSignature;
     NSString *key = [self inventoryRequestKeyForCG:cg trusted:trusted];
     // Reuse same-key observation within TTL (ready or incomplete). Incomplete
-    // never sets inventoryReady, so close/export stay blocked.
+    // never sets inventoryReady, so close/export stay blocked. Unclassifiable
+    // CG must never reuse a prior ready observation even if the key matched.
     if ([key isEqual:self.inventoryPublishedKey] &&
         self.inventoryPublishedGeneration == self.inventoryGeneration &&
-        [self inventoryCacheFresh]) {
+        [self inventoryCacheFresh] &&
+        ![self cgHasUnclassifiableEvidence:cg]) {
         return;
     }
     // Pending until a matching generation publishes.
@@ -600,12 +686,19 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     if (!self.inventoryReady || ![self inventoryCacheFresh]) return YES;
     if ([self rowsForDisplayID:ID].count) return YES;
     for (YMWPlacement *placement in self.placements) if (placement.lastDisplayID == ID) return YES;
-    // Unknown/partial CG evidence that might belong to this display blocks close.
-    for (NSDictionary *cg in self.inventoryCachedCG) {
-        if (!YMWorkspaceCGCandidateVisible(cg)) continue;
+    // Close uses the same admission/exclusion evidence as inventory ready.
+    // Non-admitted system surfaces and confirmed exclusions must not block empty close.
+    if ([self cgHasUnclassifiableEvidence:self.inventoryCachedCG]) return YES;
+    BOOL truncated = NO;
+    NSArray *admitted = [self admittedCGCandidates:self.inventoryCachedCG truncated:&truncated];
+    if (truncated) return YES;
+    NSSet *excluded = self.inventoryConfirmedExcludedKeys ?: [NSSet set];
+    for (NSDictionary *cg in admitted) {
         NSDictionary *frame = YMWorkspaceGeometry(cg[@"frame"]);
         NSDictionary *display = frame ? YMWorkspaceDisplayForFrame(frame, self.displays) : nil;
         if ([display[@"displayID"] unsignedIntValue] != ID) continue;
+        NSString *key = YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"]);
+        if ([excluded containsObject:key]) continue;
         BOOL published = NO;
         for (NSDictionary *window in self.windows) {
             if ([window[@"pid"] isEqual:cg[@"pid"]] && [window[@"windowID"] isEqual:cg[@"windowID"]]) {
@@ -784,7 +877,12 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         fabs([before[@"height"] doubleValue] - size.height) > 1) {
         (void)[self.windowAccess setSize:size element:element expectedIdentity:identity];
         live = [self.windowAccess observeElement:element];
-        if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], identity)) return NO;
+        // Re-validate full movable state after resize — minimized/non-ordinary/
+        // unsettable windows must not continue into position writes.
+        if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], identity) ||
+            ![live[@"ordinary"] boolValue] || [live[@"minimized"] boolValue] ||
+            ![live[@"positionSettable"] boolValue] || !YMWorkspaceGeometry(live[@"frame"]))
+            return NO;
     }
     if (![self displayStillCurrent:display]) return NO;
     CGPoint point = CGPointMake([frame[@"x"] doubleValue], [frame[@"y"] doubleValue]);
@@ -795,7 +893,9 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         if (![self displayStillCurrent:display]) return NO;
         live = [self.windowAccess observeElement:element];
         if (!live || !YMWorkspaceSameWindowIdentity(live[@"identity"], identity) ||
-            !YMWorkspaceGeometry(live[@"frame"])) return NO;
+            ![live[@"ordinary"] boolValue] || [live[@"minimized"] boolValue] ||
+            ![live[@"positionSettable"] boolValue] || !YMWorkspaceGeometry(live[@"frame"]))
+            return NO;
         if (YMWorkspaceFrameFits(live[@"frame"], display)) return YES;
         if (observation < 3)
             [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode
@@ -841,14 +941,18 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
                 ![live[@"positionSettable"] boolValue])
                 return [self fail:error code:11 text:@"窗口身份或位置已变化，已停止后续移动；可以返回已移动的窗口。"];
             NSDictionary *liveDisplay = YMWorkspaceDisplayForFrame(live[@"frame"], self.displays);
-            if (!liveDisplay ||
+            NSDictionary *source = [self display:[candidate[@"displayID"] unsignedIntValue]];
+            // Source topology must still match before saving origin or writing.
+            // Target-only checks leave relative origins wrong when the physical
+            // source drifts while the cached snapshot stays stale.
+            if (!liveDisplay || !source ||
                 [liveDisplay[@"displayID"] unsignedIntValue] != [candidate[@"displayID"] unsignedIntValue] ||
                 !YMWorkspaceMatchesSource(@{@"displayID": liveDisplay[@"displayID"],
                     @"isVirtual": liveDisplay[@"isVirtual"]}, filter) ||
+                ![self displayStillCurrent:source] ||
                 ![self displayStillCurrent:target])
                 return [self fail:error code:11 text:@"窗口身份或位置已变化，已停止后续移动；可以返回已移动的窗口。"];
             NSDictionary *before = live[@"frame"];
-            NSDictionary *source = [self display:[candidate[@"displayID"] unsignedIntValue]];
             YMWPlacement *placement = [self placementForElement:element application:app
                                                        windowID:[candidate[@"windowID"] unsignedIntValue]
                                                        identity:expectedIdentity];
@@ -925,10 +1029,15 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
             ![live[@"positionSettable"] boolValue])
             return [self fail:error code:13 text:@"窗口身份或位置已变化，已停止恢复；请刷新后再试。"];
         NSDictionary *origin = placement.origin, *before = live[@"frame"];
+        NSDictionary *source = [self display:[candidate[@"displayID"] unsignedIntValue]];
+        // Restore source (owned virtual) must still match live topology before writes.
+        if (!source || ![self displayStillCurrent:source])
+            return [self fail:error code:13 text:@"窗口身份或位置已变化，已停止恢复；请刷新后再试。"];
         NSDictionary *target = physicalTarget ?: YMWorkspacePhysicalDisplay(origin[@"displayUUID"], self.displays);
         NSDictionary *destination = physicalTarget ? YMWorkspaceFrameForExplicitPhysicalReturn(origin, before, target) :
             YMWorkspaceFrameOnDisplay(origin[@"relative"] ?: before, origin[@"relative"], target);
-        if (!target || !destination) return [self fail:error code:14 text:@"没有可用的实体显示器；保留虚拟屏和窗口记录。"];
+        if (!target || !destination || ![self displayStillCurrent:target])
+            return [self fail:error code:14 text:@"没有可用的实体显示器；保留虚拟屏和窗口记录。"];
         if (![self placeElement:element frame:destination display:target application:app
                expectedIdentity:expectedIdentity])
             return [self fail:error code:15 text:@"尚未确认窗口已返回实体屏；保留虚拟屏和原位置记录。"];

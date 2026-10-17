@@ -550,6 +550,28 @@ static BOOL ProbeWriteReceipt(NSDictionary *receipt, NSString *path, NSString **
     return YES;
 }
 
+// Whitelist failure stages written after args are complete. Overwrites any prior
+// passed:true receipt so reuse paths cannot keep a stale success JSON.
+static int ProbeWriteFailureReceipt(NSString *receiptPath, CGDirectDisplayID targetID,
+                                    NSDictionary *partialIdentity, NSString *stage, int code) {
+    static NSSet *allowed = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        allowed = [NSSet setWithArray:@[@"permission", @"process", @"enumeration", @"resolve"]];
+    });
+    if (![allowed containsObject:stage]) stage = @"resolve";
+    ProbeResult empty = {0};
+    NSString *receiptError = nil;
+    NSDictionary *receipt = ProbeReceipt(empty, partialIdentity, nil, targetID, stage);
+    if (!ProbeWriteReceipt(receipt, receiptPath, &receiptError)) {
+        fprintf(stderr, "receipt error: %s\n", receiptError.UTF8String ?: "unknown");
+        return 7;
+    }
+    fprintf(stderr, "RECEIPT writes=0 restoreAttempts=0 passed=0 destinationVerified=0 originRestored=0 topology=0 activationRequested=0 failure=%s\n",
+            stage.UTF8String);
+    return code;
+}
+
 static int ProbeRunNative(NSString *mode, pid_t pid, CGWindowID windowID, CGDirectDisplayID targetID,
                           NSString *receiptPath) {
     if (pid <= 0 || windowID == 0 || targetID == 0) {
@@ -558,18 +580,21 @@ static int ProbeRunNative(NSString *mode, pid_t pid, CGWindowID windowID, CGDire
     }
     if (!AXIsProcessTrusted()) {
         fprintf(stderr, "Accessibility permission unavailable\n");
-        return 3;
+        return ProbeWriteFailureReceipt(receiptPath, targetID, nil, @"permission", 3);
     }
     NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
     if (!app || app.terminated || ![app.bundleIdentifier isEqualToString:@"com.apple.calculator"]) {
         fprintf(stderr, "target process is not a live Calculator instance\n");
-        return 4;
+        return ProbeWriteFailureReceipt(receiptPath, targetID,
+            @{@"pid": @(pid), @"windowID": @(windowID)}, @"process", 4);
     }
     // Resolve requires the full identity; seed with process fields via a temporary AX walk.
     AXUIElementRef appElement = AXUIElementCreateApplication(pid);
     if (!appElement) {
         fprintf(stderr, "cannot create application AX element\n");
-        return 5;
+        return ProbeWriteFailureReceipt(receiptPath, targetID,
+            @{@"pid": @(pid), @"windowID": @(windowID),
+              @"bundleID": app.bundleIdentifier ?: @""}, @"enumeration", 5);
     }
     CFTypeRef windowsValue = NULL;
     AXError windowsError = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute, &windowsValue);
@@ -577,7 +602,9 @@ static int ProbeRunNative(NSString *mode, pid_t pid, CGWindowID windowID, CGDire
     if (windowsError != kAXErrorSuccess || !windowsValue || CFGetTypeID(windowsValue) != CFArrayGetTypeID()) {
         if (windowsValue) CFRelease(windowsValue);
         fprintf(stderr, "cannot enumerate Calculator windows\n");
-        return 5;
+        return ProbeWriteFailureReceipt(receiptPath, targetID,
+            @{@"pid": @(pid), @"windowID": @(windowID),
+              @"bundleID": app.bundleIdentifier ?: @""}, @"enumeration", 5);
     }
     NSArray *windows = CFBridgingRelease(windowsValue);
     id match = nil;
@@ -588,7 +615,7 @@ static int ProbeRunNative(NSString *mode, pid_t pid, CGWindowID windowID, CGDire
         if ([candidate[@"windowID"] unsignedIntValue] != windowID) continue;
         if (match) {
             fprintf(stderr, "window identity is ambiguous\n");
-            return 6;
+            return ProbeWriteFailureReceipt(receiptPath, targetID, candidate, @"resolve", 6);
         }
         match = window;
         identity = candidate;
@@ -596,13 +623,15 @@ static int ProbeRunNative(NSString *mode, pid_t pid, CGWindowID windowID, CGDire
     if (!match || !identity || [identity[@"pid"] intValue] != pid ||
         ![identity[@"bundleID"] isEqualToString:@"com.apple.calculator"]) {
         fprintf(stderr, "exact Calculator window identity unavailable\n");
-        return 6;
+        return ProbeWriteFailureReceipt(receiptPath, targetID,
+            @{@"pid": @(pid), @"windowID": @(windowID), @"bundleID": @"com.apple.calculator"},
+            @"resolve", 6);
     }
     NSError *exactError = nil;
     id resolved = YMUpdateResolveWindowIdentity(identity, &exactError);
     if (!resolved) {
         fprintf(stderr, "resolve failed: %s\n", exactError.localizedDescription.UTF8String ?: "unknown");
-        return 6;
+        return ProbeWriteFailureReceipt(receiptPath, targetID, identity, @"resolve", 6);
     }
 
     ProbeNativeBackend *backend = [ProbeNativeBackend new];
@@ -748,6 +777,40 @@ static void RunSelfTests(void) {
               !holdTopologyResult.passed && holdTopology.writeCalls == 1 &&
               holdTopology.holdWaits >= 1 && holdTopology.holdWaits < 20,
           @"topology change during hold ends the dwell and refuses blind restore");
+
+    // Injected failure receipts overwrite a prior passed:true without native AX.
+    NSString *receiptDir = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:[NSString stringWithFormat:@"yomado-probe-receipt-%@",
+                                                                   NSUUID.UUID.UUIDString]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:receiptDir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *receiptPath = [receiptDir stringByAppendingPathComponent:@"receipt.json"];
+    ProbeResult priorPass = {0};
+    priorPass.passed = YES;
+    priorPass.destinationVerified = YES;
+    priorPass.originRestored = YES;
+    priorPass.displayTopologyUnchanged = YES;
+    priorPass.writes = 2;
+    priorPass.restoreAttempts = 1;
+    NSString *receiptError = nil;
+    Check(ProbeWriteReceipt(ProbeReceipt(priorPass, ProbeIdentity(42, 7, @"com.apple.calculator"),
+                                         ProbeFrame(10, 20, 30, 40), 9, @""),
+                            receiptPath, &receiptError),
+          @"seed prior passed receipt");
+    for (NSString *stage in @[@"permission", @"process", @"enumeration", @"resolve"]) {
+        int code = ProbeWriteFailureReceipt(receiptPath, 9,
+            @{@"pid": @42, @"windowID": @7, @"bundleID": @"com.apple.calculator"}, stage, 3);
+        Check(code == 3, @"failure receipt returns stage exit code");
+        NSData *data = [NSData dataWithContentsOfFile:receiptPath];
+        NSDictionary *json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        Check([json isKindOfClass:NSDictionary.class], @"failure receipt is JSON");
+        Check([json[@"passed"] isEqual:@NO], @"failure receipt clears prior passed:true");
+        Check([json[@"failureReason"] isEqual:stage], @"failure receipt records whitelist stage");
+        Check([json[@"writes"] isEqual:@0] && [json[@"restoreAttempts"] isEqual:@0],
+              @"failure receipt records zero writes");
+        Check([json[@"targetDisplayID"] isEqual:@9], @"failure receipt keeps target id");
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:receiptDir error:nil];
 
     fprintf(stderr, "PASS %u self-test checks\n", (unsigned)gChecks);
 }

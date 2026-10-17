@@ -378,6 +378,14 @@ static NSURL *WriteTempFixtureApp(NSString *bundleID) {
 - (BOOL)displayStillCurrent:(NSDictionary *)display;
 - (NSDictionary *)liveDisplayStateForID:(CGDirectDisplayID)ID;
 - (BOOL)displayMatchesLiveTopology:(NSDictionary *)display;
+- (BOOL)placeElement:(id)element frame:(NSDictionary *)frame display:(NSDictionary *)display
+         application:(NSRunningApplication *)app expectedIdentity:(NSDictionary *)identity;
+- (void)finishInventoryJobKey:(NSString *)jobKey generation:(NSUInteger)jobGeneration
+                   cgSnapshot:(NSArray *)cgSnapshot trusted:(BOOL)trusted
+                     complete:(BOOL)complete reason:(NSString *)reason
+                     snapshot:(NSDictionary *)snapshot axRecords:(NSArray *)axRecords
+                 observedApps:(NSDictionary *)observedApps;
+- (void)scheduleInventoryIfNeeded;
 @end
 
 @interface YMWorkspaceFixture : YMAppWorkspace
@@ -1882,6 +1890,250 @@ int main(void) {
                       access.elementFrames[[NSString stringWithFormat:@"%p", elementB]],
                       originB[@"relative"]),
                   @"process B restores its remembered physical origin");
+        }
+
+        // --- Global fix: MUST_FIX #1 missing layer after ready must not TTL-reuse ---
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"#1 baseline ready before layer drop");
+            NSUInteger gen = workspace.inventoryGeneration;
+            NSMutableDictionary *cg = [access.cgWindows[0] mutableCopy];
+            [cg removeObjectForKey:@"layer"];
+            access.cgWindows[0] = cg;
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            Check(!workspace.inventoryReady,
+                  @"#1 dropping layer after ready immediately clears ready");
+            Check(workspace.inventoryGeneration != gen,
+                  @"#1 missing layer advances inventory generation");
+            NSError *restoreError = nil;
+            Check(![workspace restoreDisplayID:8 error:&restoreError],
+                  @"#1 missing layer refuses empty close via restoreDisplayID");
+            Check([workspace needsRestoreForDisplayID:8],
+                  @"#1 missing layer keeps needsRestore");
+        }
+
+        // --- Global fix: MUST_FIX #2 CG nil permanently invalidates prior job ---
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            Check(workspace.pendingReads.count == 1, @"#2 schedules one read");
+            dispatch_block_t read = workspace.pendingReads.firstObject;
+            [workspace.pendingReads removeObjectAtIndex:0];
+            read();
+            Check(workspace.pendingPublishes.count == 1, @"#2 read queues publish");
+            NSUInteger gen = workspace.inventoryGeneration;
+            access.failVisibleWindows = YES;
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            Check(workspace.inventoryGeneration != gen,
+                  @"#2 CG nil advances generation");
+            Check(!workspace.inventoryReady, @"#2 CG nil clears ready");
+            access.failVisibleWindows = NO;
+            dispatch_block_t publish = workspace.pendingPublishes.firstObject;
+            [workspace.pendingPublishes removeObjectAtIndex:0];
+            publish();
+            Check(!workspace.inventoryReady,
+                  @"#2 stale publish after CG failure cannot revive ready");
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady,
+                  @"#2 fresh observation after recovery can become ready");
+        }
+
+        // --- Global fix: MUST_FIX #3 publish binds observed process lifecycle ---
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            dispatch_block_t read = workspace.pendingReads.firstObject;
+            [workspace.pendingReads removeObjectAtIndex:0];
+            read();
+            YMFakeRunningApp *original = access.appsByPID[@42];
+            original.terminated = YES;
+            YMFakeRunningApp *replacement = [access installApp:42 name:@"Replacement"
+                                                       bundle:@"test.calculator"];
+            NSMutableDictionary *ax = [access.axByPID[@42].firstObject mutableCopy];
+            NSMutableDictionary *identity = [ax[@"identity"] mutableCopy];
+            identity[@"startSeconds"] = @1001;
+            ax[@"identity"] = identity;
+            ax[@"frame"] = Frame(2700, 100, 230, 408);
+            access.axByPID[@42] = @[ax];
+            access.elementFrames[[access elementKey:ax[@"element"]]] = ax[@"frame"];
+            access.elementIdentities[[access elementKey:ax[@"element"]]] = identity;
+            (void)replacement;
+            dispatch_block_t publish = workspace.pendingPublishes.firstObject;
+            [workspace.pendingPublishes removeObjectAtIndex:0];
+            publish();
+            Check(!workspace.inventoryReady,
+                  @"#3 replacement process cannot publish ready with stale AX");
+            Check([[workspace rowsForDisplayID:5] count] == 0,
+                  @"#3 replacement must not publish old physical geometry as current");
+        }
+
+        // --- Global fix: MUST_FIX #4/#5 confirmed aux exclusion vs non-admitted ---
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [access installWindowPID:42 windowID:1491
+                             cgFrame:Frame(200, 200, 30, 30)
+                             axFrame:Frame(200, 200, 30, 30)];
+            NSMutableArray *ax = [access.axByPID[@42] mutableCopy];
+            NSMutableDictionary *aux = [ax[1] mutableCopy];
+            aux[@"ordinary"] = @NO;
+            ax[1] = aux;
+            access.axByPID[@42] = ax;
+            NSDictionary *snapshot = YMWorkspaceNormalizeWindowSnapshot(access.cgWindows, ax, YES, displays);
+            Check([snapshot[@"complete"] boolValue] && [snapshot[@"blockers"] count] == 0,
+                  @"#4 normalizer confirms small aux without blockers");
+            Check([snapshot[@"excluded"] count] >= 1,
+                  @"#4 normalizer retains confirmed exclusion evidence");
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady,
+                  @"#4 confirmed aux exclusion must not block inventory ready");
+            Check(![workspace needsRestoreForDisplayID:8],
+                  @"#4 confirmed aux exclusion must not keep needsRestore");
+        }
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            [access.cgWindows addObject:@{@"pid": @999, @"windowID": @77,
+                @"frame": Frame(2800, 200, 120, 90), @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            [workspace drainReads];
+            Check(workspace.inventoryReady, @"#5 non-admitted-only virtual may be ready empty");
+            Check([[workspace rowsForDisplayID:8] count] == 0, @"#5 non-admitted creates no rows");
+            NSError *restoreError = nil;
+            Check([workspace restoreDisplayID:8 error:&restoreError],
+                  @"#5 empty admitted inventory may close");
+            Check(![workspace needsRestoreForDisplayID:8],
+                  @"#5 non-admitted system surface must not keep needsRestore");
+        }
+
+        // --- Global fix: MUST_FIX #6 post-size state revalidation ---
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            access.mutateOnObserveElementCount = 2;
+            access.observeElementMutation = @{@"minimized": @YES};
+            id element = access.axByPID[@42].firstObject[@"element"];
+            BOOL placed = [workspace placeElement:element frame:Frame(2700, 100, 200, 300)
+                                          display:displays[1]
+                                      application:(id)access.appsByPID[@42]
+                                 expectedIdentity:Identity(42, 1490)];
+            Check(!placed, @"#6 minimized after setSize must fail placeElement");
+            Check(access.sizeWrites.count == 1, @"#6 still attempted size when needed");
+            Check(access.positionWrites.count == 0,
+                  @"#6 must not position after post-size minimized");
+        }
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            access.mutateOnObserveElementCount = 2;
+            access.observeElementMutation = @{@"ordinary": @NO};
+            id element = access.axByPID[@42].firstObject[@"element"];
+            BOOL placed = [workspace placeElement:element frame:Frame(2700, 100, 200, 300)
+                                          display:displays[1]
+                                      application:(id)access.appsByPID[@42]
+                                 expectedIdentity:Identity(42, 1490)];
+            Check(!placed, @"#6 non-ordinary after setSize must fail placeElement");
+            Check(access.positionWrites.count == 0,
+                  @"#6 must not position after post-size non-ordinary");
+        }
+        {
+            YMFakeWindowAccess *access = nil;
+            YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            access.mutateOnObserveElementCount = 2;
+            access.observeElementMutation = @{@"positionSettable": @NO};
+            id element = access.axByPID[@42].firstObject[@"element"];
+            BOOL placed = [workspace placeElement:element frame:Frame(2700, 100, 200, 300)
+                                          display:displays[1]
+                                      application:(id)access.appsByPID[@42]
+                                 expectedIdentity:Identity(42, 1490)];
+            Check(!placed, @"#6 unsettable after setSize must fail placeElement");
+            Check(access.positionWrites.count == 0,
+                  @"#6 must not position after post-size unsettable");
+        }
+
+        // --- Global fix: MUST_FIX #7 source topology before origin/write ---
+        {
+            YMFakeWindowAccess *access = nil;
+            NSURL *url = nil;
+            NSDictionary *original = Frame(830, 719, 230, 408);
+            YMWorkspaceFixture *workspace = ManagerFixture(&access, &url,
+                Frame(15, 982, 37, 102), original);
+            [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
+            workspace.liveDisplayStates[@5] = @{
+                @"isActive": @YES, @"isOnline": @YES,
+                @"isInMirrorSet": @NO, @"mirrorsDisplay": @(kCGNullDirectDisplay),
+                @"bounds": Frame(100, 0, 2560, 1440)
+            };
+            NSError *moveError = nil;
+            BOOL moved = [workspace moveApplicationAtURL:url fromDisplayID:5 toDisplayID:8
+                                                   error:&moveError];
+            Check(!moved, @"#7 source bounds drift refuses move");
+            Check(access.positionWrites.count == 0 && access.sizeWrites.count == 0,
+                  @"#7 source drift performs zero position/size writes");
+            Check([[workspace valueForKey:@"placements"] count] == 0,
+                  @"#7 source drift must not save a wrong origin checkpoint");
+            [[NSFileManager defaultManager] removeItemAtURL:[url URLByDeletingLastPathComponent]
+                                                      error:nil];
+        }
+
+        // --- Global fix: MUST_FIX #10 write-period current-generation operation guard ---
+        {
+            YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+            YMFakeRunningApp *app = [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+            NSDictionary *virtualFrame = Frame(2700, 100, 230, 408);
+            id element = @"el-write-guard";
+            NSDictionary *identity = Identity(42, 1490);
+            access.elementFrames[[NSString stringWithFormat:@"%p", element]] = virtualFrame;
+            access.elementIdentities[[NSString stringWithFormat:@"%p", element]] = identity;
+            [access.cgWindows addObject:@{@"pid": @42, @"windowID": @1490,
+                @"frame": virtualFrame, @"layer": @0, @"onScreen": @YES, @"alpha": @1}];
+            access.axByPID[@42] = @[@{@"identity": identity, @"frame": virtualFrame, @"ordinary": @YES,
+                @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES, @"element": element}];
+            YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+            NSDictionary *origin = YMWorkspaceOrigin(Frame(100, 100, 230, 408),
+                                                     RuntimeDisplay(5, 0, NO, @"physical"));
+            [workspace installPlacementElement:element application:app windowID:1490
+                                        origin:origin lastDisplayID:8];
+            [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:displays];
+            Check(workspace.pendingReads.count == 1, @"#10 starts with one pending job");
+            // Finish observation into publish queue, then enter write WITHOUT bumping
+            // generation so the pending publish is still current-generation.
+            dispatch_block_t read = workspace.pendingReads.firstObject;
+            [workspace.pendingReads removeObjectAtIndex:0];
+            read();
+            id placement = [[workspace valueForKey:@"placements"] firstObject];
+            [placement setValue:@9 forKey:@"lastDisplayID"];
+            workspace.operationInProgress = YES;
+            NSUInteger schedulesBefore = workspace.scheduleCount;
+            [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:displays];
+            Check(workspace.scheduleCount == schedulesBefore,
+                  @"#10 write blocks scheduling a new inventory job");
+            Check(workspace.pendingReads.count == 0,
+                  @"#10 write must not enqueue a replacement read");
+            dispatch_block_t publish = workspace.pendingPublishes.firstObject;
+            [workspace.pendingPublishes removeObjectAtIndex:0];
+            publish();
+            Check([[placement valueForKey:@"lastDisplayID"] unsignedIntValue] == 9,
+                  @"#10 current-gen publish during write must not revert ownership");
+            Check(!workspace.inventoryReady,
+                  @"#10 current-gen publish during write must not become ready");
+            Check([[workspace valueForKey:@"placements"] count] == 1,
+                  @"#10 placement survives current-gen publish during write");
+            workspace.operationInProgress = NO;
+            [workspace invalidateInventoryForMutation];
+            [workspace drainReads];
+            Check(workspace.pendingReads.count == 0,
+                  @"#10 bounded reads resume after write ends");
         }
 
         printf("App workspace runtime tests: %lu passed, %lu failed; no GUI or display calls executed.\n",

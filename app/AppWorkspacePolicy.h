@@ -219,7 +219,7 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
     BOOL enumerationComplete, NSArray<NSDictionary *> *displays) {
     if (!enumerationComplete || ![cgWindows isKindOfClass:NSArray.class] ||
         ![axWindows isKindOfClass:NSArray.class] || ![displays isKindOfClass:NSArray.class])
-        return @{@"windows": @[], @"blockers": @[], @"complete": @NO};
+        return @{@"windows": @[], @"blockers": @[], @"excluded": @[], @"complete": @NO};
 
     NSMutableDictionary *cgByKey = [NSMutableDictionary dictionary];
     NSMutableDictionary *axByKey = [NSMutableDictionary dictionary];
@@ -228,6 +228,7 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
     NSMutableSet *crossPIDWindowIDs = [NSMutableSet set];
     NSMutableArray *blockers = [NSMutableArray array];
     NSMutableArray *windows = [NSMutableArray array];
+    NSMutableArray *excluded = [NSMutableArray array];
     BOOL complete = YES;
 
     for (NSDictionary *cg in cgWindows) {
@@ -270,7 +271,7 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
         }
         for (NSNumber *windowID in crossPIDWindowIDs)
             [blockers addObject:YMWorkspaceBlocker(@0, windowID, @"crossPID", nil)];
-        return @{@"windows": @[], @"blockers": blockers, @"complete": @YES};
+        return @{@"windows": @[], @"blockers": blockers, @"excluded": @[], @"complete": @YES};
     }
 
     for (NSString *key in cgByKey) {
@@ -306,6 +307,9 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
             } else if (YMWorkspaceCGMeetsOldSize(axFrame)) {
                 [blockers addObject:YMWorkspaceBlocker(cg[@"pid"], cg[@"windowID"],
                     minimized ? @"minimized" : @"nonOrdinary", display)];
+            } else {
+                // Exact classified exclusion: small non-ordinary/minimized surface.
+                [excluded addObject:YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"])];
             }
             continue;
         }
@@ -313,7 +317,10 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
             [blockers addObject:YMWorkspaceBlocker(cg[@"pid"], cg[@"windowID"], @"invalidFrame", nil)];
             continue;
         }
-        if (!YMWorkspaceCGMeetsOldSize(axFrame)) continue;
+        if (!YMWorkspaceCGMeetsOldSize(axFrame)) {
+            [excluded addObject:YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"])];
+            continue;
+        }
         if (!display) {
             [blockers addObject:YMWorkspaceBlocker(cg[@"pid"], cg[@"windowID"], @"unowned", nil)];
             continue;
@@ -329,7 +336,8 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
         [windows addObject:entry];
     }
 
-    return @{@"windows": windows, @"blockers": blockers, @"complete": @(complete)};
+    return @{@"windows": windows, @"blockers": blockers, @"excluded": excluded,
+             @"complete": @(complete)};
 }
 // Source eligibility for a normalized snapshot; unknown blockers close every source.
 static inline BOOL YMWorkspaceSnapshotAllowsSource(NSDictionary *snapshot,
