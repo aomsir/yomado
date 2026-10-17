@@ -123,6 +123,7 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
     ProbeFixtureTargetEqualsSource,
     ProbeFixtureIdentityChangedAfterWrite,
     ProbeFixtureAmbiguousCGAfterWrite,
+    ProbeFixtureUncertainOutboundWrite,
 };
 
 @interface ProbeFixture : NSObject <ProbeBackend>
@@ -141,6 +142,7 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
 @property(nonatomic) BOOL duplicateCGAfterWrite;
 @property(nonatomic) BOOL keepOffTargetAfterWrite;
 @property(nonatomic) BOOL keepOffOriginAfterRestore;
+@property(nonatomic) BOOL reportFailureAfterOutboundWrite;
 @end
 
 @implementation ProbeFixture
@@ -186,6 +188,9 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
             break;
         case ProbeFixtureAmbiguousCGAfterWrite:
             f.duplicateCGAfterWrite = YES;
+            break;
+        case ProbeFixtureUncertainOutboundWrite:
+            f.reportFailureAfterOutboundWrite = YES;
             break;
         case ProbeFixtureNormal:
             break;
@@ -233,6 +238,7 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
                   @"layer": @0, @"onscreen": @YES, @"alpha": @1.0}
             ];
         }
+        if (self.reportFailureAfterOutboundWrite) return NO;
     }
     return YES;
 }
@@ -280,7 +286,8 @@ static ProbeResult RunProbeWithMode(NSString *mode, id<ProbeBackend> backend) {
     }
 
     CGPoint destinationPoint = CGPointMake([destination[@"x"] doubleValue], [destination[@"y"] doubleValue]);
-    if (![backend writePosition:destinationPoint expectedIdentity:identity]) return result;
+    // BOOL NO may mean pre-check reject or post-issue AX uncertainty; never treat as "unchanged".
+    [backend writePosition:destinationPoint expectedIdentity:identity];
     result.writes++;
 
     result.destinationVerified = ProbeObserve(backend, ^{
@@ -302,8 +309,8 @@ static ProbeResult RunProbeWithMode(NSString *mode, id<ProbeBackend> backend) {
 
     result.restoreAttempts = 1;
     CGPoint originPoint = CGPointMake([originalFrame[@"x"] doubleValue], [originalFrame[@"y"] doubleValue]);
-    if ([backend writePosition:originPoint expectedIdentity:identity]) result.writes++;
-    else return result;
+    [backend writePosition:originPoint expectedIdentity:identity];
+    result.writes++;
 
     result.originRestored = ProbeObserve(backend, ^{
         if (![[backend identity] isEqual:identity]) return NO;
@@ -605,13 +612,21 @@ static void RunSelfTests(void) {
           @"read-only mode never writes a window");
 
     ProbeFixture *changedIdentity = [ProbeFixture fixture:ProbeFixtureChangedIdentity];
-    Check(RunProbeWithMode(@"--move-and-return", changedIdentity).writes == 0,
+    ProbeResult changedIdentityResult = RunProbeWithMode(@"--move-and-return", changedIdentity);
+    Check(changedIdentityResult.writes == 0 && changedIdentity.writeCalls == 0,
           @"identity changed before mutation refuses the probe");
 
     ProbeFixture *failedDestination = [ProbeFixture fixture:ProbeFixtureFailedDestination];
     ProbeResult failedDestinationResult = RunProbeWithMode(@"--move-and-return", failedDestination);
-    Check(failedDestinationResult.restoreAttempts == 1 && failedDestinationResult.writes == 2,
+    Check(failedDestinationResult.restoreAttempts == 1 && failedDestinationResult.writes == 2 &&
+              !failedDestinationResult.destinationVerified && !failedDestinationResult.passed,
           @"failed destination still makes one guarded origin restore attempt");
+
+    ProbeFixture *uncertainWrite = [ProbeFixture fixture:ProbeFixtureUncertainOutboundWrite];
+    ProbeResult uncertainWriteResult = RunProbeWithMode(@"--move-and-return", uncertainWrite);
+    Check(uncertainWriteResult.writes >= 1 && uncertainWriteResult.restoreAttempts == 1 &&
+              uncertainWriteResult.originRestored && uncertainWrite.writeCalls == 2,
+          @"issued write that reports failure still restores once and does not claim zero writes");
 
     ProbeFixture *failedRestore = [ProbeFixture fixture:ProbeFixtureFailedRestore];
     Check(!RunProbeWithMode(@"--move-and-return", failedRestore).passed,
