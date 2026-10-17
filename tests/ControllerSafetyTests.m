@@ -78,6 +78,7 @@
 @property NSUInteger resumedTerminations;
 @property BOOL deferTopologyOperations;
 @property BOOL useRealPanelPresentation;
+@property BOOL useProductionAppRestore;
 @property NSMutableArray<NSDictionary *> *pendingTopologyOperations;
 - (void)runNextTopologyOperation;
 @end
@@ -103,7 +104,11 @@
 - (void)saveDisplayProfiles { self.saves++; }
 - (void)reportTopologyError:(NSError *)error { (void)error; self.reports++; }
 - (void)powerAssertions:(BOOL)on { self.systemAssertion = self.displayAssertion = on && !self.powerFails ? 1 : 0; }
-- (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID { (void)displayID; return YES; }
+- (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID {
+    if (self.useProductionAppRestore) return [super restoreApplicationsForDisplayID:displayID];
+    (void)displayID;
+    return YES;
+}
 - (void)showWindow:(id)sender {
     self.showCalls++;
     if (self.useRealPanelPresentation) [super showWindow:sender];
@@ -211,6 +216,64 @@
     self.adoptedNonemptyOrigins=points.count>0 && [self.events.lastObject isEqual:@"inventory"];
     [self.events addObject:@"adopt"];
     return self.adoptedNonemptyOrigins;
+}
+@end
+
+// Close-gate fixture: inventory readiness and a single restore write.
+@interface YMCloseGateWorkspace : NSObject {
+    BOOL _gateReady;
+}
+@property(nonatomic) BOOL inventoryReady;
+@property(nonatomic) BOOL needsRestoreFlag;
+@property(nonatomic) BOOL restoreResult;
+@property(nonatomic) NSUInteger restoreCalls;
+@property(nonatomic) NSUInteger readyPolls;
+@property(nonatomic) NSUInteger needsRestorePolls;
+@property(nonatomic) NSUInteger refreshesBeforeReady;
+@end
+@implementation YMCloseGateWorkspace
+- (instancetype)init {
+    if ((self = [super init])) { _gateReady = YES; _restoreResult = YES; }
+    return self;
+}
+- (void)refreshWithVirtualDisplayIDs:(NSArray *)ids displaySnapshot:(NSArray *)snapshot {
+    (void)ids; (void)snapshot;
+    if (self.refreshesBeforeReady > 0) {
+        self.refreshesBeforeReady--;
+        _gateReady = self.refreshesBeforeReady == 0;
+    }
+}
+- (BOOL)inventoryReady {
+    self.readyPolls++;
+    return _gateReady;
+}
+- (void)setInventoryReady:(BOOL)inventoryReady {
+    _gateReady = inventoryReady;
+}
+- (BOOL)needsRestoreForDisplayID:(CGDirectDisplayID)displayID {
+    (void)displayID;
+    self.needsRestorePolls++;
+    return self.needsRestoreFlag;
+}
+- (BOOL)restoreDisplayID:(CGDirectDisplayID)displayID error:(NSError **)error {
+    (void)displayID; (void)error;
+    self.restoreCalls++;
+    return self.restoreResult;
+}
+- (BOOL)accessibilityTrusted { return YES; }
+- (NSArray *)rowsForDisplayID:(CGDirectDisplayID)displayID { (void)displayID; return @[]; }
+@end
+
+@interface YMCloseGateController : YMFakeController
+@end
+@implementation YMCloseGateController
+- (void)updateInventory {
+    self.inventoryUpdates++;
+    NSArray *ids = self.virtualDisplay.isCreated ? @[@(self.virtualDisplay.displayID)] : @[];
+    [(id)self.appWorkspace refreshWithVirtualDisplayIDs:ids displaySnapshot:@[]];
+}
+- (void)reportApplicationError:(NSError *)error fallback:(NSString *)fallback {
+    (void)error; (void)fallback; self.reports++;
 }
 @end
 @interface YMControllerLegacyRecovery : NSObject
@@ -516,6 +579,46 @@ int main(void) {
         [completionController restoreUpdateProfileAtIndex:0];
         Expect(completionController.completionError!=nil && [events isEqual:@[@"restore",@"finished"]],
             "backend failure without NSError cannot be announced as a successful recovery");
+
+        // Group 5: ready wait + single restore write; timeout retains virtual display.
+        {
+            YMFakeTopology *closeT = [YMFakeTopology new];
+            YMFakeDisplay *closeD = [YMFakeDisplay new];
+            closeD.live = YES; closeD.fixtureID = 202;
+            YMManagedDisplay *closeP = [YMManagedDisplay new];
+            closeP.width = 800; closeP.height = 600; closeP.display = closeD; closeP.topologyVerified = YES;
+            YMCloseGateController *closeController = [YMCloseGateController new];
+            closeController.displayTopology = (YMDisplayTopology *)closeT;
+            closeController.displayProfiles = [NSMutableArray arrayWithObject:closeP];
+            closeController.selectedProfile = closeP;
+            closeController.virtualDisplay = closeD;
+            closeController.useProductionAppRestore = YES;
+            YMCloseGateWorkspace *gate = [YMCloseGateWorkspace new];
+            gate.inventoryReady = YES;
+            gate.needsRestoreFlag = NO;
+            gate.restoreResult = YES;
+            closeController.appWorkspace = (YMAppWorkspace *)(id)gate;
+            closeController.windowRecovery = (YMWindowRecovery *)(id)[YMControllerLegacyRecovery new];
+            BOOL restored = [closeController restoreApplicationsForDisplayID:202];
+            Expect(restored && gate.restoreCalls == 1,
+                   "ready inventory restores the display exactly once");
+            Expect(gate.needsRestorePolls >= 1,
+                   "convergence polling observes needsRestore without a second write");
+            Expect(closeD.live && closeD.destroys == 0, "successful restore does not destroy the display");
+
+            gate.restoreCalls = 0; gate.readyPolls = 0; gate.needsRestorePolls = 0;
+            gate.inventoryReady = NO;
+            gate.refreshesBeforeReady = 0; // never becomes ready
+            NSDate *started = [NSDate date];
+            restored = [closeController restoreApplicationsForDisplayID:202];
+            NSTimeInterval waited = -[started timeIntervalSinceNow];
+            Expect(!restored && gate.restoreCalls == 0,
+                   "inventory ready timeout never performs restore writes");
+            Expect(waited >= 1.4 && waited < 3.0, "ready wait bounds near 1.5 seconds");
+            Expect(closeD.live && closeD.destroys == 0,
+                   "timeout does not remove the virtual display");
+            Expect(closeController.reports >= 1, "timeout reports and retains the screen");
+        }
 
         Expect(NSApp == nil,"all controller tests leave NSApplication uninitialized");
         printf("Controller boundary tests: %lu passed, %lu failed; no GUI or display calls executed.\n",(unsigned long)(Tests-Failures),(unsigned long)Failures);

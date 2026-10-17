@@ -318,6 +318,12 @@ static NSView *YMSpacer(void) {
     (void)notification;
     [self loadDisplayProfiles];
     self.appWorkspace = [[YMAppWorkspace alloc] init];
+    __weak ADController *weakSelf = self;
+    self.appWorkspace.inventoryDidChange = ^{
+        ADController *controller = weakSelf;
+        if (!controller) return;
+        [controller updateInventory];
+    };
     self.windowRecovery = [[YMWindowRecovery alloc] initWithCheckpointURL:nil];
     self.targets = @[];
     self.systemAssertion = kIOPMNullAssertionID;
@@ -1616,6 +1622,16 @@ static NSView *YMSpacer(void) {
     self.appOperationInProgress = YES;
     @try {
     [self updateInventory];
+    // Wait for a published ready inventory before any restore write. Never
+    // restore/move inside this predicate — only refresh and observe readiness.
+    BOOL inventoryReady = WaitUntil(^BOOL{
+        [self updateInventory];
+        return self.appWorkspace.inventoryReady;
+    }, 1.5);
+    if (!inventoryReady) {
+        [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留这个虚拟屏。请稍后重试关闭。"];
+        return NO;
+    }
     BOOL ownsPendingWeChat = self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay && self.wechatDisplayID == displayID;
     if (ownsPendingWeChat) {
         [self.windowRecovery refreshWithVirtualDisplayID:displayID displaySnapshot:DisplaySnapshot()];

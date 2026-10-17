@@ -1,9 +1,15 @@
 #import "AppWorkspace.h"
+#import "AppWorkspaceAccess.h"
 #import "AppWorkspacePolicy.h"
 #import "UpdateWorkspaceRecovery.h"
 #import <ApplicationServices/ApplicationServices.h>
 
 NSString * const YMAppWorkspaceErrorDomain = @"dev.chekusu.yomado.app-workspace";
+
+static const NSTimeInterval kYMInventoryBudget = 1.0;
+static const NSTimeInterval kYMInventoryCacheTTL = 1.0;
+static const NSUInteger kYMInventoryMaxPIDs = 64;
+static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 
 static AXUIElementRef YMWElement(id value) {
     return value && CFGetTypeID((__bridge CFTypeRef)value) == AXUIElementGetTypeID() ? (__bridge AXUIElementRef)value : NULL;
@@ -49,19 +55,73 @@ static BOOL YMWOrdinaryWindow(id element) {
 @property(nonatomic, copy) NSArray<NSDictionary *> *windows;
 @property(nonatomic, strong) NSMutableArray<YMWPlacement *> *placements;
 @property(nonatomic) BOOL inventoryValid;
+@property(nonatomic, readwrite) BOOL inventoryReady;
+@property(nonatomic) BOOL inventoryReadyPublished;
 @property(nonatomic) BOOL operationInProgress;
+@property(nonatomic, strong) id<YMWorkspaceWindowAccess> windowAccess;
+@property(nonatomic, strong) dispatch_queue_t inventoryQueue;
+@property(nonatomic) NSUInteger inventoryGeneration;
+@property(nonatomic, copy) NSString *inventoryInflightKey;
+@property(nonatomic) NSUInteger inventoryInflightGeneration;
+@property(nonatomic, copy) NSString *inventoryLatestKey;
+@property(nonatomic) NSUInteger inventoryLatestGeneration;
+@property(nonatomic, copy) NSString *inventoryPublishedKey;
+@property(nonatomic) NSUInteger inventoryPublishedGeneration;
+@property(nonatomic) NSTimeInterval inventoryPublishedAt;
+@property(nonatomic, copy) NSArray<NSDictionary *> *inventoryCachedCG;
+@property(nonatomic) BOOL inventoryJobScheduled;
 @end
 
 @implementation YMAppWorkspace
 - (instancetype)init {
+    return [self initWithWindowAccess:[YMSystemWorkspaceWindowAccess new]];
+}
+- (instancetype)initWithWindowAccess:(id<YMWorkspaceWindowAccess>)access {
     self = [super init];
     if (!self) return nil;
+    _windowAccess = access;
     _rows = @[]; _ownedIDs = @[]; _displays = @[]; _windows = @[];
     _placements = [NSMutableArray array];
+    _inventoryCachedCG = @[];
     _statusText = @"拖入已打开的 App，或手动把窗口拖到虚拟屏。原位置只保留到退出 yomado。";
+    _inventoryQueue = dispatch_queue_create("dev.chekusu.yomado.app-workspace.inventory", DISPATCH_QUEUE_SERIAL);
     return self;
 }
-- (BOOL)accessibilityTrusted { return AXIsProcessTrusted(); }
+- (BOOL)accessibilityTrusted { return [self.windowAccess accessibilityTrusted]; }
+- (BOOL)inventoryReady {
+    return self.inventoryReadyPublished && [self inventoryCacheFresh];
+}
+- (void)setInventoryReady:(BOOL)inventoryReady {
+    self.inventoryReadyPublished = inventoryReady;
+}
+- (void)scheduleInventoryRead:(dispatch_block_t)read {
+    dispatch_async(self.inventoryQueue, read);
+}
+- (void)publishInventoryRead:(dispatch_block_t)publish {
+    dispatch_async(dispatch_get_main_queue(), publish);
+}
+- (NSTimeInterval)inventoryTime {
+    return NSProcessInfo.processInfo.systemUptime;
+}
+- (NSArray<NSScreen *> *)workspaceScreens {
+    return NSScreen.screens;
+}
+- (void)invalidateInventoryForMutation {
+    NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
+    self.inventoryGeneration += 1;
+    self.inventoryReady = NO;
+    self.inventoryValid = NO;
+    self.inventoryPublishedKey = nil;
+    self.inventoryPublishedAt = 0;
+    self.inventoryLatestKey = [self inventoryRequestKeyForCG:self.inventoryCachedCG
+                                                    trusted:self.accessibilityTrusted];
+    self.inventoryLatestGeneration = self.inventoryGeneration;
+    [self scheduleInventoryIfNeeded];
+}
+- (void)notifyInventoryDidChange {
+    void (^callback)(void) = self.inventoryDidChange;
+    if (callback) callback();
+}
 - (BOOL)fail:(NSError **)error code:(NSInteger)code text:(NSString *)text {
     self.statusText = text;
     if (error) *error = [NSError errorWithDomain:YMAppWorkspaceErrorDomain code:code userInfo:@{NSLocalizedDescriptionKey: text}];
@@ -76,10 +136,12 @@ static BOOL YMWOrdinaryWindow(id element) {
     NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
     NSMutableOrderedSet *IDs = [NSMutableOrderedSet orderedSet];
     for (id value in displayIDs) if ([value isKindOfClass:NSNumber.class] && [value unsignedIntValue]) [IDs addObject:value];
+    NSArray *previousOwned = self.ownedIDs;
+    BOOL previousTrusted = self.accessibilityTrusted;
     self.ownedIDs = IDs.array;
     NSMutableArray *normalized = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, NSScreen *> *screens = [NSMutableDictionary dictionary];
-    for (NSScreen *screen in NSScreen.screens) {
+    for (NSScreen *screen in [self workspaceScreens]) {
         NSNumber *ID = screen.deviceDescription[@"NSScreenNumber"];
         if ([ID isKindOfClass:NSNumber.class]) screens[ID] = screen;
     }
@@ -112,54 +174,319 @@ static BOOL YMWOrdinaryWindow(id element) {
         }
         [normalized addObject:display];
     }
+    BOOL topologyChanged = ![previousOwned isEqualToArray:self.ownedIDs] ||
+        ![self.displays isEqualToArray:normalized];
+    BOOL trustChanged = previousTrusted != self.accessibilityTrusted;
     self.displays = normalized;
+    if (topologyChanged || trustChanged) self.inventoryGeneration += 1;
     [self refreshInventory];
 }
-- (void)refreshInventory {
-    // CoreGraphics may provide window titles in its dictionary; no title key is
-    // read, copied, logged, or retained. Only this allowlist leaves the loop.
-    NSArray *raw = CFBridgingRelease(CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
-    if (!raw) { self.inventoryValid = NO; self.statusText = @"暂时无法读取窗口清单；保留显示器，稍后刷新。"; return; }
+- (NSString *)normalizedCGSignature:(NSArray<NSDictionary *> *)cgWindows {
+    NSMutableArray *parts = [NSMutableArray array];
+    NSArray *sorted = [cgWindows sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSComparisonResult pid = [a[@"pid"] compare:b[@"pid"]];
+        return pid != NSOrderedSame ? pid : [a[@"windowID"] compare:b[@"windowID"]];
+    }];
+    for (NSDictionary *cg in sorted) {
+        NSDictionary *frame = YMWorkspaceGeometry(cg[@"frame"]);
+        [parts addObject:[NSString stringWithFormat:@"%@:%@:%@:%@:%@:%@:%@:%@:%@",
+            cg[@"pid"], cg[@"windowID"],
+            frame[@"x"] ?: @0, frame[@"y"] ?: @0, frame[@"width"] ?: @0, frame[@"height"] ?: @0,
+            cg[@"layer"] ?: @0, cg[@"onScreen"] ?: @NO, cg[@"alpha"] ?: @0]];
+    }
+    return [parts componentsJoinedByString:@"|"];
+}
+- (NSString *)inventoryRequestKeyForCG:(NSArray<NSDictionary *> *)cgWindows trusted:(BOOL)trusted {
+    NSMutableArray *displayParts = [NSMutableArray array];
+    for (NSDictionary *display in self.displays) {
+        NSDictionary *bounds = display[@"bounds"];
+        [displayParts addObject:[NSString stringWithFormat:@"%@:%@:%@:%@:%@:%@:%@",
+            display[@"displayID"], display[@"displayUUID"],
+            bounds[@"x"], bounds[@"y"], bounds[@"width"], bounds[@"height"],
+            display[@"isVirtual"]]];
+    }
+    NSArray *owned = [self.ownedIDs sortedArrayUsingSelector:@selector(compare:)];
+    return [NSString stringWithFormat:@"cg=%@;disp=%@;owned=%@;trust=%d;gen=%lu",
+        [self normalizedCGSignature:cgWindows ?: @[]],
+        [displayParts componentsJoinedByString:@","],
+        [owned componentsJoinedByString:@","],
+        trusted ? 1 : 0,
+        (unsigned long)self.inventoryGeneration];
+}
+- (BOOL)inventoryCacheFresh {
+    return self.inventoryPublishedKey.length &&
+        self.inventoryPublishedGeneration == self.inventoryGeneration &&
+        ([self inventoryTime] - self.inventoryPublishedAt) <= kYMInventoryCacheTTL;
+}
+- (void)markInventoryNotReady:(NSString *)status {
+    BOOL wasReady = self.inventoryReady;
+    self.inventoryReady = NO;
+    self.inventoryValid = NO;
+    if (status.length) self.statusText = status;
+    if (wasReady) [self notifyInventoryDidChange];
+}
+- (NSArray<NSDictionary *> *)admittedCGCandidates:(NSArray<NSDictionary *> *)cgWindows {
+    NSMutableArray *candidates = [NSMutableArray array];
+    for (NSDictionary *cg in cgWindows) {
+        if (!YMWorkspaceCGCandidateVisible(cg)) continue;
+        pid_t pid = [cg[@"pid"] intValue];
+        NSRunningApplication *app = [self.windowAccess applicationForPID:pid];
+        if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) continue;
+        [candidates addObject:cg];
+        if (candidates.count >= kYMInventoryMaxCGCandidates) break;
+    }
+    return candidates;
+}
+- (void)scheduleInventoryIfNeeded {
+    if (self.inventoryJobScheduled) return;
+    NSString *key = self.inventoryLatestKey;
+    NSUInteger generation = self.inventoryLatestGeneration;
+    if (!key.length) return;
+    if (self.inventoryInflightKey.length) {
+        // One in-flight + one latest slot; identical key waits for completion.
+        return;
+    }
+    if ([key isEqual:self.inventoryPublishedKey] && generation == self.inventoryPublishedGeneration &&
+        [self inventoryCacheFresh] && self.inventoryReady) {
+        self.inventoryLatestKey = nil;
+        return;
+    }
+    self.inventoryInflightKey = key;
+    self.inventoryInflightGeneration = generation;
+    self.inventoryLatestKey = nil;
+    self.inventoryJobScheduled = YES;
+    self.inventoryReady = NO;
+    self.inventoryValid = NO;
+
+    NSArray *cgSnapshot = [self.inventoryCachedCG copy] ?: @[];
+    NSArray *displays = [self.displays copy] ?: @[];
+    BOOL trusted = self.accessibilityTrusted;
+    NSUInteger jobGeneration = generation;
+    NSString *jobKey = [key copy];
+    __weak YMAppWorkspace *weakSelf = self;
+    [self scheduleInventoryRead:^{
+        YMAppWorkspace *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSMutableArray *axRecords = [NSMutableArray array];
+        BOOL complete = YES;
+        NSString *reason = @"";
+        if (trusted) {
+            NSUInteger visibleCount = 0;
+            for (NSDictionary *cg in cgSnapshot)
+                if (YMWorkspaceCGCandidateVisible(cg)) visibleCount++;
+            NSArray *candidates = [strongSelf admittedCGCandidates:cgSnapshot];
+            BOOL hitCGCap = visibleCount > kYMInventoryMaxCGCandidates ||
+                candidates.count >= kYMInventoryMaxCGCandidates;
+            NSMutableOrderedSet *pids = [NSMutableOrderedSet orderedSet];
+            for (NSDictionary *cg in candidates) {
+                [pids addObject:cg[@"pid"]];
+                if (pids.count >= kYMInventoryMaxPIDs) break;
+            }
+            BOOL hitPIDCap = pids.count >= kYMInventoryMaxPIDs;
+            NSTimeInterval deadline = [strongSelf inventoryTime] + kYMInventoryBudget;
+            for (NSNumber *pidValue in pids) {
+                if ([strongSelf inventoryTime] >= deadline) {
+                    complete = NO; reason = @"timeout"; break;
+                }
+                NSRunningApplication *app = [strongSelf.windowAccess applicationForPID:pidValue.intValue];
+                if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) {
+                    complete = NO;
+                    if (!reason.length) reason = @"missingApplication";
+                    continue;
+                }
+                NSDictionary *observation = [strongSelf.windowAccess observeApplication:app deadline:deadline];
+                if (![observation[@"complete"] boolValue]) {
+                    complete = NO;
+                    if (!reason.length) reason = observation[@"reason"] ?: @"incomplete";
+                }
+                NSArray *windows = observation[@"windows"];
+                if ([windows isKindOfClass:NSArray.class]) [axRecords addObjectsFromArray:windows];
+            }
+            if (hitCGCap) { complete = NO; if (!reason.length) reason = @"cgLimit"; }
+            if (hitPIDCap) { complete = NO; if (!reason.length) reason = @"pidLimit"; }
+        }
+        NSDictionary *snapshot = trusted
+            ? YMWorkspaceNormalizeWindowSnapshot(cgSnapshot, axRecords, complete, displays)
+            : nil;
+        [strongSelf publishInventoryRead:^{
+            YMAppWorkspace *publisher = weakSelf;
+            if (!publisher) return;
+            publisher.inventoryJobScheduled = NO;
+            publisher.inventoryInflightKey = nil;
+            [publisher finishInventoryJobKey:jobKey generation:jobGeneration
+                                  cgSnapshot:cgSnapshot trusted:trusted
+                                    complete:complete reason:reason
+                                   snapshot:snapshot axRecords:axRecords];
+        }];
+    }];
+}
+- (NSArray<NSDictionary *> *)windowsFromNoAXCG:(NSArray<NSDictionary *> *)cgWindows {
     NSMutableArray *windows = [NSMutableArray array];
-    for (NSDictionary *entry in raw) {
-        CGRect rect;
-        if (![entry[(__bridge NSString *)kCGWindowBounds] isKindOfClass:NSDictionary.class]) continue;
-        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)entry[(__bridge NSString *)kCGWindowBounds], &rect)) continue;
-        NSDictionary *frame = YMWorkspaceGeometry(@{@"x": @(rect.origin.x), @"y": @(rect.origin.y),
-            @"width": @(rect.size.width), @"height": @(rect.size.height)});
-        if (!YMWorkspaceVisibleOrdinaryGeometry(frame, [entry[(__bridge NSString *)kCGWindowLayer] integerValue],
-            [entry[(__bridge NSString *)kCGWindowIsOnscreen] boolValue], [entry[(__bridge NSString *)kCGWindowAlpha] doubleValue])) continue;
-        pid_t PID = [entry[(__bridge NSString *)kCGWindowOwnerPID] intValue];
-        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:PID];
+    for (NSDictionary *cg in cgWindows) {
+        if (!YMWorkspaceCGCandidateVisible(cg)) continue;
+        NSDictionary *frame = YMWorkspaceGeometry(cg[@"frame"]);
+        if (!YMWorkspaceVisibleOrdinaryGeometry(frame, [cg[@"layer"] integerValue],
+            [cg[@"onScreen"] boolValue], [cg[@"alpha"] doubleValue])) continue;
+        pid_t pid = [cg[@"pid"] intValue];
+        NSRunningApplication *app = [self.windowAccess applicationForPID:pid];
         if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) continue;
         NSDictionary *display = YMWorkspaceDisplayForFrame(frame, self.displays);
         if (!display) continue;
-        [windows addObject:@{@"windowID": entry[(__bridge NSString *)kCGWindowNumber], @"pid": @(PID),
-            @"bundleIdentifier": app.bundleIdentifier, @"appName": app.localizedName ?: app.bundleIdentifier,
-            @"appURL": app.bundleURL, @"frame": frame, @"displayID": display[@"displayID"],
-            @"isVirtual": display[@"isVirtual"]}];
+        [windows addObject:@{@"windowID": cg[@"windowID"], @"pid": @(pid),
+            @"bundleIdentifier": app.bundleIdentifier,
+            @"appName": app.localizedName ?: app.bundleIdentifier,
+            @"appURL": app.bundleURL, @"frame": frame, @"cgFrame": frame,
+            @"displayID": display[@"displayID"], @"isVirtual": display[@"isVirtual"]}];
     }
-    self.windows = windows; self.inventoryValid = YES;
-    // A closed process is decisive evidence; an absent or unreadable window is
-    // not. Retain such checkpoints until an explicit restore can inspect AX.
+    return windows;
+}
+- (NSArray<NSDictionary *> *)assembledWindowsFromSnapshot:(NSDictionary *)snapshot {
+    NSMutableArray *windows = [NSMutableArray array];
+    for (NSDictionary *entry in snapshot[@"windows"]) {
+        pid_t pid = [entry[@"pid"] intValue];
+        NSRunningApplication *app = [self.windowAccess applicationForPID:pid];
+        if (!app || app.terminated || !app.bundleIdentifier.length || !app.bundleURL) continue;
+        NSMutableDictionary *window = [entry mutableCopy];
+        window[@"bundleIdentifier"] = app.bundleIdentifier;
+        window[@"appName"] = app.localizedName ?: app.bundleIdentifier;
+        window[@"appURL"] = app.bundleURL;
+        [windows addObject:window];
+    }
+    return windows;
+}
+- (BOOL)snapshotHasUnresolvedEvidence:(NSDictionary *)snapshot cg:(NSArray *)cgWindows {
+    if (![snapshot[@"complete"] boolValue]) return YES;
+    if ([snapshot[@"blockers"] count]) return YES;
+    // Any visible CG candidate that did not become a published window remains unknown.
+    NSMutableSet *published = [NSMutableSet set];
+    for (NSDictionary *window in snapshot[@"windows"])
+        [published addObject:YMWorkspaceWindowKey(window[@"pid"], window[@"windowID"])];
+    for (NSDictionary *cg in [self admittedCGCandidates:cgWindows]) {
+        if (![published containsObject:YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"])])
+            return YES;
+    }
+    return NO;
+}
+- (void)retirePlacementsAgainstWindows:(NSArray<NSDictionary *> *)windows {
     for (YMWPlacement *placement in self.placements.copy) {
         if (placement.application.terminated) { [self.placements removeObject:placement]; continue; }
         for (NSDictionary *window in windows) {
             if ([window[@"windowID"] unsignedIntValue] != placement.windowID ||
                 [window[@"pid"] intValue] != placement.application.processIdentifier) continue;
-            if ([window[@"isVirtual"] boolValue]) placement.lastDisplayID = [window[@"displayID"] unsignedIntValue];
-            // CG may still report the pre-move physical frame after AX has
-            // already confirmed the virtual destination. Do not mistake that
-            // transient snapshot for a user's manual return and lose origin.
-            // Read only the retained window's geometry, never application text.
-            else if (!self.operationInProgress && self.accessibilityTrusted &&
-                     YMWorkspacePhysicalReturnConfirmed(window[@"frame"], YMWFrame(placement.element), self.displays, NO))
-                [self.placements removeObject:placement];
+            if ([window[@"isVirtual"] boolValue])
+                placement.lastDisplayID = [window[@"displayID"] unsignedIntValue];
+            else if (!self.operationInProgress && self.accessibilityTrusted) {
+                NSDictionary *live = [self.windowAccess observeElement:placement.element];
+                NSDictionary *axFrame = live[@"frame"];
+                // Independent raw CG evidence only — never normalized AX as cgFrame.
+                if (YMWorkspacePhysicalReturnConfirmed(window[@"cgFrame"], axFrame, self.displays, NO))
+                    [self.placements removeObject:placement];
+            }
             break;
         }
     }
+}
+- (void)publishWindows:(NSArray<NSDictionary *> *)windows ready:(BOOL)ready key:(NSString *)key
+            generation:(NSUInteger)generation {
+    NSArray *previousRows = self.rows;
+    BOOL previousReady = self.inventoryReady;
+    [self retirePlacementsAgainstWindows:windows];
+    self.windows = windows;
     self.rows = [self groupedRowsForDisplay:0 ownedOnly:YES];
+    if (ready) {
+        self.inventoryPublishedKey = key;
+        self.inventoryPublishedGeneration = generation;
+        self.inventoryPublishedAt = [self inventoryTime];
+        self.inventoryReady = YES;
+        self.inventoryValid = YES;
+    } else {
+        self.inventoryPublishedKey = nil;
+        self.inventoryPublishedAt = 0;
+        self.inventoryReady = NO;
+        self.inventoryValid = NO;
+    }
+    BOOL rowsChanged = ![previousRows isEqual:self.rows];
+    if (rowsChanged || previousReady != self.inventoryReady) [self notifyInventoryDidChange];
+}
+- (void)finishInventoryJobKey:(NSString *)jobKey generation:(NSUInteger)jobGeneration
+                   cgSnapshot:(NSArray *)cgSnapshot trusted:(BOOL)trusted
+                     complete:(BOOL)complete reason:(NSString *)reason
+                    snapshot:(NSDictionary *)snapshot axRecords:(NSArray *)axRecords {
+    (void)axRecords;
+    NSArray *liveCG = [self.windowAccess visibleWindows];
+    if (!liveCG) {
+        [self markInventoryNotReady:@"暂时无法读取窗口清单；保留显示器，稍后刷新。"];
+        [self drainLatestInventoryRequest];
+        return;
+    }
+    self.inventoryCachedCG = liveCG;
+    BOOL liveTrusted = self.accessibilityTrusted;
+    NSString *liveKey = [self inventoryRequestKeyForCG:liveCG trusted:liveTrusted];
+    NSString *jobCGSignature = [self normalizedCGSignature:cgSnapshot];
+    NSString *liveCGSignature = [self normalizedCGSignature:liveCG];
+    if (jobGeneration != self.inventoryGeneration || ![jobKey isEqual:liveKey] ||
+        trusted != liveTrusted || ![jobCGSignature isEqual:liveCGSignature]) {
+        // World moved: discard stale result and merge the latest request.
+        self.inventoryLatestKey = liveKey;
+        self.inventoryLatestGeneration = self.inventoryGeneration;
+        self.inventoryReady = NO;
+        self.inventoryValid = NO;
+        [self drainLatestInventoryRequest];
+        return;
+    }
+    if (!trusted) {
+        NSArray *windows = [self windowsFromNoAXCG:liveCG];
+        [self publishWindows:windows ready:YES key:liveKey generation:jobGeneration];
+        [self drainLatestInventoryRequest];
+        return;
+    }
+    if (!complete || !snapshot || ![snapshot[@"complete"] boolValue] ||
+        [self snapshotHasUnresolvedEvidence:snapshot cg:liveCG]) {
+        NSArray *partial = snapshot ? [self assembledWindowsFromSnapshot:snapshot] : self.windows;
+        // Keep prior display rows when partial; never claim ready/empty.
+        if (snapshot && [snapshot[@"windows"] count])
+            [self publishWindows:partial ready:NO key:nil generation:jobGeneration];
+        else {
+            self.inventoryReady = NO;
+            self.inventoryValid = NO;
+            if ([reason isEqual:@"timeout"])
+                self.statusText = @"窗口清单核对超时；保留显示器，稍后刷新。";
+            else
+                self.statusText = @"暂时无法完整核对窗口清单；保留显示器，稍后刷新。";
+            [self notifyInventoryDidChange];
+        }
+        [self drainLatestInventoryRequest];
+        return;
+    }
+    NSArray *windows = [self assembledWindowsFromSnapshot:snapshot];
+    [self publishWindows:windows ready:YES key:liveKey generation:jobGeneration];
+    [self drainLatestInventoryRequest];
+}
+- (void)drainLatestInventoryRequest {
+    if (!self.inventoryLatestKey.length) return;
+    [self scheduleInventoryIfNeeded];
+}
+- (void)refreshInventory {
+    NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
+    NSArray *cg = [self.windowAccess visibleWindows];
+    if (!cg) {
+        [self markInventoryNotReady:@"暂时无法读取窗口清单；保留显示器，稍后刷新。"];
+        return;
+    }
+    self.inventoryCachedCG = cg;
+    BOOL trusted = self.accessibilityTrusted;
+    NSString *key = [self inventoryRequestKeyForCG:cg trusted:trusted];
+    if ([key isEqual:self.inventoryPublishedKey] &&
+        self.inventoryPublishedGeneration == self.inventoryGeneration &&
+        [self inventoryCacheFresh] && self.inventoryReady) {
+        return;
+    }
+    // Pending until a matching generation publishes.
+    self.inventoryReady = NO;
+    self.inventoryValid = NO;
+    self.inventoryLatestKey = key;
+    self.inventoryLatestGeneration = self.inventoryGeneration;
+    [self scheduleInventoryIfNeeded];
 }
 - (NSArray<NSDictionary *> *)groupedRowsForDisplay:(CGDirectDisplayID)ID ownedOnly:(BOOL)ownedOnly {
     NSMutableDictionary<NSString *, NSMutableDictionary *> *groups = [NSMutableDictionary dictionary];
@@ -172,7 +499,7 @@ static BOOL YMWOrdinaryWindow(id element) {
         if (!row) {
             row = [@{@"appName": window[@"appName"], @"bundleIdentifier": bundle, @"appURL": window[@"appURL"],
                 @"pid": window[@"pid"], @"pids": [NSMutableArray array], @"windowCount": @0, @"managedWindowCount": @0} mutableCopy];
-            NSImage *icon = [NSRunningApplication runningApplicationWithProcessIdentifier:[window[@"pid"] intValue]].icon;
+            NSImage *icon = [self.windowAccess applicationForPID:[window[@"pid"] intValue]].icon;
             if (icon) row[@"appIcon"] = icon;
             groups[bundle] = row;
         }
@@ -197,8 +524,23 @@ static BOOL YMWOrdinaryWindow(id element) {
 - (NSArray<NSDictionary *> *)rowsForDisplayID:(CGDirectDisplayID)ID { return [self groupedRowsForDisplay:ID ownedOnly:NO]; }
 - (BOOL)needsRestoreForDisplayID:(CGDirectDisplayID)ID {
     if (![self.ownedIDs containsObject:@(ID)]) return NO;
-    if (!self.inventoryValid || [self rowsForDisplayID:ID].count) return YES;
+    if (!self.inventoryReady || ![self inventoryCacheFresh]) return YES;
+    if ([self rowsForDisplayID:ID].count) return YES;
     for (YMWPlacement *placement in self.placements) if (placement.lastDisplayID == ID) return YES;
+    // Unknown/partial CG evidence that might belong to this display blocks close.
+    for (NSDictionary *cg in self.inventoryCachedCG) {
+        if (!YMWorkspaceCGCandidateVisible(cg)) continue;
+        NSDictionary *frame = YMWorkspaceGeometry(cg[@"frame"]);
+        NSDictionary *display = frame ? YMWorkspaceDisplayForFrame(frame, self.displays) : nil;
+        if ([display[@"displayID"] unsignedIntValue] != ID) continue;
+        BOOL published = NO;
+        for (NSDictionary *window in self.windows) {
+            if ([window[@"pid"] isEqual:cg[@"pid"]] && [window[@"windowID"] isEqual:cg[@"windowID"]]) {
+                published = YES; break;
+            }
+        }
+        if (!published) return YES;
+    }
     return NO;
 }
 - (BOOL)needsRestoreBeforeRemovingVirtualDisplay {
@@ -209,7 +551,8 @@ static BOOL YMWOrdinaryWindow(id element) {
     if (self.operationInProgress) return [self fail:error code:1 text:@"正在核对窗口位置，请稍候。"];
     if (!self.accessibilityTrusted) return [self fail:error code:2 text:@"移动窗口需要控制权限；请先打开控制权限设置。"];
     [self refreshInventory];
-    if (!self.inventoryValid) return [self fail:error code:3 text:@"无法读取窗口清单，尚未移动任何窗口。"];
+    if (!self.inventoryReady || ![self inventoryCacheFresh])
+        return [self fail:error code:3 text:@"无法读取窗口清单，尚未移动任何窗口。"];
     return YES;
 }
 - (BOOL)genericBundleAllowed:(NSString *)bundle error:(NSError **)error {
@@ -326,7 +669,9 @@ static BOOL YMWOrdinaryWindow(id element) {
     }
     if (!running) return [self fail:error code:10 text:@"请先打开这个 App 的窗口，再将 App 拖入虚拟屏。"];
     if (!operations.count) return [self fail:error code:18 text:@"没有需要移动的可见普通窗口；窗口可能已在目标屏，或仍处于隐藏、最小化状态。请先显示要移动的窗口。"];
-    self.operationInProgress = YES; NSUInteger moved = 0;
+    self.operationInProgress = YES;
+    [self invalidateInventoryForMutation];
+    NSUInteger moved = 0;
     @try {
         for (NSDictionary *operation in operations) {
             NSRunningApplication *app = operation[@"application"]; NSDictionary *candidate = operation[@"candidate"];
@@ -356,7 +701,11 @@ static BOOL YMWOrdinaryWindow(id element) {
         }
         self.statusText = [NSString stringWithFormat:@"已移入 %lu 个窗口。原位置在本次 yomado 运行期间保留。", (unsigned long)moved];
         return YES;
-    } @finally { self.operationInProgress = NO; [self refreshInventory]; }
+    } @finally {
+        self.operationInProgress = NO;
+        [self invalidateInventoryForMutation];
+        [self refreshInventory];
+    }
 }
 - (BOOL)moveApplicationAtURL:(NSURL *)URL toDisplayID:(CGDirectDisplayID)ID error:(NSError **)error {
     return [self performMoveApplicationAtURL:URL sourceFilter:nil toDisplayID:ID error:error];
@@ -406,8 +755,13 @@ static BOOL YMWOrdinaryWindow(id element) {
     if (![self preflight:error]) return NO;
     if (ID && ![self.ownedIDs containsObject:@(ID)]) return [self fail:error code:17 text:@"只能返回 yomado 虚拟屏中的窗口。"];
     self.operationInProgress = YES;
+    [self invalidateInventoryForMutation];
     @try { return [self performRestoreBundle:bundle sourceID:ID physicalTarget:nil error:error]; }
-    @finally { self.operationInProgress = NO; [self refreshInventory]; }
+    @finally {
+        self.operationInProgress = NO;
+        [self invalidateInventoryForMutation];
+        [self refreshInventory];
+    }
 }
 - (BOOL)restoreApplicationWithBundleIdentifier:(NSString *)bundle fromDisplayID:(CGDirectDisplayID)sourceID
                           toPhysicalDisplayID:(CGDirectDisplayID)physicalID error:(NSError **)error {
@@ -419,14 +773,20 @@ static BOOL YMWOrdinaryWindow(id element) {
     if (!target || [target[@"isVirtual"] boolValue] || ![self displayStillCurrent:target])
         return [self fail:error code:19 text:@"指定的实体显示器当前不可用；窗口保持原位。"];
     self.operationInProgress = YES;
+    [self invalidateInventoryForMutation];
     @try { return [self performRestoreBundle:bundle sourceID:sourceID physicalTarget:target error:error]; }
-    @finally { self.operationInProgress = NO; [self refreshInventory]; }
+    @finally {
+        self.operationInProgress = NO;
+        [self invalidateInventoryForMutation];
+        [self refreshInventory];
+    }
 }
 - (BOOL)restoreDisplayID:(CGDirectDisplayID)ID error:(NSError **)error {
     NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
     if (self.operationInProgress) return [self fail:error code:1 text:@"正在核对窗口位置，请稍候。"];
     [self refreshInventory];
-    if (!self.inventoryValid) return [self fail:error code:3 text:@"无法读取窗口清单；保留虚拟屏，稍后再试。"];
+    if (!self.inventoryReady || ![self inventoryCacheFresh])
+        return [self fail:error code:3 text:@"无法读取窗口清单；保留虚拟屏，稍后再试。"];
     if (![self.ownedIDs containsObject:@(ID)]) return [self fail:error code:17 text:@"只能返回 yomado 虚拟屏中的窗口。"];
     NSMutableOrderedSet *bundles = [NSMutableOrderedSet orderedSet];
     for (NSDictionary *row in [self rowsForDisplayID:ID]) [bundles addObject:row[@"bundleIdentifier"]];
@@ -436,6 +796,7 @@ static BOOL YMWOrdinaryWindow(id element) {
     if (!bundles.count) { self.statusText = @"此虚拟屏没有需要返回的窗口。"; return YES; }
     if (!self.accessibilityTrusted) return [self fail:error code:2 text:@"返回窗口需要控制权限；请先打开控制权限设置，或手动移回窗口。"];
     self.operationInProgress = YES;
+    [self invalidateInventoryForMutation];
     @try {
         for (NSString *bundle in bundles) {
             // The controller first handles any pending WeChat safety checkpoint
@@ -444,13 +805,20 @@ static BOOL YMWOrdinaryWindow(id element) {
             if (![self performRestoreBundle:bundle sourceID:ID physicalTarget:nil error:error]) return NO;
         }
         return YES;
-    } @finally { self.operationInProgress = NO; [self refreshInventory]; }
+    } @finally {
+        self.operationInProgress = NO;
+        [self invalidateInventoryForMutation];
+        [self refreshInventory];
+    }
 }
 - (NSArray<NSDictionary *> *)restartOriginCheckpointsWithError:(NSError **)error {
     NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
     if (self.operationInProgress) { [self fail:error code:30 text:@"窗口操作尚未结束，稍后再更新。"]; return nil; }
     [self refreshInventory];
-    if (!self.inventoryValid) { [self fail:error code:30 text:@"无法核对窗口清单，保留当前工作区。"]; return nil; }
+    if (!self.inventoryReady || ![self inventoryCacheFresh]) {
+        [self fail:error code:30 text:@"无法核对窗口清单，保留当前工作区。"];
+        return nil;
+    }
     NSMutableArray *result = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
     for (YMWPlacement *placement in self.placements) {
@@ -504,6 +872,7 @@ static BOOL YMWOrdinaryWindow(id element) {
                 [self.placements removeObject:old];
         [self.placements addObject:placement];
     }
+    [self invalidateInventoryForMutation];
     [self refreshInventory];
     return YES;
 }
