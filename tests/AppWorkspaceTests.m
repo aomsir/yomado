@@ -212,11 +212,39 @@ int main(void) {
                 @"layer": @0, @"onScreen": @YES, @"alpha": @1}], @[dialogAX], YES, displays);
         Check([dialog[@"windows"] count] == 0, @"non-ordinary dialog is never movable");
         Check([dialog[@"blockers"] count] > 0, @"visible non-ordinary dialog remains a blocker");
-        NSDictionary *smallAux = YMWorkspaceNormalizeWindowSnapshot(
+        NSDictionary *thumbDialog = YMWorkspaceNormalizeWindowSnapshot(
             @[@{@"pid": @42, @"windowID": @1490, @"frame": Frame(15, 982, 37, 102),
                 @"layer": @0, @"onScreen": @YES, @"alpha": @1}], @[dialogAX], YES, displays);
+        Check([thumbDialog[@"windows"] count] == 0, @"Stage Manager thumbnail cannot make a large dialog movable");
+        Check([thumbDialog[@"blockers"] count] > 0,
+            @"CG thumbnail must not drop a large non-ordinary blocker");
+        Check([First(thumbDialog[@"blockers"])[@"displayID"] isEqual:@5],
+            @"large non-ordinary blocker keeps real AX source");
+        NSDictionary *thumbMinimized = YMWorkspaceNormalizeWindowSnapshot(
+            @[@{@"pid": @42, @"windowID": @1490, @"frame": Frame(15, 982, 37, 102),
+                @"layer": @0, @"onScreen": @YES, @"alpha": @1}], @[minimizedAX], YES, displays);
+        Check([thumbMinimized[@"windows"] count] == 0, @"Stage Manager thumbnail cannot make a large minimized window movable");
+        Check([thumbMinimized[@"blockers"] count] > 0,
+            @"CG thumbnail must not drop a large minimized blocker");
+        NSDictionary *smallAuxAX = @{@"identity": identity, @"frame": Frame(15, 982, 37, 102),
+            @"ordinary": @NO, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *smallAux = YMWorkspaceNormalizeWindowSnapshot(
+            @[@{@"pid": @42, @"windowID": @1490, @"frame": Frame(15, 982, 37, 102),
+                @"layer": @0, @"onScreen": @YES, @"alpha": @1}], @[smallAuxAX], YES, displays);
         Check([smallAux[@"windows"] count] == 0 && [smallAux[@"blockers"] count] == 0,
             @"small non-ordinary auxiliary surface may be excluded");
+        NSDictionary *invalidAuxAX = @{@"identity": identity, @"frame": Frame(NAN, 719, 37, 102),
+            @"ordinary": @NO, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};
+        NSDictionary *invalidAux = YMWorkspaceNormalizeWindowSnapshot(
+            @[@{@"pid": @42, @"windowID": @1490, @"frame": Frame(15, 982, 37, 102),
+                @"layer": @0, @"onScreen": @YES, @"alpha": @1}], @[invalidAuxAX], YES, displays);
+        Check([invalidAux[@"windows"] count] == 0, @"invalid AX non-ordinary cannot become movable");
+        Check([invalidAux[@"blockers"] count] > 0,
+            @"invalid AX non-ordinary with small CG remains an unknown-source blocker");
+        Check(First(invalidAux[@"blockers"])[@"displayID"] == nil,
+            @"invalid AX non-ordinary blocker omits unreliable displayID");
+        Check(!YMWorkspaceSnapshotAllowsSource(invalidAux, @5),
+            @"invalid AX non-ordinary blocker refuses every source");
 
         NSDictionary *nanAX = @{@"identity": identity, @"frame": Frame(NAN, 719, 230, 408),
             @"ordinary": @YES, @"minimized": @NO, @"readable": @YES, @"positionSettable": @YES};

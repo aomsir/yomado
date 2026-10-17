@@ -269,9 +269,13 @@ static inline NSDictionary *YMWorkspaceNormalizeWindowSnapshot(
         BOOL ordinary = [ax[@"ordinary"] isKindOfClass:NSNumber.class] && [ax[@"ordinary"] boolValue];
         BOOL minimized = [ax[@"minimized"] isKindOfClass:NSNumber.class] && [ax[@"minimized"] boolValue];
         if (!ordinary || minimized) {
-            if (YMWorkspaceCGMeetsOldSize(cg[@"frame"]))
+            if (!axFrame) {
+                [blockers addObject:YMWorkspaceBlocker(cg[@"pid"], cg[@"windowID"],
+                    minimized ? @"minimized" : @"nonOrdinary", nil)];
+            } else if (YMWorkspaceCGMeetsOldSize(axFrame)) {
                 [blockers addObject:YMWorkspaceBlocker(cg[@"pid"], cg[@"windowID"],
                     minimized ? @"minimized" : @"nonOrdinary", display)];
+            }
             continue;
         }
         if (!axFrame) {
