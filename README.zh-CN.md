@@ -59,9 +59,9 @@ yomado 主要是为了支持 **Codex 或其他 Agent 通过视觉操作电脑**�
 
 ## 下载
 
-[下载 Apple Silicon 应用](https://github.com/chekusu/yomado/releases/download/v0.3.6/Yomado.zip) · [版本说明](https://github.com/chekusu/yomado/releases/tag/v0.3.6)
+[下载 Apple Silicon 应用](https://github.com/chekusu/yomado/releases/download/v0.3.7/Yomado.zip) · [版本说明](https://github.com/chekusu/yomado/releases/tag/v0.3.7)
 
-官方 v0.3.6 下载包已由 CHEKUSU INC. 使用 Developer ID 签名，并通过 Apple 公证、附带公证票据。它仍是使用私有 API 的实验版本；Apple 公证不等同于 Mac App Store 上架。
+官方 v0.3.7 下载包已由 CHEKUSU INC. 使用 Developer ID 签名，并通过 Apple 公证、附带公证票据。它仍是使用私有 API 的实验版本；Apple 公证不等同于 Mac App Store 上架。
 
 ## 编译
 
@@ -80,7 +80,7 @@ dist/Yomado.zip
 
 构建脚本通过 `xcrun` 使用当前 Xcode 或 Command Line Tools，也可以设置 `YOMADO_DEVELOPER_DIR` 选择其他开发工具目录。
 
-目前验证过 Apple Silicon 原生构建。macOS 14 部署目标只是编译设置，不代表所有 macOS 14 及以上系统、或 Intel Mac 均已兼容。[GitHub Releases](https://github.com/chekusu/yomado/releases/tag/v0.3.6) 提供实验性的 Apple Silicon 应用和 SHA-256 校验值，暂不提供 Intel 版本。
+目前验证过 Apple Silicon 原生构建。macOS 14 部署目标只是编译设置，不代表所有 macOS 14 及以上系统、或 Intel Mac 均已兼容。[GitHub Releases](https://github.com/chekusu/yomado/releases/tag/v0.3.7) 提供实验性的 Apple Silicon 应用和 SHA-256 校验值，暂不提供 Intel 版本。
 
 本地构建默认使用 **ad hoc 签名**。显式设置 `YOMADO_SIGNING_IDENTITY` 后，脚本会为应用和恢复进程使用 Developer ID Application 签名、强化运行时及安全时间戳；此步骤不会自动提交 Apple 公证。[官网分发流程](docs/distribution.md) 说明签名、公证、附加公证票据及发布验证。只有 Apple 接受该构建、最终下载包也通过验证后，才会将该版本标记为已公证。是否运行本地构建，请遵循自己 Mac 的正常安全策略。
 

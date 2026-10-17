@@ -790,10 +790,7 @@ static NSView *YMSpacer(void) {
     [self selectProfile:profile];
     if (self.selectedProfile == profile) [self stop:nil];
 }
-- (void)renameManagedDisplayFromMenu:(NSMenuItem *)sender {
-    YMManagedDisplay *profile = sender.representedObject;
-    if (![profile isKindOfClass:YMManagedDisplay.class] || ![self canPerformScreenMenuActionForProfile:profile]
-        || self.window.attachedSheet) return;
+- (NSAlert *)makeRenameAlertForProfile:(YMManagedDisplay *)profile {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"给虚拟屏命名";
     alert.informativeText = @"例如 Codex 或 GrokBot。名称会显示在屏幕和菜单栏中。";
@@ -805,6 +802,15 @@ static NSView *YMSpacer(void) {
     [input setAccessibilityLabel:@"虚拟屏名称"];
     alert.accessoryView = input;
     alert.window.initialFirstResponder = input;
+    return alert;
+}
+- (void)renameManagedDisplayFromMenu:(NSMenuItem *)sender {
+    YMManagedDisplay *profile = sender.representedObject;
+    if (![profile isKindOfClass:YMManagedDisplay.class] || ![self canPerformScreenMenuActionForProfile:profile]
+        || self.window.attachedSheet) return;
+    [self showWindow:nil];
+    NSAlert *alert = [self makeRenameAlertForProfile:profile];
+    NSTextField *input = (NSTextField *)alert.accessoryView;
     __weak ADController *weakSelf = self;
     [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
         ADController *controller = weakSelf;

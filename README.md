@@ -4,7 +4,7 @@
 
 A work screen for visual agents, designed to let physical screens rest.
 
-[Website](https://yomado.app/) · [Download for Apple Silicon](https://github.com/chekusu/yomado/releases/download/v0.3.6/Yomado.zip) · [Release notes](https://github.com/chekusu/yomado/releases/tag/v0.3.6) · [简体中文](README.zh-CN.md) · [MIT license](LICENSE)
+[Website](https://yomado.app/) · [Download for Apple Silicon](https://github.com/chekusu/yomado/releases/download/v0.3.7/Yomado.zip) · [Release notes](https://github.com/chekusu/yomado/releases/tag/v0.3.7) · [简体中文](README.zh-CN.md) · [MIT license](LICENSE)
 
 ## See yomado in 60 seconds
 
@@ -74,7 +74,7 @@ dist/Yomado.zip
 
 The build script selects the active Xcode or Command Line Tools installation through `xcrun`. Set `YOMADO_DEVELOPER_DIR` to select another developer directory.
 
-The native Apple Silicon build has been verified. The macOS 14 deployment target is a build setting, not a claim that every macOS 14+ system or Intel Mac is supported. An experimental Apple Silicon build is available in [GitHub Releases](https://github.com/chekusu/yomado/releases/tag/v0.3.6), with a SHA-256 checksum. Intel binaries are not supplied. The official v0.3.6 archive is signed by CHEKUSU INC. with Developer ID, notarized by Apple, and includes a stapled notarization ticket. Notarization is separate from Mac App Store review.
+The native Apple Silicon build has been verified. The macOS 14 deployment target is a build setting, not a claim that every macOS 14+ system or Intel Mac is supported. An experimental Apple Silicon build is available in [GitHub Releases](https://github.com/chekusu/yomado/releases/tag/v0.3.7), with a SHA-256 checksum. Intel binaries are not supplied. The official v0.3.7 archive is signed by CHEKUSU INC. with Developer ID, notarized by Apple, and includes a stapled notarization ticket. Notarization is separate from Mac App Store review.
 
 Local builds receive an **ad hoc signature** by default. Setting `YOMADO_SIGNING_IDENTITY` explicitly enables Developer ID Application signing with the hardened runtime and secure timestamps for both the app and its recovery helper. This signing step does not submit the app for notarization. See the [website distribution process](docs/distribution.md) for signing, Apple notarization, stapling and release checks. A release is described as notarized only after Apple accepts that exact build and its final download passes verification. Follow your Mac's normal security policies when choosing whether to run a local build.
 

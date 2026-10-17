@@ -341,6 +341,160 @@
 - (void)finishUpdateRecoveryWithError:(NSError *)error { self.completionError=error; [self.events addObject:@"finished"]; }
 @end
 
+@interface ADController (YMRenameTestDeclaration)
+- (NSAlert *)makeRenameAlertForProfile:(YMManagedDisplay *)profile;
+@end
+
+@interface YMRenameText : NSObject
+@property(nonatomic, copy) NSString *stringValue;
+@end
+@implementation YMRenameText
+@end
+
+@interface YMRenameWindow : NSObject
+@property(nonatomic) BOOL visible;
+@property(nonatomic, strong) id attachedSheet;
+@end
+@implementation YMRenameWindow
+@end
+
+@interface YMRenameAlert : NSObject
+@property(nonatomic, strong) YMRenameText *accessoryView;
+@property(nonatomic, weak) YMRenameWindow *parent;
+@property(nonatomic, copy) void (^completion)(NSModalResponse);
+@property(nonatomic) NSUInteger begins;
+- (void)beginSheetModalForWindow:(NSWindow *)window
+              completionHandler:(void (^)(NSModalResponse))completion;
+- (void)finish:(NSModalResponse)response;
+@end
+@implementation YMRenameAlert
+- (void)beginSheetModalForWindow:(NSWindow *)window
+              completionHandler:(void (^)(NSModalResponse))completion {
+    self.parent = (YMRenameWindow *)(id)window;
+    self.parent.attachedSheet = self;
+    self.parent.visible = YES;
+    self.completion = completion;
+    self.begins++;
+}
+- (void)finish:(NSModalResponse)response {
+    self.parent.attachedSheet = nil;
+    void (^completion)(NSModalResponse) = self.completion;
+    self.completion = nil;
+    if (completion) completion(response);
+}
+@end
+
+@interface YMRenameMenuItem : NSObject
+@property(nonatomic, strong) id representedObject;
+@end
+@implementation YMRenameMenuItem
+@end
+
+@interface YMRenameEnvironment : NSObject <YMPanelPresentationEnvironment>
+@property(nonatomic) NSApplicationActivationPolicy activationPolicy;
+@property(nonatomic) BOOL rejectAccessory;
+@property(nonatomic) NSUInteger hides;
+@property(nonatomic) NSUInteger presentations;
+@property(nonatomic) NSUInteger policyRequests;
+@property(nonatomic, strong) NSMutableArray *pending;
+@property(nonatomic, strong) NSMutableArray *settling;
+- (void)drain;
+- (void)drainSettling;
+@end
+@implementation YMRenameEnvironment
+- (instancetype)init {
+    if ((self = [super init])) {
+        _activationPolicy = NSApplicationActivationPolicyAccessory;
+        _pending = [NSMutableArray array];
+        _settling = [NSMutableArray array];
+    }
+    return self;
+}
+- (BOOL)requestActivationPolicy:(NSApplicationActivationPolicy)policy {
+    self.policyRequests++;
+    if (self.rejectAccessory && policy == NSApplicationActivationPolicyAccessory) return NO;
+    self.activationPolicy = policy;
+    return YES;
+}
+- (void)activateApplication {}
+- (void)deferUntilAfterMenuTracking:(dispatch_block_t)block {
+    [self.pending addObject:[block copy]];
+}
+- (void)deferUntilPolicySettles:(dispatch_block_t)block {
+    [self.settling addObject:[block copy]];
+}
+- (BOOL)isWindowVisible:(NSWindow *)window {
+    return ((YMRenameWindow *)(id)window).visible;
+}
+- (BOOL)hasAttachedSheetForWindow:(NSWindow *)window {
+    return ((YMRenameWindow *)(id)window).attachedSheet != nil;
+}
+- (void)presentWindow:(NSWindow *)window {
+    self.presentations++;
+    ((YMRenameWindow *)(id)window).visible = YES;
+}
+- (void)hideWindow:(NSWindow *)window {
+    self.hides++;
+    ((YMRenameWindow *)(id)window).visible = NO;
+}
+- (void)reportActivationPolicyFailure:(NSApplicationActivationPolicy)requested
+                        actualPolicy:(NSApplicationActivationPolicy)actual {
+    (void)requested; (void)actual;
+}
+- (void)drain {
+    while (self.pending.count) {
+        dispatch_block_t block = self.pending.firstObject;
+        [self.pending removeObjectAtIndex:0];
+        block();
+    }
+}
+- (void)drainSettling {
+    while (self.settling.count) {
+        dispatch_block_t block = self.settling.firstObject;
+        [self.settling removeObjectAtIndex:0];
+        block();
+    }
+}
+@end
+
+@interface YMRenameController : YMFakeController
+@property(nonatomic) NSUInteger alertCreations;
+@property(nonatomic, strong) YMRenameAlert *lastRenameAlert;
+@end
+@implementation YMRenameController
+- (NSAlert *)makeRenameAlertForProfile:(YMManagedDisplay *)profile {
+    self.alertCreations++;
+    YMRenameAlert *alert = [YMRenameAlert new];
+    alert.accessoryView = [YMRenameText new];
+    alert.accessoryView.stringValue = profile.friendlyName ?: @"";
+    self.lastRenameAlert = alert;
+    return (NSAlert *)(id)alert;
+}
+@end
+
+static YMRenameController *RenameController(YMRenameWindow **window, YMRenameEnvironment **environment, YMManagedDisplay **profile) {
+    YMRenameController *c = [YMRenameController new];
+    YMRenameWindow *w = [YMRenameWindow new];
+    YMRenameEnvironment *e = [YMRenameEnvironment new];
+    YMFakeDisplay *display = [YMFakeDisplay new];
+    YMManagedDisplay *p = [YMManagedDisplay new];
+    p.width = 800; p.height = 600; p.ordinal = 1;
+    p.friendlyName = @"Original";
+    p.display = display;
+    c.displayProfiles = [NSMutableArray arrayWithObject:p];
+    c.selectedProfile = p;
+    c.virtualDisplay = display;
+    c.statusLabel = (NSTextField *)(id)[YMRenameText new];
+    c.detailLabel = (NSTextField *)(id)[YMRenameText new];
+    c.window = (NSWindow *)(id)w;
+    c.useRealPanelPresentation = YES;
+    c.panelPresenter = [[YMControlPanelPresenter alloc] initWithWindow:(NSWindow *)(id)w environment:e];
+    if (window) *window = w;
+    if (environment) *environment = e;
+    if (profile) *profile = p;
+    return c;
+}
+
 static NSUInteger Tests, Failures;
 static void Expect(BOOL value, const char *name) { Tests++; if (!value) { Failures++; fprintf(stderr,"FAIL %s\n",name); } }
 static YMFakeController *Controller(YMFakeTopology **t, YMFakeDisplay **d, YMManagedDisplay **p, YMManagedDisplay **s) {
@@ -725,6 +879,346 @@ int main(void) {
                    "WeChat restore and app restore both recorded");
             Expect(restored, "WeChat-then-ready-then-restore close path succeeds");
         }
+
+        {
+            BOOL seamAvailable = [ADController instancesRespondToSelector:
+                @selector(makeRenameAlertForProfile:)];
+            Expect(seamAvailable, "rename alert construction has a headless boundary");
+            if (!seamAvailable) goto rename_tests_done;
+
+            YMRenameWindow *w;
+            YMRenameEnvironment *e;
+            YMManagedDisplay *profile;
+            YMRenameController *c = RenameController(&w, &e, &profile);
+            [c showWindow:nil]; [e drain];
+            [c windowShouldClose:c.window]; [e drain];
+            NSUInteger hides = e.hides, opens = c.showCalls;
+            YMRenameMenuItem *item = [YMRenameMenuItem new];
+            item.representedObject = profile;
+            [c renameManagedDisplayFromMenu:(NSMenuItem *)(id)item];
+            Expect(c.showCalls == opens + 1, "menu rename uses the normal open entry");
+            Expect(c.panelPresenter.panelOpen, "rename restores logical open state");
+            [e drain];
+            Expect(e.activationPolicy == NSApplicationActivationPolicyRegular,
+                   "rename restores regular lifecycle");
+            [c.lastRenameAlert finish:NSAlertSecondButtonReturn];
+            Expect(c.panelPresenter.panelOpen && w.visible && c.saves == 0,
+                   "cancel keeps the panel open without saving");
+            [c windowShouldClose:c.window]; [e drain];
+            Expect(!w.visible && !c.panelPresenter.panelOpen && e.hides == hides + 1,
+                   "explicit close after rename hides the same panel");
+            NSWindow *originalWindow = c.window;
+            [c showWindow:nil]; [e drain];
+            Expect(w.visible && c.panelPresenter.panelOpen && c.window == originalWindow,
+                   "normal reopen reuses the panel");
+            [c windowShouldClose:c.window]; [e drain];
+            Expect(!w.visible && e.hides == hides + 2, "reopened panel closes again");
+            Expect(NSApp == nil, "rename regression never initializes the application");
+            [c.panelPresenter invalidate];
+            [e.pending removeAllObjects];
+            [e.settling removeAllObjects];
+
+            NSArray<NSString *> *blockedFlags = @[
+                @"previewMode", @"updateWorkspaceBusy", @"appOperationInProgress",
+                @"displayOperationInProgress", @"armed", @"preparing", @"restoring",
+                @"layoutChangedForTrial", @"recoveryRequested"
+            ];
+            for (NSString *flag in blockedFlags) {
+                YMRenameWindow *bw; YMRenameEnvironment *be; YMManagedDisplay *bp;
+                YMRenameController *bc = RenameController(&bw, &be, &bp);
+                NSUInteger showBefore = bc.showCalls, alertsBefore = bc.alertCreations, savesBefore = bc.saves;
+                [bc setValue:@YES forKey:flag];
+                YMRenameMenuItem *blockedItem = [YMRenameMenuItem new];
+                blockedItem.representedObject = bp;
+                [bc renameManagedDisplayFromMenu:(NSMenuItem *)(id)blockedItem];
+                Expect(bc.showCalls == showBefore && bc.alertCreations == alertsBefore && bc.saves == savesBefore,
+                       [[NSString stringWithFormat:@"blocked flag %@ rejects rename", flag] UTF8String]);
+                [bc.panelPresenter invalidate];
+                [be.pending removeAllObjects];
+                [be.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *rw; YMRenameEnvironment *re; YMManagedDisplay *rp;
+                YMRenameController *rc = RenameController(&rw, &re, &rp);
+                NSUInteger showBefore = rc.showCalls, alertsBefore = rc.alertCreations, savesBefore = rc.saves;
+                YMRenameMenuItem *nilItem = [YMRenameMenuItem new];
+                nilItem.representedObject = nil;
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)nilItem];
+                Expect(rc.showCalls == showBefore && rc.alertCreations == alertsBefore && rc.saves == savesBefore,
+                       "nil representedObject rejects rename");
+                YMRenameMenuItem *objItem = [YMRenameMenuItem new];
+                objItem.representedObject = [NSObject new];
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)objItem];
+                Expect(rc.showCalls == showBefore && rc.alertCreations == alertsBefore && rc.saves == savesBefore,
+                       "non-profile representedObject rejects rename");
+                YMManagedDisplay *outsider = [YMManagedDisplay new];
+                outsider.friendlyName = @"Outsider";
+                YMRenameMenuItem *outItem = [YMRenameMenuItem new];
+                outItem.representedObject = outsider;
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)outItem];
+                Expect(rc.showCalls == showBefore && rc.alertCreations == alertsBefore && rc.saves == savesBefore,
+                       "profile outside displayProfiles rejects rename");
+                rw.attachedSheet = [NSObject new];
+                YMRenameMenuItem *sheetItem = [YMRenameMenuItem new];
+                sheetItem.representedObject = rp;
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)sheetItem];
+                Expect(rc.showCalls == showBefore && rc.alertCreations == alertsBefore && rc.saves == savesBefore,
+                       "existing attachedSheet rejects second rename");
+                [rc.panelPresenter invalidate];
+                [re.pending removeAllObjects];
+                [re.settling removeAllObjects];
+            }
+
+            NSArray<NSDictionary *> *cases = @[
+                @{ @"text": @"Ignored", @"response": @(NSAlertSecondButtonReturn), @"saves": @0, @"name": @"Original" },
+                @{ @"text": @"  Renamed  ", @"response": @(NSAlertFirstButtonReturn), @"saves": @1, @"name": @"Renamed" },
+                @{ @"text": @"x", @"response": @(NSAlertFirstButtonReturn), @"saves": @1, @"name": @"x" },
+                @{ @"text": [@"" stringByPaddingToLength:60 withString:@"x" startingAtIndex:0],
+                   @"response": @(NSAlertFirstButtonReturn), @"saves": @1,
+                   @"name": [@"" stringByPaddingToLength:60 withString:@"x" startingAtIndex:0] },
+                @{ @"text": @"   ", @"response": @(NSAlertFirstButtonReturn), @"saves": @0, @"name": @"Original" },
+                @{ @"text": @"A\nB", @"response": @(NSAlertFirstButtonReturn), @"saves": @0, @"name": @"Original" },
+                @{ @"text": [@"" stringByPaddingToLength:61 withString:@"x" startingAtIndex:0],
+                   @"response": @(NSAlertFirstButtonReturn), @"saves": @0, @"name": @"Original" }
+            ];
+            for (NSDictionary *caseInfo in cases) {
+                YMRenameWindow *cw; YMRenameEnvironment *ce; YMManagedDisplay *cp;
+                YMRenameController *cc = RenameController(&cw, &ce, &cp);
+                NSUInteger inventoryBefore = cc.inventoryUpdates;
+                NSUInteger hidesBefore = ce.hides;
+                YMRenameMenuItem *caseItem = [YMRenameMenuItem new];
+                caseItem.representedObject = cp;
+                [cc renameManagedDisplayFromMenu:(NSMenuItem *)(id)caseItem];
+                [ce drain];
+                cc.lastRenameAlert.accessoryView.stringValue = caseInfo[@"text"];
+                [cc.lastRenameAlert finish:[caseInfo[@"response"] integerValue]];
+                NSUInteger expectedSaves = [caseInfo[@"saves"] unsignedIntegerValue];
+                Expect(cc.saves == expectedSaves && [cp.friendlyName isEqualToString:caseInfo[@"name"]],
+                       [[NSString stringWithFormat:@"rename case %@ saves and name", caseInfo[@"name"]] UTF8String]);
+                if (expectedSaves == 1) {
+                    Expect(cc.inventoryUpdates == inventoryBefore + 1, "valid save updates inventory once");
+                } else {
+                    Expect(cc.inventoryUpdates == inventoryBefore, "non-save leaves inventory unchanged");
+                }
+                Expect(cc.panelPresenter.panelOpen && cw.visible && ce.hides == hidesBefore,
+                       "rename completion keeps panel open without hiding");
+                [cc windowShouldClose:cc.window]; [ce drain];
+                Expect(!cw.visible && !cc.panelPresenter.panelOpen && ce.hides == hidesBefore + 1,
+                       "explicit close after rename case hides once");
+                [cc.panelPresenter invalidate];
+                [ce.pending removeAllObjects];
+                [ce.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *iw; YMRenameEnvironment *ie; YMManagedDisplay *ip;
+                YMRenameController *ic = RenameController(&iw, &ie, &ip);
+                YMManagedDisplay *selected = [YMManagedDisplay new];
+                selected.friendlyName = @"Selected";
+                YMFakeDisplay *selectedDisplay = [YMFakeDisplay new];
+                selected.display = selectedDisplay;
+                [ic.displayProfiles addObject:selected];
+                ic.selectedProfile = selected;
+                ic.virtualDisplay = selectedDisplay;
+                YMRenameMenuItem *targetItem = [YMRenameMenuItem new];
+                targetItem.representedObject = ip;
+                [ic renameManagedDisplayFromMenu:(NSMenuItem *)(id)targetItem];
+                [ie drain];
+                ic.lastRenameAlert.accessoryView.stringValue = @"MenuTarget";
+                [ic.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                Expect([ip.friendlyName isEqual:@"MenuTarget"] && [selected.friendlyName isEqual:@"Selected"],
+                       "valid save renames only the menu target");
+                Expect(ic.selectedProfile == selected && ic.virtualDisplay == selectedDisplay,
+                       "rename preserves selectedProfile and virtualDisplay identity");
+                [ic.panelPresenter invalidate];
+                [ie.pending removeAllObjects];
+                [ie.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *iw; YMRenameEnvironment *ie; YMManagedDisplay *ip;
+                YMRenameController *ic = RenameController(&iw, &ie, &ip);
+                YMRenameMenuItem *targetItem = [YMRenameMenuItem new];
+                targetItem.representedObject = ip;
+                [ic renameManagedDisplayFromMenu:(NSMenuItem *)(id)targetItem];
+                [ie drain];
+                [ic.displayProfiles removeObject:ip];
+                ic.lastRenameAlert.accessoryView.stringValue = @"Gone";
+                [ic.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                Expect(ic.saves == 0 && [ip.friendlyName isEqual:@"Original"] && ic.panelPresenter.panelOpen,
+                       "removed target at finish does not save");
+                [ic windowShouldClose:ic.window]; [ie drain];
+                Expect(!iw.visible && !ic.panelPresenter.panelOpen, "panel still closes after removed-target finish");
+                [ic.panelPresenter invalidate];
+                [ie.pending removeAllObjects];
+                [ie.settling removeAllObjects];
+            }
+            {
+                YMRenameWindow *iw; YMRenameEnvironment *ie; YMManagedDisplay *ip;
+                YMRenameController *ic = RenameController(&iw, &ie, &ip);
+                YMRenameMenuItem *targetItem = [YMRenameMenuItem new];
+                targetItem.representedObject = ip;
+                [ic renameManagedDisplayFromMenu:(NSMenuItem *)(id)targetItem];
+                [ie drain];
+                ic.updateWorkspaceBusy = YES;
+                ic.lastRenameAlert.accessoryView.stringValue = @"Busy";
+                [ic.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                Expect(ic.saves == 0 && [ip.friendlyName isEqual:@"Original"] && ic.panelPresenter.panelOpen,
+                       "busy at finish does not save");
+                ic.updateWorkspaceBusy = NO;
+                [ic windowShouldClose:ic.window]; [ie drain];
+                Expect(!iw.visible && !ic.panelPresenter.panelOpen, "panel still closes after busy finish");
+                [ic.panelPresenter invalidate];
+                [ie.pending removeAllObjects];
+                [ie.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *sw; YMRenameEnvironment *se; YMManagedDisplay *sp;
+                YMRenameController *sc = RenameController(&sw, &se, &sp);
+                YMRenameMenuItem *sheetItem = [YMRenameMenuItem new];
+                sheetItem.representedObject = sp;
+                [sc renameManagedDisplayFromMenu:(NSMenuItem *)(id)sheetItem];
+                [se drain];
+                NSUInteger hidesBefore = se.hides;
+                id sheet = sw.attachedSheet;
+                [sc windowShouldClose:sc.window];
+                Expect(sw.attachedSheet == sheet && se.hides == hidesBefore && sc.panelPresenter.panelOpen,
+                       "sheet protects against close");
+                [sc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                [sc windowShouldClose:sc.window]; [se drain];
+                Expect(!sw.visible && !sc.panelPresenter.panelOpen && se.hides == hidesBefore + 1,
+                       "close works after sheet cancel");
+                [sc.panelPresenter invalidate];
+                [se.pending removeAllObjects];
+                [se.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *dw; YMRenameEnvironment *de; YMManagedDisplay *dp;
+                YMRenameController *dc = RenameController(&dw, &de, &dp);
+                YMRenameMenuItem *dupItem = [YMRenameMenuItem new];
+                dupItem.representedObject = dp;
+                [dc renameManagedDisplayFromMenu:(NSMenuItem *)(id)dupItem];
+                [de drain];
+                [dc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                NSUInteger hidesBefore = de.hides;
+                [dc windowShouldClose:dc.window];
+                [dc windowShouldClose:dc.window];
+                [de drain];
+                Expect(de.hides == hidesBefore + 1 && de.activationPolicy == NSApplicationActivationPolicyAccessory,
+                       "duplicate close hides once and settles to Accessory");
+                Expect(de.pending.count == 0 && de.settling.count == 0, "duplicate close leaves no deferred work");
+                [dc showWindow:nil]; [de drain];
+                Expect(dw.visible && dc.panelPresenter.panelOpen, "reopen after duplicate close works");
+                [dc.panelPresenter invalidate];
+                [de.pending removeAllObjects];
+                [de.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *ow; YMRenameEnvironment *oe; YMManagedDisplay *op;
+                YMRenameController *oc = RenameController(&ow, &oe, &op);
+                [oc showWindow:nil]; [oe drain];
+                [oc.panelPresenter closeWindow:oc.window];
+                YMRenameMenuItem *lateItem = [YMRenameMenuItem new];
+                lateItem.representedObject = op;
+                [oc renameManagedDisplayFromMenu:(NSMenuItem *)(id)lateItem];
+                [oe drain];
+                Expect(oc.panelPresenter.panelOpen && ow.visible
+                       && oe.activationPolicy == NSApplicationActivationPolicyRegular,
+                       "stale ordinary close cannot demote after rename open");
+                [oc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                [oc.panelPresenter invalidate];
+                [oe.pending removeAllObjects];
+                [oe.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *rw; YMRenameEnvironment *re; YMManagedDisplay *rp;
+                YMRenameController *rc = RenameController(&rw, &re, &rp);
+                [rc showWindow:nil]; [re drain];
+                re.rejectAccessory = YES;
+                [rc windowShouldClose:rc.window]; [re drain];
+                Expect(re.settling.count == 1, "rejected Accessory schedules one settling retry");
+                re.rejectAccessory = NO;
+                YMRenameMenuItem *retryItem = [YMRenameMenuItem new];
+                retryItem.representedObject = rp;
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)retryItem];
+                [re drain];
+                NSUInteger policyBefore = re.policyRequests;
+                [re drainSettling];
+                Expect(re.policyRequests == policyBefore,
+                       "stale settling retry adds no policy request after rename");
+                Expect(re.activationPolicy == NSApplicationActivationPolicyRegular,
+                       "rename wins over stale Accessory retry");
+                [rc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                [rc.panelPresenter invalidate];
+                [re.pending removeAllObjects];
+                [re.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *nw; YMRenameEnvironment *ne; YMManagedDisplay *np;
+                YMRenameController *nc = RenameController(&nw, &ne, &np);
+                YMSpyHeartbeat *heartbeat = [YMSpyHeartbeat new];
+                nc.heartbeatTimer = (NSTimer *)(id)heartbeat;
+                YMFakeDisplay *display = (YMFakeDisplay *)np.display;
+                NSWindow *windowIdentity = nc.window;
+                YMRenameMenuItem *sideItem = [YMRenameMenuItem new];
+                sideItem.representedObject = np;
+                [nc renameManagedDisplayFromMenu:(NSMenuItem *)(id)sideItem];
+                [ne drain];
+                [nc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                [nc windowShouldClose:nc.window]; [ne drain];
+                [nc showWindow:nil]; [ne drain];
+                sideItem = [YMRenameMenuItem new];
+                sideItem.representedObject = np;
+                [nc renameManagedDisplayFromMenu:(NSMenuItem *)(id)sideItem];
+                [ne drain];
+                nc.lastRenameAlert.accessoryView.stringValue = @"SideEffect";
+                [nc.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                [nc windowShouldClose:nc.window]; [ne drain];
+                [nc showWindow:nil]; [ne drain];
+                Expect(heartbeat.invalidations == 0 && display.creates == 0 && display.destroys == 0
+                       && nc.stopCalls == 0 && nc.window == windowIdentity,
+                       "rename lifecycle has no heartbeat display or stop side effects");
+                [nc.panelPresenter invalidate];
+                [ne.pending removeAllObjects];
+                [ne.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *aw; YMRenameEnvironment *ae; YMManagedDisplay *ap;
+                YMRenameController *ac = RenameController(&aw, &ae, &ap);
+                [ac showWindow:nil]; [ae drain];
+                NSWindow *windowIdentity = ac.window;
+                YMRenameMenuItem *alreadyItem = [YMRenameMenuItem new];
+                alreadyItem.representedObject = ap;
+                [ac renameManagedDisplayFromMenu:(NSMenuItem *)(id)alreadyItem];
+                [ae drain];
+                [ac.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                Expect(ac.panelPresenter.panelOpen && aw.visible && ac.saves == 0,
+                       "already-open cancel keeps panel open");
+                [ac renameManagedDisplayFromMenu:(NSMenuItem *)(id)alreadyItem];
+                [ae drain];
+                ac.lastRenameAlert.accessoryView.stringValue = @"AlreadyOpen";
+                [ac.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                Expect(ac.saves == 1 && [ap.friendlyName isEqual:@"AlreadyOpen"]
+                       && ac.panelPresenter.panelOpen && aw.visible && ac.window == windowIdentity,
+                       "already-open save keeps same panel identity");
+                NSUInteger hidesBefore = ae.hides;
+                [ac windowShouldClose:ac.window]; [ae drain];
+                Expect(!aw.visible && !ac.panelPresenter.panelOpen && ae.hides == hidesBefore + 1
+                       && ac.window == windowIdentity,
+                       "already-open path closes once without changing window identity");
+                [ac.panelPresenter invalidate];
+                [ae.pending removeAllObjects];
+                [ae.settling removeAllObjects];
+            }
+        }
+    rename_tests_done:
 
         Expect(NSApp == nil,"all controller tests leave NSApplication uninitialized");
         printf("Controller boundary tests: %lu passed, %lu failed; no GUI or display calls executed.\n",(unsigned long)(Tests-Failures),(unsigned long)Failures);
