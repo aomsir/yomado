@@ -194,6 +194,8 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 - (NSArray<NSScreen *> *)workspaceScreens;
 - (void)invalidateInventoryForMutation;
 - (BOOL)displayStillCurrent:(NSDictionary *)display;
+- (NSDictionary *)liveDisplayStateForID:(CGDirectDisplayID)ID;
+- (BOOL)displayMatchesLiveTopology:(NSDictionary *)display;
 @end
 
 @interface YMWorkspaceFixture : YMAppWorkspace
@@ -202,7 +204,7 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 @property(nonatomic) NSTimeInterval clock;
 @property(nonatomic) NSUInteger scheduleCount;
 @property(nonatomic, strong) NSArray *fakeScreens;
-@property(nonatomic) BOOL displayCurrent;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSDictionary *> *liveDisplayStates;
 @end
 
 @implementation YMWorkspaceFixture
@@ -212,8 +214,8 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
     _pendingReads = [NSMutableArray array];
     _pendingPublishes = [NSMutableArray array];
     _clock = 1000;
-    _displayCurrent = YES;
     _fakeScreens = @[];
+    _liveDisplayStates = [NSMutableDictionary dictionary];
     return self;
 }
 
@@ -230,9 +232,22 @@ static NSDictionary *Identity(pid_t pid, CGWindowID windowID) {
 
 - (NSArray<NSScreen *> *)workspaceScreens { return self.fakeScreens ?: @[]; }
 
-- (BOOL)displayStillCurrent:(NSDictionary *)display {
-    (void)display;
-    return self.displayCurrent;
+- (NSDictionary *)liveDisplayStateForID:(CGDirectDisplayID)ID {
+    NSDictionary *override = self.liveDisplayStates[@(ID)];
+    if (override) return override;
+    // Default: mirror cached snapshot so inventory/move guards run production
+    // comparison without touching CG/NSScreen.
+    for (NSDictionary *display in [self valueForKey:@"displays"]) {
+        if ([display[@"displayID"] unsignedIntValue] != ID) continue;
+        return @{
+            @"isActive": display[@"isActive"] ?: @NO,
+            @"isOnline": display[@"isOnline"] ?: @NO,
+            @"isInMirrorSet": @NO,
+            @"mirrorsDisplay": @(kCGNullDirectDisplay),
+            @"bounds": display[@"bounds"]
+        };
+    }
+    return nil;
 }
 
 - (void)advanceClock:(NSTimeInterval)delta { self.clock += delta; }
@@ -635,12 +650,105 @@ int main(void) {
                                         origin:origin lastDisplayID:8];
             [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:displays];
             Check(workspace.pendingReads.count == 1, @"topology probe schedules one job");
-            workspace.displayCurrent = NO; // topology moved; manager not refreshed yet
+            // Inject a real bounds drift on the physical screen — production
+            // comparison must reject without a blunt displayStillCurrent override.
+            workspace.liveDisplayStates[@5] = @{
+                @"isActive": @YES, @"isOnline": @YES,
+                @"isInMirrorSet": @NO, @"mirrorsDisplay": @(kCGNullDirectDisplay),
+                @"bounds": Frame(99, 0, 2560, 1440)
+            };
             [workspace drainReads];
             Check(!workspace.inventoryReady,
                   @"stale topology must not publish ready without manager refresh");
             Check([[workspace valueForKey:@"placements"] count] == 1,
                   @"stale topology must not retire checkpoints");
+        }
+
+        // --- Fix4 / P2: stable inactive-online must not block inventory ready ---
+        {
+            NSArray *withInactive = @[
+                RuntimeDisplay(5, 0, NO, @"physical"),
+                @{@"displayID": @7, @"displayUUID": @"sidecar-inactive",
+                  @"bounds": Frame(7680, 0, 1920, 1080), @"isMain": @NO,
+                  @"isActive": @NO, @"isOnline": @YES, @"isVirtual": @NO},
+                RuntimeDisplay(8, 2560, YES, @"agent-a"),
+                RuntimeDisplay(9, 5120, YES, @"agent-b")
+            ];
+            {
+                YMFakeWindowAccess *access = nil;
+                YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+                [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:withInactive];
+                [workspace drainReads];
+                Check(workspace.inventoryReady,
+                      @"stable inactive online display must not block inventory ready");
+                Check([[workspace rowsForDisplayID:5] count] == 1,
+                      @"active virtual inventory still publishes with inactive sidecar");
+                NSDictionary *inactive = nil;
+                for (NSDictionary *display in [workspace valueForKey:@"displays"]) {
+                    if ([display[@"displayID"] unsignedIntValue] == 7) { inactive = display; break; }
+                }
+                Check(inactive != nil, @"inactive sidecar remains in cached displays");
+                Check(![workspace displayStillCurrent:inactive],
+                      @"displayStillCurrent must still reject inactive move targets");
+                Check([workspace displayMatchesLiveTopology:inactive],
+                      @"inventory topology match allows stable inactive online");
+            }
+            // Inject drift before publish so production comparison rejects (same-key
+            // TTL reuse would skip a post-ready refresh).
+            {
+                YMFakeWindowAccess *access = nil;
+                YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+                [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:withInactive];
+                workspace.liveDisplayStates[@7] = @{
+                    @"isActive": @YES, @"isOnline": @YES,
+                    @"isInMirrorSet": @NO, @"mirrorsDisplay": @(kCGNullDirectDisplay),
+                    @"bounds": Frame(7680, 0, 1920, 1080)
+                };
+                [workspace drainReads];
+                Check(!workspace.inventoryReady,
+                      @"inactive→active live drift must refuse inventory publish");
+                Check([workspace needsRestoreForDisplayID:8],
+                      @"topology drift keeps needsRestore / blocks empty close");
+            }
+            {
+                YMFakeWindowAccess *access = nil;
+                YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+                [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:withInactive];
+                workspace.liveDisplayStates[@8] = @{
+                    @"isActive": @YES, @"isOnline": @NO,
+                    @"isInMirrorSet": @NO, @"mirrorsDisplay": @(kCGNullDirectDisplay),
+                    @"bounds": Frame(2560, 0, 2560, 1440)
+                };
+                [workspace drainReads];
+                Check(!workspace.inventoryReady,
+                      @"owned display online→offline drift must refuse inventory publish");
+            }
+            {
+                YMFakeWindowAccess *access = nil;
+                YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+                [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:withInactive];
+                workspace.liveDisplayStates[@8] = @{
+                    @"isActive": @YES, @"isOnline": @YES,
+                    @"isInMirrorSet": @YES, @"mirrorsDisplay": @(5),
+                    @"bounds": Frame(2560, 0, 2560, 1440)
+                };
+                [workspace drainReads];
+                Check(!workspace.inventoryReady,
+                      @"owned display mirror drift must refuse inventory publish");
+            }
+            {
+                YMFakeWindowAccess *access = nil;
+                YMWorkspaceFixture *workspace = FixtureWithThumbnail(&access);
+                [workspace refreshWithVirtualDisplayIDs:@[@8] displaySnapshot:withInactive];
+                workspace.liveDisplayStates[@5] = @{
+                    @"isActive": @YES, @"isOnline": @YES,
+                    @"isInMirrorSet": @NO, @"mirrorsDisplay": @(kCGNullDirectDisplay),
+                    @"bounds": Frame(10, 0, 2560, 1440)
+                };
+                [workspace drainReads];
+                Check(!workspace.inventoryReady,
+                      @"bounds drift must refuse inventory publish");
+            }
         }
 
         // --- Fix2 / Important 3: normalizer uses admitted app set ---

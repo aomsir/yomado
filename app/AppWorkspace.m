@@ -473,7 +473,9 @@ static BOOL YMWOrdinaryWindow(id element) {
     NSString *liveCGSignature = [self normalizedCGSignature:liveCG];
     BOOL topologyCurrent = YES;
     for (NSDictionary *display in self.displays) {
-        if (![self displayStillCurrent:display]) { topologyCurrent = NO; break; }
+        // Inventory requires live topology to match the cached snapshot, including
+        // stable inactive-online entries. Move targets still use displayStillCurrent:.
+        if (![self displayMatchesLiveTopology:display]) { topologyCurrent = NO; break; }
     }
     if (!topologyCurrent) {
         // Cached self.displays no longer match live topology. Do not publish,
@@ -705,14 +707,46 @@ static BOOL YMWOrdinaryWindow(id element) {
     }
     return result;
 }
-- (BOOL)displayStillCurrent:(NSDictionary *)display {
-    CGDirectDisplayID ID = [display[@"displayID"] unsignedIntValue];
-    if (!YMWorkspaceUsableDisplay(display) || !CGDisplayIsActive(ID) || !CGDisplayIsOnline(ID)) return NO;
-    if ([self.ownedIDs containsObject:@(ID)] &&
-        (CGDisplayIsInMirrorSet(ID) || CGDisplayMirrorsDisplay(ID) != kCGNullDirectDisplay)) return NO;
+- (NSDictionary *)liveDisplayStateForID:(CGDirectDisplayID)ID {
+    if (!ID) return nil;
     CGRect rect = CGDisplayBounds(ID);
-    return YMWorkspaceSameFrame(display[@"bounds"], @{@"x": @(rect.origin.x), @"y": @(rect.origin.y),
-        @"width": @(rect.size.width), @"height": @(rect.size.height)});
+    return @{
+        @"isActive": @(CGDisplayIsActive(ID)),
+        @"isOnline": @(CGDisplayIsOnline(ID)),
+        @"isInMirrorSet": @(CGDisplayIsInMirrorSet(ID)),
+        @"mirrorsDisplay": @(CGDisplayMirrorsDisplay(ID)),
+        @"bounds": @{@"x": @(rect.origin.x), @"y": @(rect.origin.y),
+                     @"width": @(rect.size.width), @"height": @(rect.size.height)}
+    };
+}
+- (BOOL)displayMatchesLiveTopology:(NSDictionary *)display {
+    if (![display isKindOfClass:NSDictionary.class]) return NO;
+    CGDirectDisplayID ID = [display[@"displayID"] unsignedIntValue];
+    NSDictionary *bounds = YMWorkspaceGeometry(display[@"bounds"]);
+    if (!ID || !bounds ||
+        ![display[@"isActive"] isKindOfClass:NSNumber.class] ||
+        ![display[@"isOnline"] isKindOfClass:NSNumber.class]) return NO;
+    NSDictionary *live = [self liveDisplayStateForID:ID];
+    if (!live) return NO;
+    if ([display[@"isActive"] boolValue] != [live[@"isActive"] boolValue]) return NO;
+    if ([display[@"isOnline"] boolValue] != [live[@"isOnline"] boolValue]) return NO;
+    if ([self.ownedIDs containsObject:@(ID)]) {
+        CGDirectDisplayID mirrors = [live[@"mirrorsDisplay"] unsignedIntValue];
+        if ([live[@"isInMirrorSet"] boolValue] || mirrors != kCGNullDirectDisplay) return NO;
+    }
+    return YMWorkspaceSameFrame(bounds, live[@"bounds"]);
+}
+- (BOOL)displayStillCurrent:(NSDictionary *)display {
+    // Strict write-target guard: snapshot entry must already be usable (active+online).
+    if (!YMWorkspaceUsableDisplay(display)) return NO;
+    NSDictionary *live = [self liveDisplayStateForID:[display[@"displayID"] unsignedIntValue]];
+    if (!live || ![live[@"isActive"] boolValue] || ![live[@"isOnline"] boolValue]) return NO;
+    CGDirectDisplayID ID = [display[@"displayID"] unsignedIntValue];
+    if ([self.ownedIDs containsObject:@(ID)]) {
+        CGDirectDisplayID mirrors = [live[@"mirrorsDisplay"] unsignedIntValue];
+        if ([live[@"isInMirrorSet"] boolValue] || mirrors != kCGNullDirectDisplay) return NO;
+    }
+    return YMWorkspaceSameFrame(display[@"bounds"], live[@"bounds"]);
 }
 - (BOOL)placeElement:(id)element frame:(NSDictionary *)frame display:(NSDictionary *)display application:(NSRunningApplication *)app {
     pid_t PID = 0; AXUIElementRef ref = YMWElement(element);
