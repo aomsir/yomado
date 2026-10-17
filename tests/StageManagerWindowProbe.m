@@ -121,6 +121,8 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
     ProbeFixtureDuplicateCG,
     ProbeFixtureTargetMissing,
     ProbeFixtureTargetEqualsSource,
+    ProbeFixtureIdentityChangedAfterWrite,
+    ProbeFixtureAmbiguousCGAfterWrite,
 };
 
 @interface ProbeFixture : NSObject <ProbeBackend>
@@ -134,6 +136,9 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
 @property(nonatomic, copy) NSArray<NSDictionary *> *records;
 @property(nonatomic) CGDirectDisplayID targetID;
 @property(nonatomic) BOOL changeIdentityBeforeWrite;
+@property(nonatomic) BOOL changeIdentityAfterWrite;
+@property(nonatomic) BOOL identityMutated;
+@property(nonatomic) BOOL duplicateCGAfterWrite;
 @property(nonatomic) BOOL keepOffTargetAfterWrite;
 @property(nonatomic) BOOL keepOffOriginAfterRestore;
 @end
@@ -176,6 +181,12 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
         case ProbeFixtureTargetEqualsSource:
             f.targetID = 1;
             break;
+        case ProbeFixtureIdentityChangedAfterWrite:
+            f.changeIdentityAfterWrite = YES;
+            break;
+        case ProbeFixtureAmbiguousCGAfterWrite:
+            f.duplicateCGAfterWrite = YES;
+            break;
         case ProbeFixtureNormal:
             break;
     }
@@ -183,6 +194,8 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
 }
 - (NSDictionary *)identity {
     self.identityReads++;
+    if (self.identityMutated)
+        return ProbeIdentity(4242, 100, @"com.apple.calculator.changed");
     if (self.changeIdentityBeforeWrite && self.identityReads > 1)
         return ProbeIdentity(4242, 100, @"com.apple.calculator.changed");
     return self.stableIdentity;
@@ -210,6 +223,17 @@ typedef NS_ENUM(NSInteger, ProbeFixtureKind) {
         return YES;
     }
     self.currentFrame = next;
+    if (!restoring) {
+        if (self.changeIdentityAfterWrite) self.identityMutated = YES;
+        if (self.duplicateCGAfterWrite) {
+            self.records = @[
+                @{@"pid": @4242, @"windowID": @100, @"frame": ProbeFrame(15, 500, 37, 102),
+                  @"layer": @0, @"onscreen": @YES, @"alpha": @1.0},
+                @{@"pid": @4242, @"windowID": @100, @"frame": ProbeFrame(20, 520, 40, 90),
+                  @"layer": @0, @"onscreen": @YES, @"alpha": @1.0}
+            ];
+        }
+    }
     return YES;
 }
 @end
@@ -260,12 +284,14 @@ static ProbeResult RunProbeWithMode(NSString *mode, id<ProbeBackend> backend) {
     result.writes++;
 
     result.destinationVerified = ProbeObserve(backend, ^{
+        if (![[backend identity] isEqual:identity]) return NO;
+        NSArray *matches = ProbeMatchingRecords([backend visibleWindowRecords], identity);
+        if (matches.count != 1) return NO;
         NSDictionary *frame = YMWorkspaceGeometry([backend frame]);
         NSDictionary *target = ProbeFindDisplay([backend displaySnapshot], targetID);
         return ProbeFrameOnTarget(frame, target);
     });
 
-    result.restoreAttempts = 1;
     liveIdentity = [backend identity];
     liveDisplays = [backend displaySnapshot] ?: @[];
     result.displayTopologyUnchanged = ProbeDisplaysEqual(displays, liveDisplays);
@@ -274,11 +300,15 @@ static ProbeResult RunProbeWithMode(NSString *mode, id<ProbeBackend> backend) {
         return result;
     }
 
+    result.restoreAttempts = 1;
     CGPoint originPoint = CGPointMake([originalFrame[@"x"] doubleValue], [originalFrame[@"y"] doubleValue]);
     if ([backend writePosition:originPoint expectedIdentity:identity]) result.writes++;
     else return result;
 
     result.originRestored = ProbeObserve(backend, ^{
+        if (![[backend identity] isEqual:identity]) return NO;
+        NSArray *matches = ProbeMatchingRecords([backend visibleWindowRecords], identity);
+        if (matches.count != 1) return NO;
         return YMWorkspaceSameFrame(YMWorkspaceGeometry([backend frame]), originalFrame);
     });
     liveIdentity = [backend identity];
@@ -579,7 +609,8 @@ static void RunSelfTests(void) {
           @"identity changed before mutation refuses the probe");
 
     ProbeFixture *failedDestination = [ProbeFixture fixture:ProbeFixtureFailedDestination];
-    Check(RunProbeWithMode(@"--move-and-return", failedDestination).restoreAttempts == 1,
+    ProbeResult failedDestinationResult = RunProbeWithMode(@"--move-and-return", failedDestination);
+    Check(failedDestinationResult.restoreAttempts == 1 && failedDestinationResult.writes == 2,
           @"failed destination still makes one guarded origin restore attempt");
 
     ProbeFixture *failedRestore = [ProbeFixture fixture:ProbeFixtureFailedRestore];
@@ -601,6 +632,17 @@ static void RunSelfTests(void) {
     ProbeFixture *sameDisplay = [ProbeFixture fixture:ProbeFixtureTargetEqualsSource];
     Check(RunProbeWithMode(@"--move-and-return", sameDisplay).writes == 0,
           @"target equal to source refuses writes");
+
+    ProbeResult identityAfterWrite = RunProbeWithMode(
+        @"--move-and-return", [ProbeFixture fixture:ProbeFixtureIdentityChangedAfterWrite]);
+    Check(identityAfterWrite.writes == 1 && identityAfterWrite.restoreAttempts == 0 &&
+              !identityAfterWrite.passed,
+          @"identity change after first write refuses restore and does not count a restore attempt");
+
+    ProbeResult ambiguousCG = RunProbeWithMode(
+        @"--move-and-return", [ProbeFixture fixture:ProbeFixtureAmbiguousCGAfterWrite]);
+    Check(!ambiguousCG.destinationVerified && !ambiguousCG.passed,
+          @"ambiguous CG identity after write cannot verify destination");
 
     ProbeResult success = RunProbeWithMode(@"--move-and-return", [ProbeFixture fixture:ProbeFixtureNormal]);
     Check(success.passed && success.destinationVerified && success.originRestored &&
