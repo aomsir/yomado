@@ -68,8 +68,11 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     self.messageLabel.textColor = NSColor.systemRedColor;
     self.messageLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.messageLabel.hidden = YES;
+    self.messageLabel.maximumNumberOfLines = 0;
     [self.messageLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
                                                 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.messageLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired
+                                                forOrientation:NSLayoutConstraintOrientationVertical];
 
     self.textStack = [[NSStackView alloc] init];
     self.textStack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -115,14 +118,22 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     [actions setContentCompressionResistancePriority:NSLayoutPriorityRequired
                                       forOrientation:NSLayoutConstraintOrientationHorizontal];
 
+    NSView *spacer = [[NSView alloc] initWithFrame:NSZeroRect];
+    spacer.translatesAutoresizingMaskIntoConstraints = NO;
+    [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [spacer setContentCompressionResistancePriority:1
+                                     forOrientation:NSLayoutConstraintOrientationHorizontal];
+
     NSStackView *root = [[NSStackView alloc] init];
     root.translatesAutoresizingMaskIntoConstraints = NO;
     root.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     root.alignment = NSLayoutAttributeCenterY;
+    root.distribution = NSStackViewDistributionFill;
     root.spacing = 10;
     root.edgeInsets = NSEdgeInsetsMake(8, 4, 8, 4);
     [root addArrangedSubview:self.iconView];
     [root addArrangedSubview:self.textStack];
+    [root addArrangedSubview:spacer];
     [root addArrangedSubview:actions];
     [self addSubview:root];
 
@@ -138,6 +149,15 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     return self;
 }
 
+- (void)layout {
+    [super layout];
+    CGFloat textWidth = NSWidth(self.textStack.bounds);
+    if (textWidth > 1) {
+        self.messageLabel.preferredMaxLayoutWidth = textWidth;
+        self.nameLabel.preferredMaxLayoutWidth = textWidth;
+    }
+}
+
 - (void)applyRow:(YMSavedDisplayProfileRow *)row {
     NSString *name = row.name ?: @"";
     self.nameLabel.stringValue = name;
@@ -147,6 +167,11 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     BOOL hasMessage = row.message.length > 0;
     self.messageLabel.stringValue = row.message ?: @"";
     self.messageLabel.hidden = !hasMessage;
+    if (hasMessage) {
+        CGFloat textWidth = NSWidth(self.textStack.bounds);
+        if (textWidth < 1) textWidth = 400;
+        self.messageLabel.preferredMaxLayoutWidth = textWidth;
+    }
 
     self.editButton.tag = (NSInteger)row.ordinal;
     self.startButton.tag = (NSInteger)row.ordinal;
@@ -339,8 +364,8 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
         if (currentIndex == NSNotFound) {
             [self.rowsStack insertArrangedSubview:rowView atIndex:index];
         } else if (currentIndex != index) {
+            // Keep the view in the hierarchy so widthAnchor to rowsStack survives reorder.
             [self.rowsStack removeArrangedSubview:rowView];
-            [rowView removeFromSuperview];
             [self.rowsStack insertArrangedSubview:rowView atIndex:index];
         }
         if (created) {

@@ -279,6 +279,146 @@ static void AssertRowLayout(YMSavedDisplayProfilesView *view, const char *scenar
     }
 }
 
+static NSWindow *SavedListWindow(CGFloat width) {
+    NSWindow *window = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, width, 400)
+                  styleMask:NSWindowStyleMaskBorderless
+                    backing:NSBackingStoreBuffered
+                      defer:YES];
+    return window;
+}
+
+static YMSavedDisplayProfilesView *EmbedSavedList(NSWindow *window) {
+    YMSavedDisplayProfilesView *view = [[YMSavedDisplayProfilesView alloc] initWithFrame:NSZeroRect];
+    view.translatesAutoresizingMaskIntoConstraints = NO;
+    [window.contentView addSubview:view];
+    [NSLayoutConstraint activateConstraints:@[
+        [view.leadingAnchor constraintEqualToAnchor:window.contentView.leadingAnchor constant:20],
+        [view.trailingAnchor constraintEqualToAnchor:window.contentView.trailingAnchor constant:-20],
+        [view.topAnchor constraintEqualToAnchor:window.contentView.topAnchor constant:20],
+        [view.heightAnchor constraintGreaterThanOrEqualToConstant:220]
+    ]];
+    return view;
+}
+
+static void AssertViewportHeight(YMSavedDisplayProfilesView *view, CGFloat minH, CGFloat maxH,
+                                 const char *scenario) {
+    CGFloat height = NSHeight(view.scrollView.frame);
+    Check(height + 0.5 >= minH && height - 0.5 <= maxH, scenario);
+}
+
+static BOOL RowHasActiveWidthConstraint(YMSavedDisplayProfilesView *view,
+                                        YMSavedDisplayProfileRowView *row) {
+    for (NSLayoutConstraint *constraint in view.rowsStack.constraints) {
+        if ((constraint.firstItem == row || constraint.secondItem == row) &&
+            constraint.firstAttribute == NSLayoutAttributeWidth &&
+            constraint.secondAttribute == NSLayoutAttributeWidth &&
+            constraint.active) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void AssertButtonsPinnedTrailing(YMSavedDisplayProfilesView *view, const char *scenario) {
+    CGFloat stackWidth = NSWidth(view.rowsStack.bounds);
+    Check(stackWidth > 200, "rows stack has usable width");
+    for (YMSavedDisplayProfileRowView *row in view.rowsByOrdinal.allValues) {
+        Check(fabs(NSWidth(row.bounds) - stackWidth) < 1.0, scenario);
+        Check(RowHasActiveWidthConstraint(view, row), "row keeps width constraint to stack");
+        NSRect startInStack = [row.startButton convertRect:row.startButton.bounds toView:view.rowsStack];
+        Check(stackWidth - NSMaxX(startInStack) < 12.0, "start button stays trailing after layout");
+    }
+}
+
+static void AssertVisibleRowButtonsReachable(YMSavedDisplayProfilesView *view, const char *scenario) {
+    NSRect visible = view.scrollView.documentVisibleRect;
+    for (YMSavedDisplayProfileRowView *row in view.rowsByOrdinal.allValues) {
+        NSRect rowInDoc = [row convertRect:row.bounds toView:view.scrollView.documentView];
+        // Only fully visible rows: partially clipped rows may hide vertically-centered buttons.
+        if (!NSContainsRect(visible, rowInDoc)) continue;
+        NSRect startInDoc = [row.startButton convertRect:row.startButton.bounds
+                                                  toView:view.scrollView.documentView];
+        NSRect editInDoc = [row.editButton convertRect:row.editButton.bounds
+                                                toView:view.scrollView.documentView];
+        Check(NSContainsRect(visible, startInDoc), scenario);
+        Check(NSContainsRect(visible, editInDoc), scenario);
+        Check(NSContainsRect(rowInDoc, startInDoc), "start button stays inside visible row");
+        Check(NSContainsRect(rowInDoc, editInDoc), "edit button stays inside visible row");
+    }
+}
+
+static void SavedRowsReorderKeepsWidth(void) {
+    NSWindow *window = SavedListWindow(760);
+    YMSavedDisplayProfilesView *view = EmbedSavedList(window);
+    [view updateRows:@[Row(1, @"Alpha Profile With A Long Name", YES),
+                       Row(2, @"Beta Profile With A Long Name", YES)]
+        revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    AssertButtonsPinnedTrailing(view, "initial order fills row width");
+    YMSavedDisplayProfileRowView *first = view.rowsByOrdinal[@1];
+    [view updateRows:@[Row(2, @"Beta Profile With A Long Name", YES),
+                       Row(1, @"Alpha Profile With A Long Name", YES)]
+        revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(view.rowsByOrdinal[@1] == first, "reorder keeps row identity");
+    AssertButtonsPinnedTrailing(view, "reorder keeps row width and trailing actions");
+    AssertRowLayout(view, "reorder layout 760pt");
+}
+
+static void SavedRowsViewportRange(void) {
+    NSWindow *window = SavedListWindow(760);
+    YMSavedDisplayProfilesView *view = EmbedSavedList(window);
+
+    [view updateRows:@[Row(1, @"Only", YES)] revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    AssertViewportHeight(view, 56, 56, "one row viewport is 56pt");
+    AssertVisibleRowButtonsReachable(view, "one row action buttons visible");
+
+    [view updateRows:@[Row(1, @"One", YES), Row(2, @"Two", YES)] revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    CGFloat twoHeight = NSHeight(view.scrollView.frame);
+    Check(twoHeight > 56 + 0.5 && twoHeight < 184 - 0.5, "two rows use natural height inside 56…184");
+    AssertViewportHeight(view, 56, 184, "two rows viewport stays in 56…184");
+
+    [view updateRows:@[Row(1, @"One", YES), Row(2, @"Two", YES), Row(3, @"Three", YES)]
+        revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    CGFloat threeHeight = NSHeight(view.scrollView.frame);
+    Check(threeHeight > twoHeight + 0.5, "three rows grow above two-row height");
+    AssertViewportHeight(view, 56, 184, "three rows viewport stays in 56…184");
+
+    NSString *errorMessage =
+        @"启动失败：显示拓扑暂时不可用，请稍后重试。详细原因已写入日志，可再次点击启动。";
+    YMSavedDisplayProfileRow *errorRow =
+        [[YMSavedDisplayProfileRow alloc] initWithOrdinal:1 name:@"Error Only"
+            detail:@"1920 × 1080" message:errorMessage starting:NO canStart:YES canEdit:YES];
+    [view updateRows:@[errorRow] revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    CGFloat errorHeight = NSHeight(view.scrollView.frame);
+    Check(errorHeight > 56 + 0.5, "error row grows viewport above base row height");
+    AssertViewportHeight(view, 56, 184, "error row viewport stays in 56…184");
+    AssertVisibleRowButtonsReachable(view, "error row action buttons visible");
+
+    NSMutableArray<YMSavedDisplayProfileRow *> *many = [NSMutableArray array];
+    for (NSUInteger index = 1; index <= 30; index++) {
+        [many addObject:Row(index, [NSString stringWithFormat:@"P%lu", (unsigned long)index], YES)];
+    }
+    [view updateRows:many revealOrdinal:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    AssertViewportHeight(view, 184, 184, "long list clamps viewport to 184pt");
+    AssertVisibleRowButtonsReachable(view, "long list visible rows keep action buttons reachable");
+
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(view.collapsed && view.scrollView.hidden, "collapse hides viewport");
+    [view toggleCollapsed:nil];
+    [window.contentView layoutSubtreeIfNeeded];
+    Check(!view.collapsed && !view.scrollView.hidden, "expand shows viewport");
+    AssertViewportHeight(view, 184, 184, "re-expand restores clamped long-list viewport");
+    AssertVisibleRowButtonsReachable(view, "re-expand keeps visible action buttons reachable");
+}
+
 static void SavedRowsCollapseScrollAndLayout(void) {
     NSMutableArray<YMSavedDisplayProfileRow *> *rows = [NSMutableArray array];
     NSString *longName = [@"N" stringByPaddingToLength:60 withString:@"x" startingAtIndex:0];
@@ -368,6 +508,10 @@ int main(void) {
         printf("PASS saved rows use identity\n");
         SavedRowsCollapseScrollAndLayout();
         printf("PASS saved rows collapse scroll and layout\n");
+        SavedRowsReorderKeepsWidth();
+        printf("PASS saved rows reorder keeps width\n");
+        SavedRowsViewportRange();
+        printf("PASS saved rows viewport range\n");
         return 0;
     }
 }
