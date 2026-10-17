@@ -38,6 +38,7 @@ static id AXSize(CGSize size) {
 - (NSDictionary *)identityForElement:(id)element;
 - (BOOL)writeAttribute:(CFStringRef)attribute value:(id)value element:(id)element;
 - (NSTimeInterval)monotonicTime;
+- (nullable NSArray<NSDictionary *> *)whitelistedWindowsFromCGEntries:(NSArray *)raw;
 @end
 
 @interface YMAccessAppStub : NSObject
@@ -67,6 +68,7 @@ static id AXSize(CGSize size) {
 @property(nonatomic) NSUInteger attributeCalls;
 @property(nonatomic) BOOL terminateAfterWindows;
 @property(nonatomic, strong) NSMutableArray *visibleOverride;
+@property(nonatomic, copy) void (^duringIdentity)(YMAccessFixture *fixture, id element);
 @end
 
 @implementation YMAccessFixture
@@ -157,6 +159,11 @@ static id AXSize(CGSize size) {
 }
 
 - (NSDictionary *)identityForElement:(id)element {
+    if (self.duringIdentity) {
+        void (^hook)(YMAccessFixture *, id) = self.duringIdentity;
+        self.duringIdentity = nil;
+        hook(self, element);
+    }
     self.clock += self.clockStep;
     if (self.application.terminated) return nil;
     NSString *key = [NSString stringWithFormat:@"%p", element];
@@ -322,6 +329,141 @@ int main(void) {
         bad.failAttribute = YES;
         bad.failAttributeName = (__bridge NSString *)kAXMinimizedAttribute;
         Check([bad observeElement:bad.element] == nil, @"observeElement fails closed on missing minimized");
+
+        // Last identity read past deadline must not report complete success.
+        YMAccessFixture *lastRead = OrdinaryFixture();
+        lastRead.clockStep = 0.02;
+        NSDictionary *lastTimed = [lastRead observeApplication:(id)lastRead.application deadline:0.17];
+        Check(![lastTimed[@"complete"] boolValue], @"final identity past deadline is incomplete");
+        Check([lastTimed[@"windows"] count] == 1, @"final identity timeout retains the read window");
+        Check([lastTimed[@"reason"] isEqual:@"timeout"], @"final identity timeout reports timeout");
+
+        // Empty enumeration that already exhausted the budget is incomplete.
+        YMAccessFixture *emptyTimed = [YMAccessFixture new];
+        emptyTimed.clockStep = 0.1;
+        NSDictionary *emptyPast = [emptyTimed observeApplication:(id)emptyTimed.application deadline:0.05];
+        Check(![emptyPast[@"complete"] boolValue], @"empty enumeration past deadline is incomplete");
+        Check([emptyPast[@"reason"] isEqual:@"timeout"], @"empty enumeration past deadline reports timeout");
+
+        // Nested observeElement / writers must not clear an outer observe budget.
+        YMAccessFixture *nested = OrdinaryFixture();
+        id nestedSecond = @"window-nested-second";
+        [nested installOrdinaryWindow:nestedSecond identity:Identity(4242, 1492, 1000)
+                                frame:Frame(10, 10, 200, 200)];
+        nested.clockStep = 0.02;
+        NSDictionary *nestedIdentity = Identity(4242, 1490, 1000);
+        nested.duringIdentity = ^(YMAccessFixture *fixture, id element) {
+            (void)element;
+            [fixture observeElement:fixture.element];
+            [fixture setPosition:CGPointMake(1, 2) element:fixture.element expectedIdentity:nestedIdentity];
+            [fixture setSize:CGSizeMake(3, 4) element:fixture.element expectedIdentity:nestedIdentity];
+        };
+        NSDictionary *nestedObs = [nested observeApplication:(id)nested.application deadline:0.18];
+        Check(![nestedObs[@"complete"] boolValue], @"nested writers do not clear outer budget");
+        Check([nestedObs[@"windows"] count] == 1, @"outer budget still stops later windows");
+
+        // Nested observeApplication with its own deadline must not drop the outer budget.
+        YMAccessFixture *nestedObsApp = OrdinaryFixture();
+        id nestedObsSecond = @"window-nested-obs-second";
+        [nestedObsApp installOrdinaryWindow:nestedObsSecond identity:Identity(4242, 1494, 1000)
+                                      frame:Frame(10, 10, 200, 200)];
+        nestedObsApp.clockStep = 0.02;
+        __block NSDictionary *innerAppObs = nil;
+        nestedObsApp.duringIdentity = ^(YMAccessFixture *fixture, id element) {
+            (void)element;
+            innerAppObs = [fixture observeApplication:(id)fixture.application deadline:fixture.clock];
+        };
+        NSDictionary *outerAppObs =
+            [nestedObsApp observeApplication:(id)nestedObsApp.application deadline:0.18];
+        Check(![innerAppObs[@"complete"] boolValue], @"inner observeApplication uses its own deadline");
+        Check(![outerAppObs[@"complete"] boolValue], @"outer observeApplication keeps its deadline");
+        Check([outerAppObs[@"windows"] count] == 1, @"outer deadline still stops later windows");
+
+        // Controllable same-instance interleaving across threads (no sleep / no native lock).
+        YMAccessFixture *shared = OrdinaryFixture();
+        id sharedSecond = @"window-shared-second";
+        [shared installOrdinaryWindow:sharedSecond identity:Identity(4242, 1493, 1000)
+                                frame:Frame(10, 10, 200, 200)];
+        shared.clockStep = 0.02;
+        dispatch_queue_t bg = dispatch_queue_create("ym.access.budget", DISPATCH_QUEUE_SERIAL);
+        dispatch_semaphore_t atHook = dispatch_semaphore_create(0);
+        dispatch_semaphore_t resume = dispatch_semaphore_create(0);
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        __block NSDictionary *bgObs = nil;
+        shared.duringIdentity = ^(YMAccessFixture *fixture, id element) {
+            (void)fixture;
+            (void)element;
+            dispatch_semaphore_signal(atHook);
+            dispatch_semaphore_wait(resume, DISPATCH_TIME_FOREVER);
+        };
+        dispatch_async(bg, ^{
+            bgObs = [shared observeApplication:(id)shared.application deadline:0.18];
+            dispatch_semaphore_signal(done);
+        });
+        dispatch_semaphore_wait(atHook, DISPATCH_TIME_FOREVER);
+        [shared observeElement:shared.element];
+        [shared setPosition:CGPointMake(9, 9) element:shared.element
+           expectedIdentity:Identity(4242, 1490, 1000)];
+        [shared setSize:CGSizeMake(5, 5) element:shared.element
+       expectedIdentity:Identity(4242, 1490, 1000)];
+        dispatch_semaphore_signal(resume);
+        dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+        Check(![bgObs[@"complete"] boolValue], @"concurrent calls do not clear background budget");
+        Check([bgObs[@"windows"] count] == 1, @"background budget still stops later windows");
+
+        // Production CG whitelist: unknown fields fail closed; titles never retained.
+        YMSystemWorkspaceWindowAccess *cgAccess = [YMSystemWorkspaceWindowAccess new];
+        NSString *boundsKey = (__bridge NSString *)kCGWindowBounds;
+        NSString *pidKey = (__bridge NSString *)kCGWindowOwnerPID;
+        NSString *idKey = (__bridge NSString *)kCGWindowNumber;
+        NSString *layerKey = (__bridge NSString *)kCGWindowLayer;
+        NSString *onScreenKey = (__bridge NSString *)kCGWindowIsOnscreen;
+        NSString *alphaKey = (__bridge NSString *)kCGWindowAlpha;
+        NSString *nameKey = (__bridge NSString *)kCGWindowName;
+        NSDictionary *rawMissingPresence = @{
+            pidKey: @4242, idKey: @1490, layerKey: @0,
+            boundsKey: @{@"X": @15, @"Y": @982, @"Width": @37, @"Height": @102},
+            nameKey: @"Secret Title"
+        };
+        NSArray *cleanedMissing = [cgAccess whitelistedWindowsFromCGEntries:@[rawMissingPresence]];
+        Check(cleanedMissing.count == 1, @"production CG keep records missing onScreen/alpha");
+        Check(cleanedMissing[0][@"onScreen"] == nil, @"missing onScreen is not defaulted invisible");
+        Check(cleanedMissing[0][@"alpha"] == nil, @"missing alpha is not defaulted invisible");
+        Check(cleanedMissing[0][nameKey] == nil, @"production CG never retains window titles");
+        Check(cleanedMissing[0][@"title"] == nil, @"production CG never invents title keys");
+        NSDictionary *normMissing = YMWorkspaceNormalizeWindowSnapshot(
+            cleanedMissing, @[], YES, @[]);
+        Check([normMissing[@"blockers"] count] > 0 || ![normMissing[@"complete"] boolValue],
+              @"missing presence fields fail closed via normalizer");
+        Check(!YMWorkspaceSnapshotAllowsSource(normMissing, nil),
+              @"missing presence fields refuse inventory close");
+
+        NSDictionary *rawBadBounds = @{
+            pidKey: @4242, idKey: @1491, layerKey: @0,
+            onScreenKey: @YES, alphaKey: @1,
+            boundsKey: @{@"X": @"bad", @"Y": @0, @"Width": @10, @"Height": @10}
+        };
+        NSArray *cleanedBadBounds = [cgAccess whitelistedWindowsFromCGEntries:@[rawBadBounds]];
+        Check(cleanedBadBounds.count == 1, @"illegal bounds keep a whitelist record");
+        Check(cleanedBadBounds[0][@"frame"] == nil, @"illegal bounds omit frame");
+        NSDictionary *normBadBounds = YMWorkspaceNormalizeWindowSnapshot(
+            cleanedBadBounds, @[], YES, @[]);
+        Check([normBadBounds[@"blockers"] count] > 0 || ![normBadBounds[@"complete"] boolValue],
+              @"illegal bounds fail closed rather than empty success");
+
+        NSDictionary *rawMissingPID = @{
+            idKey: @1492, layerKey: @0, onScreenKey: @YES, alphaKey: @1,
+            boundsKey: @{@"X": @0, @"Y": @0, @"Width": @10, @"Height": @10}
+        };
+        NSArray *cleanedMissingPID = [cgAccess whitelistedWindowsFromCGEntries:@[rawMissingPID]];
+        Check(cleanedMissingPID.count == 1, @"missing PID keeps a whitelist record");
+        NSDictionary *normMissingPID = YMWorkspaceNormalizeWindowSnapshot(
+            cleanedMissingPID, @[], YES, @[]);
+        Check(![normMissingPID[@"complete"] boolValue],
+              @"missing PID is incomplete observation not empty success");
+
+        Check([cgAccess whitelistedWindowsFromCGEntries:@[ @"not-a-dictionary" ]] == nil,
+              @"non-dictionary CG entries fail the query");
 
         if (failures) {
             fprintf(stderr, "%u of %u App workspace access checks failed.\n",

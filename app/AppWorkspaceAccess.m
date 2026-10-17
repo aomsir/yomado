@@ -7,45 +7,85 @@
 
 static const NSUInteger kYMWorkspaceMaxWindowsPerPID = 128;
 static const NSTimeInterval kYMWorkspaceAXCallCap = 0.1;
-
-@interface YMSystemWorkspaceWindowAccess ()
-@property(nonatomic) NSTimeInterval activeDeadline;
-@property(nonatomic) BOOL hasActiveDeadline;
-@end
+static NSString * const YMWorkspaceDeadlineStackKey = @"YMWorkspaceDeadlineStack";
 
 @implementation YMSystemWorkspaceWindowAccess
+
+- (NSMutableArray *)deadlineStack {
+    NSMutableDictionary *threadDictionary = NSThread.currentThread.threadDictionary;
+    NSMutableArray *stack = threadDictionary[YMWorkspaceDeadlineStackKey];
+    if (![stack isKindOfClass:NSMutableArray.class]) {
+        stack = [NSMutableArray array];
+        threadDictionary[YMWorkspaceDeadlineStackKey] = stack;
+    }
+    return stack;
+}
+
+- (void)pushDeadline:(NSTimeInterval)deadline {
+    [self.deadlineStack addObject:@(deadline)];
+}
+
+- (void)popDeadline {
+    NSMutableArray *stack = self.deadlineStack;
+    if (stack.count) [stack removeLastObject];
+}
+
+- (BOOL)hasActiveDeadline {
+    return self.deadlineStack.count > 0;
+}
+
+- (NSTimeInterval)activeDeadline {
+    return [self.deadlineStack.lastObject doubleValue];
+}
 
 - (BOOL)accessibilityTrusted {
     return AXIsProcessTrusted();
 }
 
-- (nullable NSArray<NSDictionary *> *)visibleWindows {
+- (nullable NSArray<NSDictionary *> *)whitelistedWindowsFromCGEntries:(NSArray *)raw {
     // CoreGraphics may include window titles; only this allowlist is retained.
-    NSArray *raw = CFBridgingRelease(CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    // Unknown / incomplete fields stay omitable so the normalizer can fail closed
+    // instead of treating drops or invisible defaults as a confirmed empty set.
     if (!raw) return nil;
     NSMutableArray *windows = [NSMutableArray array];
-    for (NSDictionary *entry in raw) {
-        if (![entry isKindOfClass:NSDictionary.class]) continue;
-        id bounds = entry[(__bridge NSString *)kCGWindowBounds];
-        CGRect rect;
-        if (![bounds isKindOfClass:NSDictionary.class] ||
-            !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)bounds, &rect)) continue;
-        NSDictionary *frame = YMWorkspaceGeometry(@{@"x": @(rect.origin.x), @"y": @(rect.origin.y),
-            @"width": @(rect.size.width), @"height": @(rect.size.height)});
+    for (id entryValue in raw) {
+        if (![entryValue isKindOfClass:NSDictionary.class]) return nil;
+        NSDictionary *entry = entryValue;
+        NSMutableDictionary *window = [NSMutableDictionary dictionary];
         id pid = entry[(__bridge NSString *)kCGWindowOwnerPID];
         id windowID = entry[(__bridge NSString *)kCGWindowNumber];
-        if (!frame || !pid || !windowID) continue;
-        [windows addObject:@{
-            @"pid": pid,
-            @"windowID": windowID,
-            @"frame": frame,
-            @"layer": entry[(__bridge NSString *)kCGWindowLayer] ?: @0,
-            @"onScreen": entry[(__bridge NSString *)kCGWindowIsOnscreen] ?: @NO,
-            @"alpha": entry[(__bridge NSString *)kCGWindowAlpha] ?: @0
-        }];
+        if (pid) window[@"pid"] = pid;
+        if (windowID) window[@"windowID"] = windowID;
+
+        id bounds = entry[(__bridge NSString *)kCGWindowBounds];
+        if ([bounds isKindOfClass:NSDictionary.class]) {
+            id x = bounds[@"X"], y = bounds[@"Y"], width = bounds[@"Width"], height = bounds[@"Height"];
+            if ([x isKindOfClass:NSNumber.class] && [y isKindOfClass:NSNumber.class] &&
+                [width isKindOfClass:NSNumber.class] && [height isKindOfClass:NSNumber.class]) {
+                CGRect rect;
+                if (CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)bounds, &rect)) {
+                    NSDictionary *frame = YMWorkspaceGeometry(@{@"x": @(rect.origin.x), @"y": @(rect.origin.y),
+                        @"width": @(rect.size.width), @"height": @(rect.size.height)});
+                    if (frame) window[@"frame"] = frame;
+                }
+            }
+        }
+
+        id layer = entry[(__bridge NSString *)kCGWindowLayer];
+        if (layer) window[@"layer"] = layer;
+        id onScreen = entry[(__bridge NSString *)kCGWindowIsOnscreen];
+        if (onScreen) window[@"onScreen"] = onScreen;
+        id alpha = entry[(__bridge NSString *)kCGWindowAlpha];
+        if (alpha) window[@"alpha"] = alpha;
+        [windows addObject:window];
     }
     return windows;
+}
+
+- (nullable NSArray<NSDictionary *> *)visibleWindows {
+    NSArray *raw = CFBridgingRelease(CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+    return [self whitelistedWindowsFromCGEntries:raw];
 }
 
 - (nullable NSRunningApplication *)applicationForPID:(pid_t)pid {
@@ -63,12 +103,12 @@ static const NSTimeInterval kYMWorkspaceAXCallCap = 0.1;
 }
 
 - (BOOL)prepareAXElement:(id)element {
-    if (self.hasActiveDeadline && [self monotonicTime] >= self.activeDeadline) return NO;
+    if (![self budgetRemaining]) return NO;
     AXUIElementRef ref = [self axElement:element];
     if (!ref) return YES;
     NSTimeInterval timeout = kYMWorkspaceAXCallCap;
-    if (self.hasActiveDeadline) {
-        NSTimeInterval remaining = self.activeDeadline - [self monotonicTime];
+    if ([self hasActiveDeadline]) {
+        NSTimeInterval remaining = [self activeDeadline] - [self monotonicTime];
         if (remaining <= 0) return NO;
         timeout = fmin(remaining, kYMWorkspaceAXCallCap);
     }
@@ -178,37 +218,28 @@ static const NSTimeInterval kYMWorkspaceAXCallCap = 0.1;
 }
 
 - (BOOL)budgetRemaining {
-    return !self.hasActiveDeadline || [self monotonicTime] < self.activeDeadline;
+    return ![self hasActiveDeadline] || [self monotonicTime] < [self activeDeadline];
 }
 
-- (NSDictionary *)observeApplication:(NSRunningApplication *)application
-                           deadline:(NSTimeInterval)deadline {
-    self.activeDeadline = deadline;
-    self.hasActiveDeadline = YES;
+- (NSDictionary *)observeApplicationUnderBudget:(NSRunningApplication *)application {
     if (!application) {
-        self.hasActiveDeadline = NO;
         return [self observationFailure:@"missingApplication" windows:@[]];
     }
     if (application.terminated) {
-        self.hasActiveDeadline = NO;
         return [self observationFailure:@"processTerminated" windows:@[]];
     }
     if (![self budgetRemaining]) {
-        self.hasActiveDeadline = NO;
         return [self observationFailure:@"timeout" windows:@[]];
     }
     id windowsValue = [self copyWindowsForApplication:application];
     if (![windowsValue isKindOfClass:NSArray.class]) {
-        self.hasActiveDeadline = NO;
         return [self observationFailure:@"enumerationFailed" windows:@[]];
     }
     NSArray *windows = windowsValue;
     if (windows.count > kYMWorkspaceMaxWindowsPerPID) {
-        self.hasActiveDeadline = NO;
         return [self observationFailure:@"windowLimit" windows:@[]];
     }
     if (application.terminated) {
-        self.hasActiveDeadline = NO;
         return [self observationFailure:@"processTerminated" windows:@[]];
     }
 
@@ -255,13 +286,27 @@ static const NSTimeInterval kYMWorkspaceAXCallCap = 0.1;
         reason = @"processTerminated";
     }
 
-    self.hasActiveDeadline = NO;
+    if (complete && ![self budgetRemaining]) {
+        complete = NO;
+        reason = @"timeout";
+    }
     if (!complete) return [self observationFailure:reason windows:records];
     return [self observationSuccess:records];
 }
 
+- (NSDictionary *)observeApplication:(NSRunningApplication *)application
+                           deadline:(NSTimeInterval)deadline {
+    [self pushDeadline:deadline];
+    NSDictionary *observation = nil;
+    @try {
+        observation = [self observeApplicationUnderBudget:application];
+    } @finally {
+        [self popDeadline];
+    }
+    return observation;
+}
+
 - (nullable NSDictionary *)observeElement:(id)element {
-    self.hasActiveDeadline = NO;
     return [self recordForElement:element];
 }
 
@@ -271,7 +316,6 @@ static const NSTimeInterval kYMWorkspaceAXCallCap = 0.1;
 
 - (BOOL)setPosition:(CGPoint)position element:(id)element
    expectedIdentity:(NSDictionary *)identity {
-    self.hasActiveDeadline = NO;
     if (!YMWorkspaceSameWindowIdentity([self identityForElement:element], identity)) return NO;
     AXValueRef value = AXValueCreate(kAXValueCGPointType, &position);
     if (!value) return NO;
@@ -282,7 +326,6 @@ static const NSTimeInterval kYMWorkspaceAXCallCap = 0.1;
 
 - (BOOL)setSize:(CGSize)size element:(id)element
 expectedIdentity:(NSDictionary *)identity {
-    self.hasActiveDeadline = NO;
     if (!YMWorkspaceSameWindowIdentity([self identityForElement:element], identity)) return NO;
     AXValueRef value = AXValueCreate(kAXValueCGSizeType, &size);
     if (!value) return NO;
