@@ -26,3 +26,6 @@ ym_layout_sdk="$(DEVELOPER_DIR="$ym_layout_developer" /usr/bin/xcrun --sdk macos
   -I "$ym_layout_root/app" "$ym_layout_root/tests/WorkspaceLayoutTests.m" \
   -framework AppKit -framework QuartzCore -o "$ym_layout_stage/WorkspaceLayoutTests"
 "$ym_layout_stage/WorkspaceLayoutTests"
+
+bash "$ym_layout_root/scripts/test-display-profile-ui.sh"
+bash "$ym_layout_root/scripts/test-display-profile-panel.sh"

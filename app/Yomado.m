@@ -207,6 +207,9 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property YMDisplayProfileEditor *profileEditor;
 @property BOOL profileEditorCommitInProgress;
 @property(copy) NSNumber *pendingProfileRevealOrdinal;
+@property YMSavedDisplayProfilesView *savedProfilesView;
+@property NSTextField *profileActivityLabel;
+@property(weak) NSView *profileEditorOrigin;
 - (void)restore:(id)sender;
 - (void)buildWindow;
 - (void)preparePanelPresenter;
@@ -226,6 +229,11 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 - (NSArray<YMSavedDisplayProfileRow *> *)savedProfileRows;
 - (NSString *)profileActivityText;
 - (void)createSelectedProfilePersistingOnSuccess:(BOOL)persistOnSuccess;
+- (YMDisplayProfileEditor *)makeDisplayProfileEditorWithMode:(YMDisplayProfileEditorMode)mode
+                                                       draft:(YMDisplayProfileDraft *)draft;
+- (void)presentProfileEditorForOrdinal:(NSUInteger)ordinal mode:(YMDisplayProfileEditorMode)mode;
+- (void)updateSavedProfilesPresentation;
+- (void)restoreProfileEditorFocus;
 @end
 
 static OSStatus RecoveryHotkey(EventHandlerCallRef next, EventRef event, void *data) {
@@ -444,16 +452,7 @@ static NSView *YMSpacer(void) {
 }
 - (void)addDisplay:(id)sender {
     (void)sender;
-    if (self.previewMode || self.updateWorkspaceBusy || self.topologyRecoverySnapshot || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.displayOperationInProgress || self.appOperationInProgress) return;
-    NSUInteger ordinal = 1;
-    for (YMManagedDisplay *profile in self.displayProfiles) ordinal = MAX(ordinal, profile.ordinal + 1);
-    if (ordinal > UINT16_MAX) { self.detailLabel.stringValue = @"已达到可用的屏幕编号上限。"; return; }
-    NSString *name = ordinal == 2 ? @"GrokBot" : [NSString stringWithFormat:@"Agent %lu", (unsigned long)ordinal];
-    YMManagedDisplay *profile = [self newProfileWithOrdinal:ordinal name:name width:1920 height:1080 hiDPI:NO];
-    [self.displayProfiles addObject:profile];
-    [self saveDisplayProfiles];
-    [self selectProfile:profile];
-    [self create:nil];
+    [self presentProfileEditorForOrdinal:0 mode:YMDisplayProfileEditorModeCreate];
 }
 - (void)buildMenu {
     if (self.previewMode) return;
@@ -495,9 +494,7 @@ static NSView *YMSpacer(void) {
         screen.submenu = submenu; [menu addItem:screen];
     }
     if (!active.count) [menu addItem:[[NSMenuItem alloc] initWithTitle:@"尚无运行中的虚拟屏" action:nil keyEquivalent:@""]];
-    NSMenuItem *add = [self menuItem:@"添加或启动虚拟屏…" action:nil profile:nil];
-    add.submenu = [self addingDisplayMenu];
-    [menu addItem:add];
+    [menu addItem:[self menuItem:@"添加或启动虚拟屏…" action:@selector(showWindow:) profile:nil]];
     if (self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay)
         [menu addItem:[self menuItem:@"微信返回原显示器" action:@selector(wechatRestore:) profile:nil]];
     if (self.topologyRecoverySnapshot)
@@ -521,6 +518,14 @@ static NSView *YMSpacer(void) {
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     if (item.action == @selector(checkForUpdates:))
         return !self.previewMode && self.automaticUpdater.canCheck && !self.updateRecoveryFailed && !self.updateWorkspaceBusy;
+    if (item.action == @selector(quit:) || item.action == @selector(closeProfile:)
+        || item.action == @selector(closeManagedDisplayFromMenu:)
+        || item.action == @selector(renameManagedDisplayFromMenu:)
+        || item.action == @selector(startManagedDisplayFromMenu:)
+        || item.action == @selector(setManagedDisplayResolutionFromMenu:)
+        || item.action == @selector(toggleManagedDisplayHiDPIFromMenu:)
+        || item.action == @selector(addDisplay:))
+        return !self.profileEditor && self.window.attachedSheet == nil;
     return YES;
 }
 - (void)openProductURL:(NSString *)address {
@@ -781,6 +786,7 @@ static NSView *YMSpacer(void) {
 }
 - (void)showProfile:(NSMenuItem *)sender { [self selectProfile:sender.representedObject]; [self showWindow:nil]; }
 - (void)closeProfile:(NSMenuItem *)sender {
+    if (self.profileEditor || self.window.attachedSheet) return;
     [self selectProfile:sender.representedObject];
     if (self.selectedProfile == sender.representedObject) [self stop:nil];
 }
@@ -790,7 +796,8 @@ static NSView *YMSpacer(void) {
     return !self.previewMode && profile && [self.displayProfiles containsObject:profile]
         && !self.updateWorkspaceBusy && !self.appOperationInProgress && !self.displayOperationInProgress
         && !self.armed && !self.preparing && !self.restoring
-        && !self.layoutChangedForTrial && !self.recoveryRequested;
+        && !self.layoutChangedForTrial && !self.recoveryRequested
+        && !self.profileEditor && self.window.attachedSheet == nil;
 }
 - (void)startManagedDisplayFromMenu:(NSMenuItem *)sender {
     YMManagedDisplay *profile = sender.representedObject;
@@ -806,47 +813,97 @@ static NSView *YMSpacer(void) {
     [self selectProfile:profile];
     if (self.selectedProfile == profile) [self stop:nil];
 }
-- (NSAlert *)makeRenameAlertForProfile:(YMManagedDisplay *)profile {
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"给虚拟屏命名";
-    alert.informativeText = @"例如 Codex 或 GrokBot。名称会显示在屏幕和菜单栏中。";
-    [alert addButtonWithTitle:@"保存"];
-    [alert addButtonWithTitle:@"取消"];
-    NSTextField *input = [NSTextField textFieldWithString:profile.friendlyName ?: @""];
-    input.frame = NSMakeRect(0, 0, 300, 26);
-    input.placeholderString = @"1–60 个字符";
-    [input setAccessibilityLabel:@"虚拟屏名称"];
-    alert.accessoryView = input;
-    alert.window.initialFirstResponder = input;
-    return alert;
+- (YMDisplayProfileEditor *)makeDisplayProfileEditorWithMode:(YMDisplayProfileEditorMode)mode
+                                                       draft:(YMDisplayProfileDraft *)draft {
+    return [[YMDisplayProfileEditor alloc] initWithMode:mode draft:draft];
+}
+- (void)restoreProfileEditorFocus {
+    NSWindow *window = self.window;
+    if (!window) return;
+    NSView *origin = self.profileEditorOrigin;
+    self.profileEditorOrigin = nil;
+    if (origin && origin.window == window && origin.acceptsFirstResponder
+        && (!([origin respondsToSelector:@selector(isEnabled)]) || [(NSControl *)origin isEnabled])) {
+        [window makeFirstResponder:origin];
+        return;
+    }
+    if (self.addDisplayButton && self.addDisplayButton.window == window && self.addDisplayButton.enabled) {
+        [window makeFirstResponder:self.addDisplayButton];
+        return;
+    }
+    [window makeFirstResponder:nil];
+}
+- (void)presentProfileEditorForOrdinal:(NSUInteger)ordinal mode:(YMDisplayProfileEditorMode)mode {
+    if (mode != YMDisplayProfileEditorModeCreate && mode != YMDisplayProfileEditorModeEdit
+        && mode != YMDisplayProfileEditorModeRename) return;
+    if (mode == YMDisplayProfileEditorModeCreate) {
+        if (ordinal != 0) return;
+    } else if (!ordinal || ![self profileWithOrdinal:ordinal]) {
+        return;
+    }
+    if (![self profileActionsAvailableForEditor:nil]) return;
+    YMManagedDisplay *target = mode == YMDisplayProfileEditorModeCreate ? nil : [self profileWithOrdinal:ordinal];
+    if (mode == YMDisplayProfileEditorModeEdit && target.display.isCreated) return;
+    YMDisplayProfileDraft *draft = mode == YMDisplayProfileEditorModeCreate
+        ? [[YMDisplayProfileDraft alloc] initWithName:@"" width:1920 hiDPI:NO]
+        : [[YMDisplayProfileDraft alloc] initWithName:target.friendlyName ?: @""
+                                                 width:target.width ?: 1920
+                                                 hiDPI:target.hiDPI];
+    YMDisplayProfileEditor *editor = [self makeDisplayProfileEditorWithMode:mode draft:draft];
+    if (!editor) return;
+    [self showWindow:nil];
+    NSWindow *parent = self.window;
+    if (!parent) return;
+    id currentResponder = parent.firstResponder;
+    self.profileEditorOrigin = [currentResponder isKindOfClass:NSView.class] ? currentResponder : self.addDisplayButton;
+    self.profileEditor = editor;
+    __weak ADController *weakController = self;
+    __weak YMDisplayProfileEditor *weakEditor = editor;
+    editor.submitHandler = ^BOOL(YMDisplayProfileDraft *submitted, NSError **error) {
+        ADController *controller = weakController;
+        YMDisplayProfileEditor *current = weakEditor;
+        if (!controller || !current) return NO;
+        return [controller acceptProfileDraft:submitted mode:mode ordinal:ordinal editor:current error:error];
+    };
+    editor.endHandler = ^(BOOL accepted) {
+        (void)accepted;
+        ADController *controller = weakController;
+        YMDisplayProfileEditor *current = weakEditor;
+        if (!controller || !current || controller.profileEditor != current) return;
+        controller.profileEditor = nil;
+        current.submitHandler = nil;
+        current.endHandler = nil;
+        [controller restoreProfileEditorFocus];
+    };
+    [editor beginSheetForWindow:parent];
+}
+- (void)updateSavedProfilesPresentation {
+    if (!self.savedProfilesView) return;
+    NSNumber *reveal = self.pendingProfileRevealOrdinal;
+    NSArray<YMSavedDisplayProfileRow *> *rows = [self savedProfileRows];
+    NSWindow *window = self.window;
+    id previousResponder = window.firstResponder;
+    BOOL responderWasRow = [previousResponder isKindOfClass:NSView.class]
+        && [(NSView *)previousResponder isDescendantOf:self.savedProfilesView];
+    [self.savedProfilesView updateRows:rows revealOrdinal:reveal];
+    if (reveal) self.pendingProfileRevealOrdinal = nil;
+    if (responderWasRow) {
+        NSView *stillPresent = (NSView *)previousResponder;
+        if (!stillPresent.window || stillPresent.window != window || ![stillPresent isDescendantOf:self.savedProfilesView]) {
+            if (self.addDisplayButton.enabled) [window makeFirstResponder:self.addDisplayButton];
+            else [window makeFirstResponder:nil];
+        }
+    }
+    NSString *activity = [self profileActivityText];
+    if (self.profileActivityLabel) {
+        self.profileActivityLabel.stringValue = activity ?: @"";
+        self.profileActivityLabel.hidden = activity.length == 0;
+    }
 }
 - (void)renameManagedDisplayFromMenu:(NSMenuItem *)sender {
     YMManagedDisplay *profile = sender.representedObject;
-    if (![profile isKindOfClass:YMManagedDisplay.class] || ![self canPerformScreenMenuActionForProfile:profile]
-        || self.window.attachedSheet) return;
-    [self showWindow:nil];
-    NSAlert *alert = [self makeRenameAlertForProfile:profile];
-    NSTextField *input = (NSTextField *)alert.accessoryView;
-    __weak ADController *weakSelf = self;
-    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
-        ADController *controller = weakSelf;
-        if (response != NSAlertFirstButtonReturn || !controller
-            || ![controller canPerformScreenMenuActionForProfile:profile]) return;
-        NSString *name = [input.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (!name.length || name.length > 60
-            || [name rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location != NSNotFound) {
-            controller.statusLabel.stringValue = @"名称未保存";
-            controller.detailLabel.stringValue = @"请输入 1–60 个字符，且不含换行或控制字符。";
-            return;
-        }
-        profile.friendlyName = name;
-        [controller saveDisplayProfiles];
-        [controller updateInventory];
-        controller.statusLabel.stringValue = @"名称已保存";
-        controller.detailLabel.stringValue = profile.display.isCreated
-            ? @"界面中的名称已更新；系统显示器名称将在这块虚拟屏下次启动时更新。"
-            : @"下次启动这块虚拟屏时会使用新名称。";
-    }];
+    if (![profile isKindOfClass:YMManagedDisplay.class] || ![self canPerformScreenMenuActionForProfile:profile]) return;
+    [self presentProfileEditorForOrdinal:profile.ordinal mode:YMDisplayProfileEditorModeRename];
 }
 - (void)setManagedDisplayResolutionFromMenu:(NSMenuItem *)sender {
     NSDictionary *settings = sender.representedObject;
@@ -921,40 +978,15 @@ static NSView *YMSpacer(void) {
     CGFloat bottom = [anchor isKindOfClass:YMAppWorkspaceView.class] ? anchor.bounds.size.width / ((YMAppWorkspaceView *)anchor).displayAspectRatio : 24;
     [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(MAX(18, anchor.bounds.size.width - 24), bottom) inView:anchor];
 }
-- (NSMenu *)addingDisplayMenu {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"添加虚拟屏"];
-    menu.autoenablesItems = NO;
-    for (YMManagedDisplay *profile in self.displayProfiles) {
-        if (profile.display.isCreated) continue;
-        NSMenuItem *saved = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"%@ · 已关闭", [self titleForProfile:profile]]
-            action:nil keyEquivalent:@""];
-        saved.submenu = [self screenActionMenuForProfile:profile];
-        saved.enabled = YES;
-        [menu addItem:saved];
-    }
-    if (menu.numberOfItems) [menu addItem:NSMenuItem.separatorItem];
-    NSMenuItem *newDisplay = [self menuItem:@"新增虚拟屏" action:@selector(addDisplay:) profile:nil];
-    newDisplay.enabled = !self.appOperationInProgress && !self.displayOperationInProgress
-        && !self.armed && !self.preparing && !self.restoring && !self.layoutChangedForTrial && !self.recoveryRequested;
-    [menu addItem:newDisplay];
-    return menu;
-}
-- (void)addDisplayMenu:(id)sender {
-    if (self.previewMode) return;
-    NSView *anchor = [sender isKindOfClass:NSView.class] ? sender : self.addDisplayButton;
-    NSPoint location = NSMakePoint(0, anchor.isFlipped ? NSHeight(anchor.bounds) + 4 : -4);
-    [[self addingDisplayMenu] popUpMenuPositioningItem:nil atLocation:location inView:anchor];
-}
-
 - (void)buildWindow {
-    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1000, 410)
+    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1000, 620)
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
         backing:NSBackingStoreBuffered defer:NO];
-    self.window.contentView = [[YMDocumentView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 410)];
+    self.window.contentView = [[YMDocumentView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 620)];
     self.window.title = @"yomado";
     self.window.titlebarAppearsTransparent = YES;
     self.window.titleVisibility = NSWindowTitleHidden;
-    self.window.contentMinSize = NSMakeSize(760, 370);
+    self.window.contentMinSize = NSMakeSize(760, 520);
     self.window.delegate = self.previewMode ? nil : self;
     self.window.releasedWhenClosed = NO;
     if (!self.previewMode) [self.window center];
@@ -993,11 +1025,29 @@ static NSView *YMSpacer(void) {
     self.wechatRestoreButton.toolTip = @"微信返回原显示器";
     self.wechatRestoreButton.hidden = YES;
     [header addArrangedSubview:self.wechatRestoreButton];
-    self.addDisplayButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:@"添加虚拟屏"] target:self action:@selector(addDisplayMenu:)];
+    self.addDisplayButton = [NSButton buttonWithTitle:@"＋ 新建屏幕" target:self action:@selector(addDisplay:)];
     self.addDisplayButton.bezelStyle = NSBezelStyleAccessoryBarAction;
-    self.addDisplayButton.toolTip = @"添加或启动虚拟屏";
+    self.addDisplayButton.toolTip = @"新建虚拟屏";
+    [self.addDisplayButton setAccessibilityLabel:@"新建屏幕"];
     [header addArrangedSubview:self.addDisplayButton];
     [stack addArrangedSubview:header]; YMFillWidth(header, stack);
+
+    NSStackView *overviewHeader = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 10);
+    [overviewHeader addArrangedSubview:Label(@"屏幕总览", 13, NSFontWeightSemibold)];
+    self.statusPill = [[YMStatusPill alloc] initWithFrame:NSZeroRect];
+    self.statusPill.translatesAutoresizingMaskIntoConstraints = NO;
+    [overviewHeader addArrangedSubview:self.statusPill];
+    [overviewHeader addArrangedSubview:YMSpacer()];
+    self.inventoryLabel = Label(@"", 11, NSFontWeightRegular);
+    self.inventoryLabel.textColor = NSColor.secondaryLabelColor;
+    [overviewHeader addArrangedSubview:self.inventoryLabel];
+    [stack addArrangedSubview:overviewHeader]; YMFillWidth(overviewHeader, stack);
+
+    self.profileActivityLabel = Label(@"", 12, NSFontWeightMedium);
+    self.profileActivityLabel.textColor = NSColor.secondaryLabelColor;
+    self.profileActivityLabel.hidden = YES;
+    [stack addArrangedSubview:self.profileActivityLabel]; YMFillWidth(self.profileActivityLabel, stack);
+
     NSScrollView *board = [[NSScrollView alloc] init];
     board.translatesAutoresizingMaskIntoConstraints = NO;
     board.drawsBackground = NO;
@@ -1020,6 +1070,28 @@ static NSView *YMSpacer(void) {
     ]];
     [stack addArrangedSubview:board]; YMFillWidth(board, stack);
     [board setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
+
+    NSTextField *inputHint = Label(@"实体屏与虚拟屏仍共用键鼠与焦点；不会隔离 Agent 输入，也不会关闭实体显示器。", 11, NSFontWeightRegular);
+    inputHint.textColor = NSColor.secondaryLabelColor;
+    [stack addArrangedSubview:inputHint]; YMFillWidth(inputHint, stack);
+
+    self.savedProfilesView = [[YMSavedDisplayProfilesView alloc] initWithFrame:NSZeroRect];
+    __weak ADController *weakSelf = self;
+    self.savedProfilesView.onStart = ^(NSUInteger ordinal) {
+        ADController *controller = weakSelf;
+        if (!controller) return;
+        NSError *error = nil;
+        [controller startSavedProfileWithOrdinal:ordinal error:&error];
+        [controller updateSavedProfilesPresentation];
+    };
+    self.savedProfilesView.onEdit = ^(NSUInteger ordinal) {
+        [weakSelf presentProfileEditorForOrdinal:ordinal mode:YMDisplayProfileEditorModeEdit];
+    };
+    [stack addArrangedSubview:self.savedProfilesView]; YMFillWidth(self.savedProfilesView, stack);
+
+    self.wechatStatusLabel = Label(@"", 11, NSFontWeightRegular);
+    self.wechatStatusLabel.hidden = YES;
+    [stack addArrangedSubview:self.wechatStatusLabel]; YMFillWidth(self.wechatStatusLabel, stack);
 
     NSStackView *footer = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 10);
     [footer addArrangedSubview:[self footerLink:@"yomado.app" action:@selector(openWebsite:) tooltip:@"官方网站 · https://yomado.app"]];
@@ -1326,9 +1398,11 @@ static NSView *YMSpacer(void) {
         }
         self.inventoryLabel.stringValue = [NSString stringWithFormat:@"%lu 块实体屏 · %lu 块虚拟屏", (unsigned long)physicalCount, (unsigned long)virtualCount];
         BOOL busy = self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress || self.appOperationInProgress;
-        self.addDisplayButton.enabled = !self.previewMode && !busy && !self.topologyRecoverySnapshot;
+        self.addDisplayButton.enabled = !self.previewMode && !busy && !self.topologyRecoverySnapshot
+            && !self.profileEditor && self.window.attachedSheet == nil;
         self.statusPill.text = busy ? @"正在更新" : self.topologyRecoverySnapshot ? @"显示排列待恢复" : virtualCount ? @"工作屏已就绪" : @"尚未启动";
         self.statusPill.tint = busy ? NSColor.systemOrangeColor : virtualCount ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
+        [self updateSavedProfilesPresentation];
         if (self.previewMode) {
             self.permissionContainer.hidden = YES;
             self.wechatRestoreButton.hidden = YES;
@@ -1932,7 +2006,11 @@ static NSView *YMSpacer(void) {
     [defaults setBool:self.window.visible forKey:@"UpdatePanelWasVisible"];
     [defaults synchronize];
 }
-- (void)quit:(id)sender { (void)sender; [NSApp terminate:nil]; }
+- (void)quit:(id)sender {
+    (void)sender;
+    if (self.profileEditor || self.window.attachedSheet) return;
+    [NSApp terminate:nil];
+}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     if (self.previewMode) return NSTerminateNow;
     (void)sender;
@@ -2196,12 +2274,25 @@ static int PreviewUI(NSString *path, NSString *state, BOOL dark) {
     controller.previewMode = YES;
     controller.previewState = state;
     controller.previewSnapshot = UIPreviewSnapshot(![state isEqualToString:@"empty"], [state isEqualToString:@"trial"], [state isEqualToString:@"multi"]);
+    controller.displayProfiles = [NSMutableArray array];
+    if ([state isEqualToString:@"running"] || [state isEqualToString:@"multi"] || [state isEqualToString:@"trial"]) {
+        YMManagedDisplay *codex = [controller newProfileWithOrdinal:1 name:@"Codex" width:1920 height:1080 hiDPI:NO];
+        // Preview tiles use synthetic snapshot IDs; keep profiles uncreated so the
+        // saved list can show stopped siblings without touching display APIs.
+        [controller.displayProfiles addObject:codex];
+    }
+    if ([state isEqualToString:@"multi"]) {
+        YMManagedDisplay *stopped = [controller newProfileWithOrdinal:2 name:@"GrokBot" width:1920 height:1080 hiDPI:YES];
+        [controller.displayProfiles addObject:stopped];
+        YMManagedDisplay *extra = [controller newProfileWithOrdinal:3 name:@"Codex · Blender" width:2560 height:1440 hiDPI:NO];
+        [controller.displayProfiles addObject:extra];
+    }
     [controller buildWindow];
     controller.window.appearance = appearance;
     [controller updateInventory];
     NSView *content = controller.window.contentView;
     [content layoutSubtreeIfNeeded];
-    [controller.window setContentSize:NSMakeSize(1000, 410)];
+    [controller.window setContentSize:NSMakeSize(1000, 620)];
     [content layoutSubtreeIfNeeded];
     // Native controls may settle their internal layers on a later run-loop turn.
     // Only this hidden fixture window exists in the preview process.
