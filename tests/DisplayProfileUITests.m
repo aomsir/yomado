@@ -268,7 +268,9 @@ static void AssertRowLayout(YMSavedDisplayProfilesView *view, const char *scenar
     Check(!view.hasAmbiguousLayout, scenario);
     for (YMSavedDisplayProfileRowView *row in view.rowsByOrdinal.allValues) {
         Check(!row.hasAmbiguousLayout, scenario);
+        NSRect iconInRow = [row.iconView convertRect:row.iconView.bounds toView:row];
         NSRect nameInRow = [row.nameLabel convertRect:row.nameLabel.bounds toView:row];
+        NSRect detailInRow = [row.detailLabel convertRect:row.detailLabel.bounds toView:row];
         NSRect startInRow = [row.startButton convertRect:row.startButton.bounds toView:row];
         NSRect editInRow = [row.editButton convertRect:row.editButton.bounds toView:row];
         Check(NSContainsRect(row.bounds, startInRow), "start button stays inside row");
@@ -276,6 +278,23 @@ static void AssertRowLayout(YMSavedDisplayProfilesView *view, const char *scenar
         Check(!FramesOverlap(nameInRow, startInRow), "name does not overlap start");
         Check(!FramesOverlap(nameInRow, editInRow), "name does not overlap edit");
         Check(!FramesOverlap(editInRow, startInRow), "edit does not overlap start");
+        // Catch trailing-packed label frames (icon left, name hugging the buttons).
+        // Allow a few pt for NSTextField alignment-rect insets around the 10pt gutter.
+        CGFloat nameAfterIcon = NSMinX(nameInRow) - NSMaxX(iconInRow);
+        CGFloat detailAfterIcon = NSMinX(detailInRow) - NSMaxX(iconInRow);
+        Check(nameAfterIcon >= 4.0 && nameAfterIcon <= 14.0,
+              "name label leading edge follows icon by ~10pt");
+        Check(detailAfterIcon >= 4.0 && detailAfterIcon <= 14.0,
+              "detail label leading edge follows icon by ~10pt");
+        Check(NSMinX(editInRow) - NSMinX(nameInRow) > 80.0,
+              "name stays near icon rather than trailing against edit");
+        // Catch full-width frames that still draw glyphs on the trailing edge.
+        Check(row.nameLabel.alignment == NSTextAlignmentLeft,
+              "name label uses explicit left text alignment");
+        Check(row.detailLabel.alignment == NSTextAlignmentLeft,
+              "detail label uses explicit left text alignment");
+        Check(row.messageLabel.alignment == NSTextAlignmentLeft,
+              "message label uses explicit left text alignment");
     }
 }
 

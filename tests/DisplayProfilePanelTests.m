@@ -204,6 +204,55 @@ static void AssertSavedSection(ADController *controller) {
         Check(NSContainsRect(row.bounds, startInRow), "start button stays inside row");
         Check(NSContainsRect(row.bounds, editInRow), "edit button stays inside row");
         Check(!FramesOverlap(startInRow, editInRow), "start and edit do not overlap");
+
+        NSImageView *icon = nil;
+        NSMutableArray<NSTextField *> *labels = [NSMutableArray array];
+        NSMutableArray<NSView *> *walk = [NSMutableArray arrayWithObject:row];
+        while (walk.count) {
+            NSView *node = walk.lastObject;
+            [walk removeLastObject];
+            if ([node isKindOfClass:NSImageView.class] && icon == nil) icon = (NSImageView *)node;
+            if ([node isKindOfClass:NSTextField.class]) [labels addObject:(NSTextField *)node];
+            for (NSView *child in node.subviews) [walk addObject:child];
+        }
+        Check(icon != nil, "saved row keeps display icon");
+        Check(labels.count >= 2, "saved row keeps name and detail labels");
+        NSRect iconInRow = [icon convertRect:icon.bounds toView:row];
+        NSMutableArray<NSTextField *> *visibleLabels = [NSMutableArray array];
+        for (NSTextField *label in labels) {
+            if (!label.hidden) [visibleLabels addObject:label];
+        }
+        [visibleLabels sortUsingComparator:^NSComparisonResult(NSTextField *a, NSTextField *b) {
+            CGFloat ay = NSMaxY([a convertRect:a.bounds toView:row]);
+            CGFloat by = NSMaxY([b convertRect:b.bounds toView:row]);
+            if (ay > by) return NSOrderedAscending;
+            if (ay < by) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        Check(visibleLabels.count >= 1, "saved row exposes a visible name label");
+        NSTextField *nameLabel = visibleLabels[0];
+        NSRect nameInRow = [nameLabel convertRect:nameLabel.bounds toView:row];
+        CGFloat nameAfterIcon = NSMinX(nameInRow) - NSMaxX(iconInRow);
+        Check(nameAfterIcon >= 4.0 && nameAfterIcon <= 14.0,
+              "name label leading edge follows icon by ~10pt");
+        Check(NSMinX(editInRow) - NSMinX(nameInRow) > 80.0,
+              "name stays near icon rather than trailing against edit");
+        Check(nameLabel.alignment == NSTextAlignmentLeft,
+              "name label uses explicit left text alignment");
+        if (visibleLabels.count >= 2) {
+            NSTextField *detailLabel = visibleLabels[1];
+            NSRect detailInRow = [detailLabel convertRect:detailLabel.bounds toView:row];
+            CGFloat detailAfterIcon = NSMinX(detailInRow) - NSMaxX(iconInRow);
+            Check(detailAfterIcon >= 4.0 && detailAfterIcon <= 14.0,
+                  "detail label leading edge follows icon by ~10pt");
+            Check(detailLabel.alignment == NSTextAlignmentLeft,
+                  "detail label uses explicit left text alignment");
+        }
+        for (NSTextField *label in labels) {
+            Check(label.alignment == NSTextAlignmentLeft,
+                  "saved row text fields use explicit left text alignment");
+        }
+
         if (fullyVisible) {
             NSRect startInDoc = [start convertRect:start.bounds toView:document];
             NSRect editInDoc = [edit convertRect:edit.bounds toView:document];

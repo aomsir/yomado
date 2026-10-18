@@ -37,6 +37,7 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     NSTextField *label = [NSTextField labelWithString:text ?: @""];
     label.font = [NSFont systemFontOfSize:size weight:weight];
     label.textColor = color;
+    label.alignment = NSTextAlignmentLeft;
     label.translatesAutoresizingMaskIntoConstraints = NO;
     return label;
 }
@@ -72,6 +73,7 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     self.messageLabel = [NSTextField wrappingLabelWithString:@""];
     self.messageLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
     self.messageLabel.textColor = NSColor.systemRedColor;
+    self.messageLabel.alignment = NSTextAlignmentLeft;
     self.messageLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.messageLabel.hidden = YES;
     self.messageLabel.maximumNumberOfLines = 0;
@@ -85,7 +87,9 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     self.textStack = [[NSStackView alloc] init];
     self.textStack.translatesAutoresizingMaskIntoConstraints = NO;
     self.textStack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    self.textStack.alignment = NSLayoutAttributeWidth;
+    // Leading + explicit width pins: Width stack alignment left intrinsic-sized
+    // labels trailing against the action buttons with a large middle gap.
+    self.textStack.alignment = NSLayoutAttributeLeading;
     self.textStack.spacing = 2;
     self.textStack.detachesHiddenViews = YES;
     [self.textStack addArrangedSubview:self.nameLabel];
@@ -95,6 +99,11 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
                                forOrientation:NSLayoutConstraintOrientationHorizontal];
     [self.textStack setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
                                              forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.nameLabel.widthAnchor constraintEqualToAnchor:self.textStack.widthAnchor],
+        [self.detailLabel.widthAnchor constraintEqualToAnchor:self.textStack.widthAnchor],
+        [self.messageLabel.widthAnchor constraintEqualToAnchor:self.textStack.widthAnchor]
+    ]];
 
     self.editButton = [[NSButton alloc] initWithFrame:NSZeroRect];
     self.editButton.translatesAutoresizingMaskIntoConstraints = NO;
