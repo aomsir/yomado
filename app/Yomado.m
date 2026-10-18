@@ -212,6 +212,9 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property(weak) NSView *profileEditorOrigin;
 @property BOOL profileEditorFocusPending;
 @property(copy) NSString *profileStartRejectionText;
+// Test-only dependency seams. Nil keeps production NSUserDefaults / DisplaySnapshot.
+@property(nonatomic, strong) NSMutableDictionary *displayProfilesPreferenceStore;
+@property(nonatomic, copy) NSArray<NSDictionary *> *(^inventorySnapshotProvider)(void);
 - (void)restore:(id)sender;
 - (void)buildWindow;
 - (void)preparePanelPresenter;
@@ -434,7 +437,9 @@ static NSView *YMSpacer(void) {
 }
 - (void)loadDisplayProfiles {
     self.displayProfiles = [NSMutableArray array];
-    id saved = [NSUserDefaults.standardUserDefaults objectForKey:@"NamedDisplayProfiles"];
+    id saved = self.displayProfilesPreferenceStore
+        ? self.displayProfilesPreferenceStore[@"NamedDisplayProfiles"]
+        : [NSUserDefaults.standardUserDefaults objectForKey:@"NamedDisplayProfiles"];
     NSMutableSet *ordinals = [NSMutableSet set];
     if ([saved isKindOfClass:NSArray.class]) {
         for (id value in saved) {
@@ -461,7 +466,10 @@ static NSView *YMSpacer(void) {
     for (YMManagedDisplay *profile in self.displayProfiles)
         [saved addObject:@{@"ordinal":@(profile.ordinal), @"name":profile.friendlyName,
                           @"width":@(profile.width), @"hiDPI":@(profile.hiDPI)}];
-    [NSUserDefaults.standardUserDefaults setObject:saved forKey:@"NamedDisplayProfiles"];
+    if (self.displayProfilesPreferenceStore)
+        self.displayProfilesPreferenceStore[@"NamedDisplayProfiles"] = saved;
+    else
+        [NSUserDefaults.standardUserDefaults setObject:saved forKey:@"NamedDisplayProfiles"];
 }
 - (void)selectProfile:(YMManagedDisplay *)profile {
     if (!profile || self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.displayOperationInProgress || self.appOperationInProgress) return;
@@ -1491,7 +1499,13 @@ static NSView *YMSpacer(void) {
     if (self.updatingInventory) return;
     self.updatingInventory = YES;
     @try {
-        NSArray *snapshot = self.previewMode ? self.previewSnapshot : DisplaySnapshot();
+        NSArray *snapshot;
+        if (self.previewMode)
+            snapshot = self.previewSnapshot;
+        else if (self.inventorySnapshotProvider)
+            snapshot = self.inventorySnapshotProvider();
+        else
+            snapshot = DisplaySnapshot();
         if (!self.previewMode) {
             [self refreshRecoveryTargetWithSnapshot:snapshot];
             NSMutableArray *ids = [NSMutableArray array];

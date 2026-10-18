@@ -1,6 +1,7 @@
 // Hidden whole-window layout fixture for the production control panel.
 // Creates NSApplication with Prohibited policy, never orders windows front,
-// never reads real displays/preferences, and never starts/stops virtual screens.
+// injects in-memory preferences and synthetic inventory, and never starts/stops
+// virtual screens or touches real defaults / display enumeration.
 #define main YMIgnoredApplicationMain
 #import "Yomado.m"
 #undef main
@@ -11,6 +12,8 @@
 @property(nonatomic) BOOL profileEditorFocusPending;
 @property(nonatomic, weak) NSView *profileEditorOrigin;
 @property(nonatomic, copy) NSString *profileStartRejectionText;
+@property(nonatomic, strong) NSMutableDictionary *displayProfilesPreferenceStore;
+@property(nonatomic, copy) NSArray<NSDictionary *> *(^inventorySnapshotProvider)(void);
 @end
 
 @interface YMDisplayProfileEditor (YMPanelTestAccess)
@@ -73,11 +76,33 @@ static YMManagedDisplay *RunningProfile(ADController *controller, NSUInteger ord
     return profile;
 }
 
+static void InstallPanelDependencyIsolation(ADController *controller,
+                                            NSUInteger *inventoryHits) {
+    if (!controller.displayProfilesPreferenceStore)
+        controller.displayProfilesPreferenceStore = [NSMutableDictionary dictionary];
+    NSArray *owned = [(controller.previewSnapshot ?: PanelSnapshot(NO)) copy];
+    controller.inventorySnapshotProvider = ^NSArray<NSDictionary *> *{
+        if (inventoryHits) (*inventoryHits)++;
+        return owned;
+    };
+}
+
+static NSString *PanelInventoryLabel(NSArray<NSDictionary *> *snapshot) {
+    NSUInteger physicalCount = 0, virtualCount = 0;
+    for (NSDictionary *item in snapshot) {
+        if (![item[@"isActive"] boolValue] || ![item[@"isOnline"] boolValue]) continue;
+        if ([item[@"isVirtual"] boolValue]) virtualCount++; else physicalCount++;
+    }
+    return [NSString stringWithFormat:@"%lu 块实体屏 · %lu 块虚拟屏",
+            (unsigned long)physicalCount, (unsigned long)virtualCount];
+}
+
 static ADController *PanelController(NSUInteger savedCount, NSSize contentSize, BOOL withRunningVirtual) {
     ADController *controller = [[ADController alloc] init];
     controller.previewMode = YES;
     controller.previewState = @"multi";
     controller.previewSnapshot = PanelSnapshot(withRunningVirtual);
+    InstallPanelDependencyIsolation(controller, NULL);
     controller.displayProfiles = [NSMutableArray array];
     if (withRunningVirtual) {
         [controller.displayProfiles addObject:RunningProfile(controller, 1, @"Codex", 902)];
@@ -508,7 +533,24 @@ static void RunEntryActions(void) {
 
     NSButton *editButton = PanelFindTaggedButton(controller.savedProfilesView, @"编辑", (NSInteger)saved.ordinal);
     Check(editButton != nil, "saved row exposes an edit button");
+    __block NSUInteger inventoryProviderHits = 0;
+    NSMutableDictionary *preferenceStore = [NSMutableDictionary dictionary];
+    controller.displayProfilesPreferenceStore = preferenceStore;
+    NSArray *ownedInventory = [controller.previewSnapshot copy];
+    NSString *expectedInventoryLabel = PanelInventoryLabel(ownedInventory);
+    controller.inventorySnapshotProvider = ^NSArray<NSDictionary *> *{
+        inventoryProviderHits++;
+        return ownedInventory;
+    };
+    // Trap: if production ever fell back to real defaults/display APIs, these
+    // fixtures would miss writes / provider hits and fail the checks below.
     controller.previewMode = NO;
+    NSUInteger hitsBeforeLeavePreview = inventoryProviderHits;
+    [controller updateInventory];
+    Check(inventoryProviderHits == hitsBeforeLeavePreview + 1,
+          "non-preview inventory uses synthetic provider");
+    Check([controller.inventoryLabel.stringValue isEqualToString:expectedInventoryLabel],
+          "non-preview inventory keeps owned synthetic snapshot");
     [controller updateSavedProfilesPresentation];
     Check(editButton.enabled, "leaving preview enables saved-row edit");
     [controller.window makeFirstResponder:editButton];
@@ -532,27 +574,35 @@ static void RunEntryActions(void) {
     Check(controller.window.firstResponder == editButton,
           "cancel restores focus to production saved-row edit origin");
 
-    id defaultsBefore = [NSUserDefaults.standardUserDefaults objectForKey:@"NamedDisplayProfiles"];
     [controller.window makeFirstResponder:editButton];
     controller.savedProfilesView.onEdit(saved.ordinal);
     Check(controller.profileEditor != nil, "production onEdit reopens for valid save");
     controller.profileEditor.nameField.stringValue = @"Saved Origin";
+    NSUInteger hitsBeforeSave = inventoryProviderHits;
     [controller.profileEditor submit:nil];
     PanelDrainSheet(controller);
     Check(controller.profileEditor == nil && controller.window.attachedSheet == nil,
           "production onEdit save clears sheet");
     Check([saved.friendlyName isEqualToString:@"Saved Origin"], "valid save updates profile name");
     Check(!saved.display.isCreated, "valid save does not auto-start");
+    id memorySaved = preferenceStore[@"NamedDisplayProfiles"];
+    Check([memorySaved isKindOfClass:NSArray.class], "valid save writes memory preference store");
+    BOOL foundSavedOrigin = NO;
+    for (id entry in (NSArray *)memorySaved) {
+        if (![entry isKindOfClass:NSDictionary.class]) continue;
+        if ([entry[@"name"] isEqualToString:@"Saved Origin"]) foundSavedOrigin = YES;
+    }
+    Check(foundSavedOrigin, "memory preference store received saved profile name");
+    Check(inventoryProviderHits >= hitsBeforeSave + 1,
+          "valid save inventory refresh uses synthetic provider");
+    Check([controller.inventoryLabel.stringValue isEqualToString:expectedInventoryLabel],
+          "valid save keeps owned synthetic inventory after submit");
     NSButton *editAfterSave = PanelFindTaggedButton(controller.savedProfilesView, @"编辑",
                                                     (NSInteger)saved.ordinal);
     Check(editAfterSave != nil && editAfterSave.enabled,
           "valid save refreshes production saved-row edit");
     Check(controller.window.firstResponder == editAfterSave,
           "valid save restores focus to production saved-row edit origin");
-    if (defaultsBefore)
-        [NSUserDefaults.standardUserDefaults setObject:defaultsBefore forKey:@"NamedDisplayProfiles"];
-    else
-        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"NamedDisplayProfiles"];
 
     [controller.window makeFirstResponder:editAfterSave];
     controller.savedProfilesView.onEdit(saved.ordinal);
@@ -582,7 +632,14 @@ static void RunEntryActions(void) {
     }
     Check(controller.window.attachedSheet == nil, "fixture ends production sheet");
     Check(controller.profileEditorFocusPending, "pending survives until production inventory");
+    NSUInteger hitsBeforeDetachInventory = inventoryProviderHits;
     [controller updateInventory];
+    Check(inventoryProviderHits == hitsBeforeDetachInventory + 1,
+          "delayed-detach inventory uses synthetic provider");
+    Check([controller.inventoryLabel.stringValue isEqualToString:expectedInventoryLabel],
+          "delayed-detach inventory keeps owned synthetic snapshot");
+    Check([preferenceStore[@"NamedDisplayProfiles"] isKindOfClass:NSArray.class],
+          "fixture preference store remains owned after delayed detach");
     NSButton *editAfterDetach = PanelFindTaggedButton(controller.savedProfilesView, @"编辑",
                                                       (NSInteger)saved.ordinal);
     Check(editAfterDetach != nil && editAfterDetach.enabled,
@@ -611,6 +668,7 @@ static void RunPreviewIdentity(void) {
         @"logicalWidth":@1920, @"logicalHeight":@1080, @"isMain":@NO, @"isVirtual":@YES,
         @"isActive":@YES, @"isOnline":@YES}];
     controller.previewSnapshot = snapshot;
+    InstallPanelDependencyIsolation(controller, NULL);
     [controller installPreviewProfilesForState:@"multi"];
     [controller buildWindow];
     [controller.window setContentSize:NSMakeSize(1000, 620)];
