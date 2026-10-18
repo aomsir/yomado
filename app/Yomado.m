@@ -315,7 +315,14 @@ static NSView *YMSpacer(void) {
     [self performTopologyOperation:^BOOL(NSError **error) {
         return [topology restoreAndVerifySnapshot:snapshot excludingDisplayID:removedID error:error];
     } completion:^(BOOL restored, NSError *error) {
-        if (restored) { self.topologyRecoverySnapshot = nil; self.topologyRecoveryRemovedID = 0; }
+        if (restored) {
+            self.topologyRecoverySnapshot = nil;
+            self.topologyRecoveryRemovedID = 0;
+            for (YMManagedDisplay *profile in self.displayProfiles) {
+                if ([profile.startFailureText isEqualToString:@"显示排列待恢复，请先使用恢复入口。"])
+                    profile.startFailureText = nil;
+            }
+        }
         completion(restored, error);
     }];
 }

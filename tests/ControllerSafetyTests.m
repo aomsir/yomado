@@ -1274,6 +1274,33 @@ int main(void) {
             YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
             sibling.ordinal = 1; profile.width = 1920; profile.height = 1080;
             NSError *error = nil;
+            topology.configureResult = NO; topology.restoreResult = NO;
+            Expect([controller startSavedProfileWithOrdinal:profile.ordinal error:&error],
+                   "restore failure before retry accepted");
+            Expect(controller.topologyRecoverySnapshot == topology.snapshot
+                   && ![[controller savedProfileRows].firstObject canStart]
+                   && [[[controller savedProfileRows].firstObject message] containsString:@"待恢复"],
+                   "pending recovery gates start before retry");
+            topology.restoreResult = YES;
+            [controller retryTopologyRecovery:nil];
+            NSArray<YMSavedDisplayProfileRow *> *rows = [controller savedProfileRows];
+            Expect(!controller.topologyRecoverySnapshot
+                   && rows.count == 1
+                   && rows.firstObject.canStart
+                   && rows.firstObject.canEdit
+                   && ![rows.firstObject.message containsString:@"待恢复"]
+                   && (profile.startFailureText.length == 0
+                       || ![profile.startFailureText containsString:@"待恢复"]),
+                   "successful recovery clears stale pending message and restores actions");
+            Expect(![[controller profileActivityText] containsString:@"待恢复"],
+                   "activity text clears after successful recovery");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1; profile.width = 1920; profile.height = 1080;
+            NSError *error = nil;
             controller.powerFails = YES;
             Expect([controller startSavedProfileWithOrdinal:profile.ordinal error:&error], "power failure accepted");
             Expect(!profile.starting && [profile.startFailureText isEqualToString:@"无法保持图形桌面唤醒，已取消启动。"]
