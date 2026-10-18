@@ -234,6 +234,7 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 - (void)presentProfileEditorForOrdinal:(NSUInteger)ordinal mode:(YMDisplayProfileEditorMode)mode;
 - (void)updateSavedProfilesPresentation;
 - (void)restoreProfileEditorFocus;
+- (void)installPreviewProfilesForState:(NSString *)state;
 @end
 
 static OSStatus RecoveryHotkey(EventHandlerCallRef next, EventRef event, void *data) {
@@ -275,6 +276,22 @@ static NSView *YMSpacer(void) {
     [[NSColor.windowBackgroundColor blendedColorWithFraction:0.035 ofColor:NSColor.labelColor] setFill];
     NSRectFill(self.bounds);
 }
+@end
+
+// Owned preview-only display. Never calls create/destroy private APIs.
+@interface YMPreviewFixtureDisplay : VDVirtualDisplay
+@property(nonatomic) BOOL live;
+@property(nonatomic) CGDirectDisplayID fixtureID;
+@end
+@implementation YMPreviewFixtureDisplay
+- (BOOL)isCreated { return self.live; }
+- (CGDirectDisplayID)displayID { return self.live ? self.fixtureID : 0; }
+- (BOOL)createWithWidth:(NSUInteger)width height:(NSUInteger)height hiDPI:(BOOL)hiDPI
+                   name:(NSString *)name error:(NSError **)error {
+    (void)width; (void)height; (void)hiDPI; (void)name; (void)error;
+    return NO;
+}
+- (void)destroy {}
 @end
 
 @implementation ADController
@@ -822,6 +839,15 @@ static NSView *YMSpacer(void) {
     if (!window) return;
     NSView *origin = self.profileEditorOrigin;
     self.profileEditorOrigin = nil;
+    // Sheet/editor are already cleared; refresh enabled from the latest gates so
+    // focus does not chase a control that updateInventory disabled while open.
+    if (self.addDisplayButton) {
+        BOOL busy = self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring
+            || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress
+            || self.appOperationInProgress;
+        self.addDisplayButton.enabled = !self.previewMode && !busy && !self.topologyRecoverySnapshot
+            && !self.profileEditor && self.window.attachedSheet == nil;
+    }
     if (origin && origin.window == window && origin.acceptsFirstResponder
         && (!([origin respondsToSelector:@selector(isEnabled)]) || [(NSControl *)origin isEnabled])) {
         [window makeFirstResponder:origin];
@@ -1010,7 +1036,7 @@ static NSView *YMSpacer(void) {
     [header addArrangedSubview:Label(@"yomado", 23, NSFontWeightSemibold)];
     NSStackView *introduction = YMStack(NSUserInterfaceLayoutOrientationVertical, 3);
     [introduction addArrangedSubview:Label(@"夜窗", 14, NSFontWeightMedium)];
-    NSTextField *tagline = Label(@"为视觉 Agent 留一块工作屏，让实体屏可以休息。", 11, NSFontWeightRegular);
+    NSTextField *tagline = Label(@"为视觉 Agent 留一块工作屏。", 11, NSFontWeightRegular);
     tagline.textColor = NSColor.secondaryLabelColor;
     [introduction addArrangedSubview:tagline];
     [header addArrangedSubview:introduction];
@@ -1061,15 +1087,19 @@ static NSView *YMSpacer(void) {
     NSLayoutConstraint *preferredBoardWidth = [self.applicationCards.widthAnchor constraintEqualToAnchor:board.contentView.widthAnchor];
     preferredBoardWidth.priority = NSLayoutPriorityDefaultHigh;
     preferredBoardWidth.active = YES;
+    NSLayoutConstraint *boardMinHeight = [board.heightAnchor constraintGreaterThanOrEqualToConstant:210];
+    boardMinHeight.priority = NSLayoutPriorityDefaultHigh;
     [NSLayoutConstraint activateConstraints:@[
         [self.applicationCards.leadingAnchor constraintEqualToAnchor:board.contentView.leadingAnchor],
         [self.applicationCards.topAnchor constraintEqualToAnchor:board.contentView.topAnchor],
         [self.applicationCards.widthAnchor constraintGreaterThanOrEqualToAnchor:board.contentView.widthAnchor],
         [self.applicationCards.heightAnchor constraintGreaterThanOrEqualToAnchor:board.contentView.heightAnchor],
-        [board.heightAnchor constraintGreaterThanOrEqualToConstant:210]
+        boardMinHeight
     ]];
     [stack addArrangedSubview:board]; YMFillWidth(board, stack);
     [board setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
+    [board setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                    forOrientation:NSLayoutConstraintOrientationVertical];
 
     NSTextField *inputHint = Label(@"实体屏与虚拟屏仍共用键鼠与焦点；不会隔离 Agent 输入，也不会关闭实体显示器。", 11, NSFontWeightRegular);
     inputHint.textColor = NSColor.secondaryLabelColor;
@@ -1088,6 +1118,10 @@ static NSView *YMSpacer(void) {
         [weakSelf presentProfileEditorForOrdinal:ordinal mode:YMDisplayProfileEditorModeEdit];
     };
     [stack addArrangedSubview:self.savedProfilesView]; YMFillWidth(self.savedProfilesView, stack);
+    [self.savedProfilesView setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                                       forOrientation:NSLayoutConstraintOrientationVertical];
+    [self.savedProfilesView setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                                     forOrientation:NSLayoutConstraintOrientationVertical];
 
     self.wechatStatusLabel = Label(@"", 11, NSFontWeightRegular);
     self.wechatStatusLabel.hidden = YES;
@@ -2068,6 +2102,33 @@ static NSView *YMSpacer(void) {
     if (self.keyHandler) RemoveEventHandler(self.keyHandler);
     [self powerAssertions:NO];
 }
+- (void)installPreviewProfilesForState:(NSString *)state {
+    self.displayProfiles = [NSMutableArray array];
+    if ([state isEqualToString:@"running"] || [state isEqualToString:@"multi"] || [state isEqualToString:@"trial"]) {
+        YMManagedDisplay *codex = [self newProfileWithOrdinal:1 name:@"Codex" width:1920 height:1080 hiDPI:NO];
+        YMPreviewFixtureDisplay *codexDisplay = [YMPreviewFixtureDisplay new];
+        codexDisplay.fixtureID = 902;
+        codexDisplay.live = YES;
+        codex.display = codexDisplay;
+        codex.topologyVerified = YES;
+        [self.displayProfiles addObject:codex];
+    }
+    if ([state isEqualToString:@"multi"]) {
+        YMManagedDisplay *grok = [self newProfileWithOrdinal:2 name:@"GrokBot" width:1920 height:1080 hiDPI:YES];
+        YMPreviewFixtureDisplay *grokDisplay = [YMPreviewFixtureDisplay new];
+        grokDisplay.fixtureID = 903;
+        grokDisplay.live = YES;
+        grok.display = grokDisplay;
+        grok.topologyVerified = YES;
+        [self.displayProfiles addObject:grok];
+        YMManagedDisplay *extra = [self newProfileWithOrdinal:3 name:@"Codex · Blender" width:2560 height:1440 hiDPI:NO];
+        YMPreviewFixtureDisplay *stoppedDisplay = [YMPreviewFixtureDisplay new];
+        stoppedDisplay.fixtureID = 904;
+        stoppedDisplay.live = NO;
+        extra.display = stoppedDisplay;
+        [self.displayProfiles addObject:extra];
+    }
+}
 @end
 
 static int SelfTest(NSString *directory, BOOL hiDPI) {
@@ -2261,6 +2322,7 @@ static NSArray<NSDictionary *> *UIPreviewSnapshot(BOOL created, BOOL trial, BOOL
         @"logicalWidth":@1920, @"logicalHeight":@1080, @"isMain":@NO, @"isVirtual":@YES, @"isActive":@YES, @"isOnline":@YES}];
     return displays;
 }
+
 static int PreviewUI(NSString *path, NSString *state, BOOL dark) {
     if (![@[@"empty", @"running", @"multi", @"trial"] containsObject:state]) {
         fprintf(stderr, "Preview state must be empty, running, multi, or trial.\n");
@@ -2274,19 +2336,7 @@ static int PreviewUI(NSString *path, NSString *state, BOOL dark) {
     controller.previewMode = YES;
     controller.previewState = state;
     controller.previewSnapshot = UIPreviewSnapshot(![state isEqualToString:@"empty"], [state isEqualToString:@"trial"], [state isEqualToString:@"multi"]);
-    controller.displayProfiles = [NSMutableArray array];
-    if ([state isEqualToString:@"running"] || [state isEqualToString:@"multi"] || [state isEqualToString:@"trial"]) {
-        YMManagedDisplay *codex = [controller newProfileWithOrdinal:1 name:@"Codex" width:1920 height:1080 hiDPI:NO];
-        // Preview tiles use synthetic snapshot IDs; keep profiles uncreated so the
-        // saved list can show stopped siblings without touching display APIs.
-        [controller.displayProfiles addObject:codex];
-    }
-    if ([state isEqualToString:@"multi"]) {
-        YMManagedDisplay *stopped = [controller newProfileWithOrdinal:2 name:@"GrokBot" width:1920 height:1080 hiDPI:YES];
-        [controller.displayProfiles addObject:stopped];
-        YMManagedDisplay *extra = [controller newProfileWithOrdinal:3 name:@"Codex · Blender" width:2560 height:1440 hiDPI:NO];
-        [controller.displayProfiles addObject:extra];
-    }
+    [controller installPreviewProfilesForState:state];
     [controller buildWindow];
     controller.window.appearance = appearance;
     [controller updateInventory];

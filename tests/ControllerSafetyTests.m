@@ -418,6 +418,19 @@
 }
 @end
 
+@interface YMFocusControl : NSObject
+@property(nonatomic, weak) id window;
+@property(nonatomic) BOOL enabled;
+@property(nonatomic) BOOL acceptsFirstResponder;
+@end
+@implementation YMFocusControl
+- (BOOL)isEnabled { return self.enabled; }
+@end
+
+@interface ADController (YMProfileEditorFocusTestAccess)
+@property(nonatomic, weak) id profileEditorOrigin;
+@end
+
 @interface YMRenameController : YMFakeController
 @property(nonatomic) NSUInteger editorCreations;
 @property(nonatomic, strong) YMRenameEditorStandIn *lastEditor;
@@ -1188,6 +1201,95 @@ int main(void) {
                 [ac.panelPresenter invalidate];
                 [ae.pending removeAllObjects];
                 [ae.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *fw; YMRenameEnvironment *fe; YMManagedDisplay *fp;
+                YMRenameController *fc = RenameController(&fw, &fe, &fp);
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = fw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                fc.addDisplayButton = (NSButton *)(id)addButton;
+                fw.firstResponder = addButton;
+                [fc addDisplay:nil];
+                Expect(fc.profileEditor != nil && fc.editorCreations == 1, "focus fixture opens create editor");
+                addButton.enabled = NO;
+                [fc.lastEditor cancel:nil];
+                Expect(addButton.enabled, "cancel refreshes create button from latest permission");
+                Expect(fw.firstResponder == addButton, "cancel restores focus to create button");
+                Expect(fc.profileEditor == nil, "cancel clears current editor");
+                [fc.panelPresenter invalidate];
+                [fe.pending removeAllObjects];
+                [fe.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *ow; YMRenameEnvironment *oe; YMManagedDisplay *op;
+                YMRenameController *oc = RenameController(&ow, &oe, &op);
+                YMFocusControl *origin = [YMFocusControl new];
+                origin.window = ow;
+                origin.enabled = YES;
+                origin.acceptsFirstResponder = YES;
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = ow;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                oc.addDisplayButton = (NSButton *)(id)addButton;
+                [oc addDisplay:nil];
+                oc.profileEditorOrigin = (NSView *)(id)origin;
+                addButton.enabled = NO;
+                [oc.lastEditor cancel:nil];
+                Expect(ow.firstResponder == origin, "cancel restores an enabled origin control");
+                Expect(addButton.enabled, "cancel still refreshes create button when origin wins");
+                [oc.panelPresenter invalidate];
+                [oe.pending removeAllObjects];
+                [oe.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *dw; YMRenameEnvironment *de; YMManagedDisplay *dp;
+                YMRenameController *dc = RenameController(&dw, &de, &dp);
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = dw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                dc.addDisplayButton = (NSButton *)(id)addButton;
+                [dc addDisplay:nil];
+                addButton.enabled = NO;
+                dc.topologyRecoverySnapshot = [YMDisplayTopologySnapshot new];
+                [dc.lastEditor cancel:nil];
+                Expect(!addButton.enabled, "recovery keeps create button disabled after cancel");
+                Expect(dw.firstResponder == nil, "cancel yields window when no control is enabled");
+                Expect(dc.profileEditor == nil, "cancel still clears editor under recovery");
+                [dc.panelPresenter invalidate];
+                [de.pending removeAllObjects];
+                [de.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *sw; YMRenameEnvironment *se; YMManagedDisplay *sp;
+                YMRenameController *sc = RenameController(&sw, &se, &sp);
+                [sc addDisplay:nil];
+                YMRenameEditorStandIn *first = sc.lastEditor;
+                void (^staleEnd)(BOOL) = [first.endHandler copy];
+                Expect(staleEnd != nil, "open editor exposes endHandler");
+                YMRenameEditorStandIn *second = [YMRenameEditorStandIn new];
+                second.mode = YMDisplayProfileEditorModeCreate;
+                sc.profileEditor = (YMDisplayProfileEditor *)(id)second;
+                staleEnd(NO);
+                Expect(sc.profileEditor == (YMDisplayProfileEditor *)(id)second,
+                       "stale endHandler does not clear a newer editor");
+                sw.attachedSheet = second.window;
+                NSUInteger presentsBefore = sc.presentCalls;
+                NSUInteger editorsBefore = sc.editorCreations;
+                [sc presentProfileEditorForOrdinal:0 mode:YMDisplayProfileEditorModeCreate];
+                Expect(sc.presentCalls == presentsBefore + 1 && sc.editorCreations == editorsBefore
+                       && sc.profileEditor == (YMDisplayProfileEditor *)(id)second,
+                       "second present is rejected while attachedSheet remains");
+                [sc.panelPresenter invalidate];
+                [se.pending removeAllObjects];
+                [se.settling removeAllObjects];
             }
         }
     rename_tests_done:

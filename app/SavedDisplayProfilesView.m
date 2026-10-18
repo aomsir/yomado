@@ -58,10 +58,16 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     self.nameLabel.cell.truncatesLastVisibleLine = YES;
     [self.nameLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
                                              forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.nameLabel setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                               forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     self.detailLabel = YMSavedLabel(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
     self.detailLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     self.detailLabel.maximumNumberOfLines = 1;
+    [self.detailLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                               forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.detailLabel setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                                 forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     self.messageLabel = [NSTextField wrappingLabelWithString:@""];
     self.messageLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
@@ -73,11 +79,13 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
                                                 forOrientation:NSLayoutConstraintOrientationHorizontal];
     [self.messageLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired
                                                 forOrientation:NSLayoutConstraintOrientationVertical];
+    [self.messageLabel setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                                  forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     self.textStack = [[NSStackView alloc] init];
     self.textStack.translatesAutoresizingMaskIntoConstraints = NO;
     self.textStack.orientation = NSUserInterfaceLayoutOrientationVertical;
-    self.textStack.alignment = NSLayoutAttributeLeading;
+    self.textStack.alignment = NSLayoutAttributeWidth;
     self.textStack.spacing = 2;
     self.textStack.detachesHiddenViews = YES;
     [self.textStack addArrangedSubview:self.nameLabel];
@@ -106,44 +114,27 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     [self.startButton setContentCompressionResistancePriority:NSLayoutPriorityRequired
                                                forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    NSStackView *actions = [[NSStackView alloc] init];
-    actions.translatesAutoresizingMaskIntoConstraints = NO;
-    actions.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    actions.spacing = 8;
-    actions.alignment = NSLayoutAttributeCenterY;
-    [actions addArrangedSubview:self.editButton];
-    [actions addArrangedSubview:self.startButton];
-    [actions setContentHuggingPriority:NSLayoutPriorityRequired
-                        forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [actions setContentCompressionResistancePriority:NSLayoutPriorityRequired
-                                      forOrientation:NSLayoutConstraintOrientationHorizontal];
-
-    NSView *spacer = [[NSView alloc] initWithFrame:NSZeroRect];
-    spacer.translatesAutoresizingMaskIntoConstraints = NO;
-    [spacer setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [spacer setContentCompressionResistancePriority:1
-                                     forOrientation:NSLayoutConstraintOrientationHorizontal];
-
-    NSStackView *root = [[NSStackView alloc] init];
-    root.translatesAutoresizingMaskIntoConstraints = NO;
-    root.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    root.alignment = NSLayoutAttributeCenterY;
-    root.distribution = NSStackViewDistributionFill;
-    root.spacing = 10;
-    root.edgeInsets = NSEdgeInsetsMake(8, 4, 8, 4);
-    [root addArrangedSubview:self.iconView];
-    [root addArrangedSubview:self.textStack];
-    [root addArrangedSubview:spacer];
-    [root addArrangedSubview:actions];
-    [self addSubview:root];
+    [self addSubview:self.iconView];
+    [self addSubview:self.textStack];
+    [self addSubview:self.editButton];
+    [self addSubview:self.startButton];
 
     [NSLayoutConstraint activateConstraints:@[
-        [root.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
-        [root.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
-        [root.topAnchor constraintEqualToAnchor:self.topAnchor],
-        [root.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+        [self.iconView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:4],
+        [self.iconView.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
         [self.iconView.widthAnchor constraintEqualToConstant:20],
         [self.iconView.heightAnchor constraintEqualToConstant:20],
+
+        [self.startButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-4],
+        [self.startButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.editButton.trailingAnchor constraintEqualToAnchor:self.startButton.leadingAnchor constant:-8],
+        [self.editButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+
+        [self.textStack.leadingAnchor constraintEqualToAnchor:self.iconView.trailingAnchor constant:10],
+        [self.textStack.trailingAnchor constraintEqualToAnchor:self.editButton.leadingAnchor constant:-10],
+        [self.textStack.topAnchor constraintEqualToAnchor:self.topAnchor constant:8],
+        [self.textStack.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-8],
+
         [self.heightAnchor constraintGreaterThanOrEqualToConstant:56]
     ]];
     return self;
@@ -264,10 +255,15 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     self.viewportMinHeight = [self.scrollView.heightAnchor constraintGreaterThanOrEqualToConstant:56];
     self.viewportMaxHeight = [self.scrollView.heightAnchor constraintLessThanOrEqualToConstant:184];
     self.viewportPreferredHeight = [self.scrollView.heightAnchor constraintEqualToConstant:56];
-    self.viewportPreferredHeight.priority = NSLayoutPriorityDefaultHigh;
+    // Prefer content height, but yield below the window's min size so 760×520 can hold.
+    self.viewportPreferredHeight.priority = NSLayoutPriorityDefaultLow;
     self.viewportMinHeight.active = YES;
     self.viewportMaxHeight.active = YES;
     self.viewportPreferredHeight.active = YES;
+    [self.scrollView setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                                forOrientation:NSLayoutConstraintOrientationVertical];
+    [self.scrollView setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                              forOrientation:NSLayoutConstraintOrientationVertical];
 
     self.rootStack = [[NSStackView alloc] init];
     self.rootStack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -322,6 +318,27 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     [self.rowsStack layoutSubtreeIfNeeded];
     CGFloat contentHeight = MAX(self.rowsStack.fittingSize.height, 56);
     self.viewportPreferredHeight.constant = MIN(184, contentHeight);
+}
+
+- (void)ensureSavedRowsReachable {
+    if (self.collapsed || self.hidden || self.rowsStack.arrangedSubviews.count == 0) return;
+    [self.scrollView layoutSubtreeIfNeeded];
+    [self.rowsStack layoutSubtreeIfNeeded];
+    NSRect visible = [self.scrollView documentVisibleRect];
+    BOOL completeRowVisible = NO;
+    for (NSView *row in self.rowsStack.arrangedSubviews) {
+        NSRect rowRect = [row convertRect:row.bounds toView:self.rowsStack];
+        NSRect part = NSIntersectionRect(visible, rowRect);
+        if (part.size.height >= rowRect.size.height - 1.0) {
+            completeRowVisible = YES;
+            break;
+        }
+    }
+    if (completeRowVisible) return;
+    NSView *first = self.rowsStack.arrangedSubviews.firstObject;
+    NSRect firstRect = [first convertRect:first.bounds toView:self.rowsStack];
+    [self.rowsStack scrollRectToVisible:firstRect];
+    [self.scrollView reflectScrolledClipView:self.scrollView.contentView];
 }
 
 - (void)updateRows:(NSArray<YMSavedDisplayProfileRow *> *)rows
@@ -400,6 +417,7 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
         [self.scrollView.contentView scrollToPoint:savedOrigin];
         [self.scrollView reflectScrolledClipView:self.scrollView.contentView];
     }
+    [self ensureSavedRowsReachable];
 }
 
 @end

@@ -5,6 +5,11 @@
 #import "Yomado.m"
 #undef main
 
+@interface ADController (YMPreviewInstallTestDeclaration)
+- (void)installPreviewProfilesForState:(NSString *)state;
+- (NSArray<YMSavedDisplayProfileRow *> *)savedProfileRows;
+@end
+
 @interface YMPreviewProfileDisplay : VDVirtualDisplay
 @property(nonatomic) BOOL live;
 @property(nonatomic) CGDirectDisplayID fixtureID;
@@ -89,6 +94,24 @@ static ADController *PanelController(NSUInteger savedCount, NSSize contentSize, 
     return controller;
 }
 
+static BOOL PanelLabelEquals(NSView *view, NSString *text) {
+    if (![view isKindOfClass:NSTextField.class]) return NO;
+    return [((NSTextField *)view).stringValue isEqualToString:text];
+}
+
+static BOOL PanelTreeContainsLabel(NSView *view, NSString *text) {
+    if (PanelLabelEquals(view, text)) return YES;
+    for (NSView *child in view.subviews) {
+        if (PanelTreeContainsLabel(child, text)) return YES;
+    }
+    return NO;
+}
+
+static void CollectAmbiguousViews(NSView *view, NSMutableArray<NSView *> *out) {
+    if (view.hasAmbiguousLayout) [out addObject:view];
+    for (NSView *child in view.subviews) CollectAmbiguousViews(child, out);
+}
+
 static void AssertBasics(ADController *controller, NSUInteger savedCount) {
     Check(controller.addDisplayButton != nil, "new display entry is present");
     Check(controller.addDisplayButton.action == @selector(addDisplay:), "new button opens editor action");
@@ -97,6 +120,10 @@ static void AssertBasics(ADController *controller, NSUInteger savedCount) {
     Check(controller.savedProfilesView != nil, "saved profiles section exists");
     Check(controller.savedProfilesView.hidden == (savedCount == 0), "saved section empty behavior");
     Check(controller.profileActivityLabel != nil, "activity label exists");
+    Check(PanelTreeContainsLabel(controller.window.contentView, @"为视觉 Agent 留一块工作屏。"),
+          "tagline matches Spec short sentence");
+    Check(!PanelTreeContainsLabel(controller.window.contentView, @"为视觉 Agent 留一块工作屏，让实体屏可以休息。"),
+          "tagline drops the unverified resting claim");
     Check(!controller.window.visible, "fixture never reveals a window");
     Check(NSApp.activationPolicy == NSApplicationActivationPolicyProhibited, "fixture never activates app");
 }
@@ -120,16 +147,89 @@ static void AssertCanvas(ADController *controller) {
     }
 }
 
+static BOOL FramesOverlap(NSRect a, NSRect b) {
+    return NSIntersectsRect(NSInsetRect(a, 0.5, 0.5), NSInsetRect(b, 0.5, 0.5));
+}
+
 static void AssertSavedSection(ADController *controller) {
     YMSavedDisplayProfilesView *view = controller.savedProfilesView;
     if (view.hidden) return;
     Check(!view.hasAmbiguousLayout, "saved section layout is unambiguous");
+    NSMutableArray<NSView *> *ambiguous = [NSMutableArray array];
+    CollectAmbiguousViews(view, ambiguous);
+    Check(ambiguous.count == 0, "saved section subtree has no ambiguous layout");
     NSRect frame = view.frame;
     Check(frame.size.width > 100 && frame.size.height > 40, "saved section has measurable frame");
-    // Long names must not shove action buttons out of the row.
-    for (NSView *subview in view.subviews) {
-        (void)subview;
+
+    NSScrollView *viewport = nil;
+    for (NSView *child in view.subviews) {
+        if ([child isKindOfClass:NSStackView.class]) {
+            for (NSView *arranged in ((NSStackView *)child).arrangedSubviews) {
+                if ([arranged isKindOfClass:NSScrollView.class]) viewport = (NSScrollView *)arranged;
+            }
+        }
     }
+    Check(viewport != nil, "saved section exposes a scroll viewport");
+    CGFloat viewportHeight = viewport.bounds.size.height;
+    Check(viewportHeight >= 55.5 && viewportHeight <= 184.5, "saved viewport stays within 56-184");
+
+    NSView *document = viewport.documentView;
+    NSRect visibleDoc = [viewport documentVisibleRect];
+    NSArray<NSView *> *rows = [document isKindOfClass:NSStackView.class]
+        ? ((NSStackView *)document).arrangedSubviews : document.subviews;
+    NSUInteger completeRows = 0;
+    for (NSView *row in rows) {
+        NSRect rowInDoc = [row convertRect:row.bounds toView:document];
+        NSRect visiblePart = NSIntersectionRect(visibleDoc, rowInDoc);
+        BOOL fullyVisible = visiblePart.size.height >= MAX(1.0, rowInDoc.size.height - 1.0)
+            && visiblePart.size.width >= MAX(1.0, rowInDoc.size.width - 1.0);
+        if (fullyVisible) completeRows++;
+        NSButton *start = nil;
+        NSButton *edit = nil;
+        NSMutableArray<NSButton *> *buttons = [NSMutableArray array];
+        NSMutableArray<NSView *> *stack = [NSMutableArray arrayWithObject:row];
+        while (stack.count) {
+            NSView *node = stack.lastObject;
+            [stack removeLastObject];
+            if ([node isKindOfClass:NSButton.class]) [buttons addObject:(NSButton *)node];
+            for (NSView *child in node.subviews) [stack addObject:child];
+        }
+        for (NSButton *button in buttons) {
+            if ([button.title containsString:@"启动"]) start = button;
+            if ([button.title isEqualToString:@"编辑"]) edit = button;
+        }
+        Check(start != nil && edit != nil, "saved row keeps start and edit buttons");
+        NSRect startInRow = [start convertRect:start.bounds toView:row];
+        NSRect editInRow = [edit convertRect:edit.bounds toView:row];
+        Check(NSContainsRect(row.bounds, startInRow), "start button stays inside row");
+        Check(NSContainsRect(row.bounds, editInRow), "edit button stays inside row");
+        Check(!FramesOverlap(startInRow, editInRow), "start and edit do not overlap");
+        if (fullyVisible) {
+            NSRect startInDoc = [start convertRect:start.bounds toView:document];
+            NSRect editInDoc = [edit convertRect:edit.bounds toView:document];
+            Check(NSContainsRect(visibleDoc, startInDoc), "visible row keeps start reachable");
+            Check(NSContainsRect(visibleDoc, editInDoc), "visible row keeps edit reachable");
+        }
+    }
+    if (rows.count > 0 && completeRows < 1) {
+        fprintf(stderr, "FAIL complete saved row missing (rows=%lu viewportH=%.1f visibleDoc=%s)\n",
+                (unsigned long)rows.count, viewportHeight, NSStringFromRect(visibleDoc).UTF8String);
+        for (NSUInteger i = 0; i < MIN(rows.count, 3); i++) {
+            NSView *row = rows[i];
+            NSRect rowInDoc = [row convertRect:row.bounds toView:document];
+            fprintf(stderr, "  row[%lu] doc=%s intersect=%s\n", (unsigned long)i,
+                    NSStringFromRect(rowInDoc).UTF8String,
+                    NSStringFromRect(NSIntersectionRect(visibleDoc, rowInDoc)).UTF8String);
+        }
+        exit(1);
+    }
+}
+
+static void AssertContentSize(ADController *controller, NSSize requested) {
+    NSSize actual = controller.window.contentView.bounds.size;
+    Check(fabs(actual.width - requested.width) <= 0.5
+          && fabs(actual.height - requested.height) <= 0.5,
+          "contentView bounds match requested content size");
 }
 
 static void RunSizeMatrix(void) {
@@ -145,8 +245,14 @@ static void RunSizeMatrix(void) {
             NSUInteger savedCount = countValue.unsignedIntegerValue;
             ADController *controller = PanelController(savedCount, size, YES);
             AssertBasics(controller, savedCount);
+            AssertContentSize(controller, size);
             AssertCanvas(controller);
             AssertSavedSection(controller);
+            if (savedCount == 30) {
+                NSMutableArray<NSView *> *ambiguous = [NSMutableArray array];
+                CollectAmbiguousViews(controller.window.contentView, ambiguous);
+                Check(ambiguous.count == 0, "30-row whole window subtree has no ambiguous layout");
+            }
             [controller.window close];
             printf("PASS panel size %.0fx%.0f saved=%lu\n", size.width, size.height, (unsigned long)savedCount);
         }
@@ -154,6 +260,22 @@ static void RunSizeMatrix(void) {
 }
 
 static void RunAppearanceAndRefresh(void) {
+    for (NSAppearance *appearance in @[
+        [NSAppearance appearanceNamed:NSAppearanceNameAqua],
+        [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]
+    ]) {
+        NSApp.appearance = appearance;
+        ADController *longNames = PanelController(30, NSMakeSize(760, 520), YES);
+        longNames.window.appearance = appearance;
+        [longNames.window.contentView layoutSubtreeIfNeeded];
+        AssertContentSize(longNames, NSMakeSize(760, 520));
+        AssertSavedSection(longNames);
+        NSMutableArray<NSView *> *ambiguous = [NSMutableArray array];
+        CollectAmbiguousViews(longNames.window.contentView, ambiguous);
+        Check(ambiguous.count == 0, "30-row min window is unambiguous in both appearances");
+        [longNames.window close];
+    }
+
     ADController *controller = PanelController(2, NSMakeSize(1000, 620), YES);
     AssertBasics(controller, 2);
     NSArray *appearances = @[
@@ -224,6 +346,49 @@ static void RunEntryActions(void) {
     printf("PASS entry actions and factory\n");
 }
 
+static void RunPreviewIdentity(void) {
+    Check([ADController instancesRespondToSelector:@selector(installPreviewProfilesForState:)],
+          "preview profile installer exists");
+    ADController *controller = [[ADController alloc] init];
+    controller.previewMode = YES;
+    controller.previewState = @"multi";
+    controller.previewSnapshot = PanelSnapshot(YES);
+    NSMutableArray *snapshot = [controller.previewSnapshot mutableCopy];
+    [snapshot addObject:@{@"displayID":@903, @"name":@"虚拟屏 2 · GrokBot", @"x":@7040, @"y":@0,
+        @"logicalWidth":@1920, @"logicalHeight":@1080, @"isMain":@NO, @"isVirtual":@YES,
+        @"isActive":@YES, @"isOnline":@YES}];
+    controller.previewSnapshot = snapshot;
+    [controller installPreviewProfilesForState:@"multi"];
+    [controller buildWindow];
+    [controller.window setContentSize:NSMakeSize(1000, 620)];
+    [controller updateInventory];
+    NSArray<YMSavedDisplayProfileRow *> *rows = [controller savedProfileRows];
+    NSMutableSet<NSString *> *savedNames = [NSMutableSet set];
+    for (YMSavedDisplayProfileRow *row in rows) [savedNames addObject:row.name];
+    BOOL savedCodex = NO, savedGrok = NO, savedBlender = NO;
+    for (NSString *name in savedNames) {
+        if ([name containsString:@"Codex · Blender"]) savedBlender = YES;
+        else if ([name containsString:@"Codex"]) savedCodex = YES;
+        else if ([name containsString:@"GrokBot"]) savedGrok = YES;
+    }
+    Check(!savedCodex, "running Codex is not listed as stopped");
+    Check(!savedGrok, "running GrokBot is not listed as stopped");
+    Check(savedBlender, "stopped preview sibling stays in saved list");
+    BOOL foundCodex = NO, foundGrok = NO;
+    for (YMManagedDisplay *profile in controller.displayProfiles) {
+        if ([profile.friendlyName isEqualToString:@"Codex"]) {
+            foundCodex = profile.display.isCreated && profile.display.displayID == 902;
+        }
+        if ([profile.friendlyName isEqualToString:@"GrokBot"]) {
+            foundGrok = profile.display.isCreated && profile.display.displayID == 903;
+        }
+    }
+    Check(foundCodex, "preview Codex uses owned fake running display 902");
+    Check(foundGrok, "preview GrokBot uses owned fake running display 903");
+    [controller.window close];
+    printf("PASS preview running/stopped identity\n");
+}
+
 int main(void) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -232,6 +397,7 @@ int main(void) {
         RunSizeMatrix();
         RunAppearanceAndRefresh();
         RunEntryActions();
+        RunPreviewIdentity();
         Check(!NSApp.isActive, "fixture never activates");
         printf("Display profile panel tests passed.\n");
         return 0;
