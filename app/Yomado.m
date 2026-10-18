@@ -211,6 +211,7 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property NSTextField *profileActivityLabel;
 @property(weak) NSView *profileEditorOrigin;
 @property BOOL profileEditorFocusPending;
+@property(copy) NSString *profileStartRejectionText;
 - (void)restore:(id)sender;
 - (void)buildWindow;
 - (void)preparePanelPresenter;
@@ -853,16 +854,19 @@ static NSView *YMSpacer(void) {
         self.addDisplayButton.enabled = actionable;
     }
     // Completion can run while attachedSheet is still set. Keep origin and wait for
-    // the real detach instead of settling on nil behind the sheet gate. Always
-    // re-queue: an early async may itself observe the sheet still attached.
+    // the real detach instead of settling on nil behind the sheet gate. Queue at most
+    // one async probe; further attempts stay pending for updateInventory.
     if (self.window.attachedSheet != nil) {
+        BOOL alreadyPending = self.profileEditorFocusPending;
         self.profileEditorFocusPending = YES;
-        __weak ADController *weakSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            ADController *controller = weakSelf;
-            if (!controller || !controller.profileEditorFocusPending) return;
-            [controller restoreProfileEditorFocus];
-        });
+        if (!alreadyPending) {
+            __weak ADController *weakSelf = self;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ADController *controller = weakSelf;
+                if (!controller || !controller.profileEditorFocusPending) return;
+                [controller restoreProfileEditorFocus];
+            });
+        }
         return;
     }
     BOOL wasPending = self.profileEditorFocusPending;
@@ -916,6 +920,10 @@ static NSView *YMSpacer(void) {
         return;
     }
     if (![self profileActionsAvailableForEditor:nil]) return;
+    if (self.profileStartRejectionText.length) {
+        self.profileStartRejectionText = nil;
+        [self updateSavedProfilesPresentation];
+    }
     YMManagedDisplay *target = mode == YMDisplayProfileEditorModeCreate ? nil : [self profileWithOrdinal:ordinal];
     if (mode == YMDisplayProfileEditorModeEdit && target.display.isCreated) return;
     YMDisplayProfileDraft *draft = mode == YMDisplayProfileEditorModeCreate
@@ -1168,18 +1176,17 @@ static NSView *YMSpacer(void) {
             if (!message.length) message = @"当前无法启动虚拟屏，请稍后重试。";
             YMManagedDisplay *profile = [controller profileWithOrdinal:ordinal];
             if (profile && [controller.displayProfiles containsObject:profile] && !profile.display.isCreated) {
+                controller.profileStartRejectionText = nil;
                 profile.startFailureText = message;
                 controller.pendingProfileRevealOrdinal = @(ordinal);
                 [controller updateSavedProfilesPresentation];
             } else {
+                controller.profileStartRejectionText = message;
                 [controller updateSavedProfilesPresentation];
-                if (controller.profileActivityLabel) {
-                    controller.profileActivityLabel.stringValue = message;
-                    controller.profileActivityLabel.hidden = NO;
-                }
             }
             return;
         }
+        controller.profileStartRejectionText = nil;
         [controller updateSavedProfilesPresentation];
     };
     self.savedProfilesView.onEdit = ^(NSUInteger ordinal) {
@@ -1721,6 +1728,7 @@ static NSView *YMSpacer(void) {
         return [NSString stringWithFormat:@"%@ 启动中…", profile.friendlyName];
     }
     if (self.topologyRecoverySnapshot) return @"显示排列待恢复，请先使用恢复入口。";
+    if (self.profileStartRejectionText.length) return self.profileStartRejectionText;
     return @"";
 }
 - (void)create:(id)sender {

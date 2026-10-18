@@ -438,6 +438,8 @@
 @property(nonatomic) YMDisplayProfileEditorMode lastPresentMode;
 @property(nonatomic) NSUInteger lastPresentOrdinal;
 @property(nonatomic) NSUInteger presentCalls;
+@property(nonatomic) NSUInteger restoreFocusCalls;
+@property(nonatomic) BOOL inventoryDrivesPendingRestore;
 @end
 @implementation YMRenameController
 - (YMDisplayProfileEditor *)makeDisplayProfileEditorWithMode:(YMDisplayProfileEditorMode)mode
@@ -454,6 +456,19 @@
     self.lastPresentOrdinal = ordinal;
     self.lastPresentMode = mode;
     [super presentProfileEditorForOrdinal:ordinal mode:mode];
+}
+- (void)restoreProfileEditorFocus {
+    self.restoreFocusCalls++;
+    [super restoreProfileEditorFocus];
+}
+- (void)updateInventory {
+    self.inventoryUpdates++;
+    // Headless stand-in for the production updateInventory pending-restore handoff.
+    // Real AppKit inventory coverage lives in DisplayProfilePanelTests.
+    if (self.inventoryDrivesPendingRestore
+        && self.profileEditorFocusPending && !self.profileEditor && self.window.attachedSheet == nil) {
+        [self restoreProfileEditorFocus];
+    }
 }
 @end
 
@@ -1351,24 +1366,32 @@ int main(void) {
                 pc.lastEditor.finished = YES;
                 pc.lastEditor.endHandler = nil;
                 pc.lastEditor.submitHandler = nil;
+                NSUInteger restoresBeforeEnd = pc.restoreFocusCalls;
                 endWhileAttached(NO);
                 Expect(pw.attachedSheet != nil && pc.profileEditorFocusPending,
                        "early async fixture keeps sheet and pending restore");
-                // Let the first deferred restore fire while AppKit still reports attachedSheet.
+                Expect(pc.restoreFocusCalls == restoresBeforeEnd + 1,
+                       "endHandler schedules exactly one restore attempt");
+                // Drain while Sheet stays attached: must stay bounded, not busy-spin.
                 for (NSUInteger pass = 0; pass < 40 && pw.attachedSheet != nil; pass++) {
                     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
                 }
                 Expect(pw.attachedSheet != nil && pc.profileEditorFocusPending && !origin.enabled,
                        "early async restore leaves origin gated while sheet remains");
-                pw.attachedSheet = nil;
-                for (NSUInteger pass = 0; pass < 40
-                     && (pc.profileEditorFocusPending || !origin.enabled || pw.firstResponder != origin);
-                     pass++) {
+                Expect(pc.restoreFocusCalls <= restoresBeforeEnd + 2,
+                       "attachedSheet restore stays bounded to one async retry");
+                NSUInteger restoresWhileAttached = pc.restoreFocusCalls;
+                for (NSUInteger pass = 0; pass < 20; pass++) {
                     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
                 }
-                Expect(origin.enabled, "rescheduled restore refreshes origin after early async");
-                Expect(pw.firstResponder == origin, "rescheduled restore focuses refreshed origin");
-                Expect(!pc.profileEditorFocusPending, "rescheduled restore clears pending flag");
+                Expect(pc.restoreFocusCalls == restoresWhileAttached,
+                       "no further self-reschedule while attachedSheet remains");
+                pw.attachedSheet = nil;
+                pc.inventoryDrivesPendingRestore = YES;
+                [pc updateInventory];
+                Expect(origin.enabled, "inventory handoff refreshes origin after delayed detach");
+                Expect(pw.firstResponder == origin, "inventory handoff focuses refreshed origin");
+                Expect(!pc.profileEditorFocusPending, "inventory handoff clears pending flag");
                 [pc.panelPresenter invalidate];
                 [pe.pending removeAllObjects];
                 [pe.settling removeAllObjects];

@@ -9,6 +9,12 @@
 - (void)installPreviewProfilesForState:(NSString *)state;
 - (NSArray<YMSavedDisplayProfileRow *> *)savedProfileRows;
 @property(nonatomic) BOOL profileEditorFocusPending;
+@property(nonatomic, weak) NSView *profileEditorOrigin;
+@property(nonatomic, copy) NSString *profileStartRejectionText;
+@end
+
+@interface YMDisplayProfileEditor (YMPanelTestAccess)
+@property(nonatomic, strong) NSTextField *nameField;
 @end
 
 @interface YMPreviewProfileDisplay : VDVirtualDisplay
@@ -433,6 +439,13 @@ static void PanelDrainSheet(ADController *controller) {
     for (NSUInteger pass = 0; pass < 80; pass++) {
         if (!controller.window.attachedSheet && controller.profileEditor == nil
             && !controller.profileEditorFocusPending) return;
+        // After real detach, drive production inventory pending-restore handoff.
+        // Do not busy-spin restore while attachedSheet remains.
+        if (!controller.window.attachedSheet && controller.profileEditor == nil
+            && controller.profileEditorFocusPending) {
+            [controller updateInventory];
+            continue;
+        }
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
     }
 }
@@ -472,6 +485,27 @@ static void RunEntryActions(void) {
     Check(sawMessage, "production onStart rejection is visible on the saved row");
     Check([saved.friendlyName isEqualToString:nameBefore], "production onStart rejection does not rewrite profile");
 
+    controller.savedProfilesView.onStart(99999);
+    Check(controller.profileActivityLabel != nil
+          && !controller.profileActivityLabel.hidden
+          && controller.profileActivityLabel.stringValue.length > 0,
+          "invalid ordinal rejection is visible on activity label");
+    NSString *invalidRejection = [controller.profileActivityLabel.stringValue copy];
+    for (NSUInteger pass = 0; pass < 40; pass++) {
+        [controller updateSavedProfilesPresentation];
+    }
+    Check(!controller.profileActivityLabel.hidden
+          && [controller.profileActivityLabel.stringValue isEqualToString:invalidRejection],
+          "invalid ordinal rejection survives 40 ordinary refreshes");
+    controller.topologyRecoverySnapshot = (id)[NSObject new];
+    [controller updateSavedProfilesPresentation];
+    Check([controller.profileActivityLabel.stringValue containsString:@"待恢复"],
+          "recovery activity outranks stale start rejection");
+    controller.topologyRecoverySnapshot = nil;
+    [controller updateSavedProfilesPresentation];
+    Check([controller.profileActivityLabel.stringValue isEqualToString:invalidRejection],
+          "start rejection returns after higher-priority activity clears");
+
     NSButton *editButton = PanelFindTaggedButton(controller.savedProfilesView, @"编辑", (NSInteger)saved.ordinal);
     Check(editButton != nil, "saved row exposes an edit button");
     controller.previewMode = NO;
@@ -485,6 +519,9 @@ static void RunEntryActions(void) {
           "production onEdit opens edit mode for the ordinal");
     Check(!saved.display.isCreated, "production onEdit does not auto-start");
     Check(controller.profileEditorOrigin == editButton, "production onEdit keeps saved-row origin");
+    Check(controller.profileActivityLabel.hidden
+          || controller.profileActivityLabel.stringValue.length == 0,
+          "opening editor clears session start-rejection activity");
     editButton.enabled = NO;
     controller.addDisplayButton.enabled = NO;
     [controller.profileEditor cancel:nil];
@@ -494,6 +531,67 @@ static void RunEntryActions(void) {
     Check(editButton.enabled, "cancel refreshes saved-row edit after production onEdit");
     Check(controller.window.firstResponder == editButton,
           "cancel restores focus to production saved-row edit origin");
+
+    id defaultsBefore = [NSUserDefaults.standardUserDefaults objectForKey:@"NamedDisplayProfiles"];
+    [controller.window makeFirstResponder:editButton];
+    controller.savedProfilesView.onEdit(saved.ordinal);
+    Check(controller.profileEditor != nil, "production onEdit reopens for valid save");
+    controller.profileEditor.nameField.stringValue = @"Saved Origin";
+    [controller.profileEditor submit:nil];
+    PanelDrainSheet(controller);
+    Check(controller.profileEditor == nil && controller.window.attachedSheet == nil,
+          "production onEdit save clears sheet");
+    Check([saved.friendlyName isEqualToString:@"Saved Origin"], "valid save updates profile name");
+    Check(!saved.display.isCreated, "valid save does not auto-start");
+    NSButton *editAfterSave = PanelFindTaggedButton(controller.savedProfilesView, @"编辑",
+                                                    (NSInteger)saved.ordinal);
+    Check(editAfterSave != nil && editAfterSave.enabled,
+          "valid save refreshes production saved-row edit");
+    Check(controller.window.firstResponder == editAfterSave,
+          "valid save restores focus to production saved-row edit origin");
+    if (defaultsBefore)
+        [NSUserDefaults.standardUserDefaults setObject:defaultsBefore forKey:@"NamedDisplayProfiles"];
+    else
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"NamedDisplayProfiles"];
+
+    [controller.window makeFirstResponder:editAfterSave];
+    controller.savedProfilesView.onEdit(saved.ordinal);
+    Check(controller.profileEditor != nil && controller.window.attachedSheet != nil,
+          "delayed-detach fixture opens production edit sheet");
+    NSButton *origin = editAfterSave;
+    Check(controller.profileEditorOrigin == origin, "delayed-detach keeps production NSButton origin");
+    YMDisplayProfileEditor *detachEditor = controller.profileEditor;
+    NSWindow *sheet = detachEditor.window;
+    void (^endWhileAttached)(BOOL) = [detachEditor.endHandler copy];
+    Check(endWhileAttached != nil, "production editor exposes endHandler");
+    detachEditor.endHandler = nil;
+    detachEditor.submitHandler = nil;
+    endWhileAttached(NO);
+    Check(controller.profileEditor == nil, "endHandler clears editor while sheet still attached");
+    Check(controller.window.attachedSheet != nil, "delayed-detach leaves attachedSheet");
+    Check(controller.profileEditorFocusPending, "delayed-detach keeps pending restore");
+    Check(controller.profileEditorOrigin == origin, "origin retained until inventory handoff");
+    for (NSUInteger pass = 0; pass < 20 && controller.window.attachedSheet != nil; pass++) {
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    }
+    Check(controller.profileEditorFocusPending && controller.window.attachedSheet != nil,
+          "bounded restore keeps pending while production sheet remains");
+    [controller.window endSheet:sheet];
+    for (NSUInteger pass = 0; pass < 40 && controller.window.attachedSheet != nil; pass++) {
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    }
+    Check(controller.window.attachedSheet == nil, "fixture ends production sheet");
+    Check(controller.profileEditorFocusPending, "pending survives until production inventory");
+    [controller updateInventory];
+    NSButton *editAfterDetach = PanelFindTaggedButton(controller.savedProfilesView, @"编辑",
+                                                      (NSInteger)saved.ordinal);
+    Check(editAfterDetach != nil && editAfterDetach.enabled,
+          "production inventory refreshes saved-row edit after delayed detach");
+    Check(controller.window.firstResponder == editAfterDetach,
+          "production inventory restores focus to saved-row NSButton origin");
+    Check(!controller.profileEditorFocusPending, "production inventory clears pending restore");
+    Check(!saved.display.isCreated, "delayed detach path does not auto-start");
+
     controller.previewMode = YES;
     [controller updateSavedProfilesPresentation];
 
