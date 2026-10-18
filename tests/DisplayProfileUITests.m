@@ -541,6 +541,14 @@ static void SavedRowsCollapseScrollAndLayout(void) {
     for (NSUInteger pass = 0; pass < 40; pass++) [view updateRows:rows revealOrdinal:nil];
     Check(NSEqualPoints(before, view.scrollView.contentView.bounds.origin), "periodic refresh preserves scroll");
 
+    [view.scrollView.contentView scrollToPoint:NSMakePoint(0, 500)];
+    [view.scrollView reflectScrolledClipView:view.scrollView.contentView];
+    NSPoint jagged = view.scrollView.contentView.bounds.origin;
+    Check(fabs(jagged.y - 500.0) < 1.0, "fixture can park at non-aligned offset 500");
+    for (NSUInteger pass = 0; pass < 40; pass++) [view updateRows:rows revealOrdinal:nil];
+    Check(NSEqualPoints(jagged, view.scrollView.contentView.bounds.origin),
+          "ordinary refresh preserves non-aligned scroll offset");
+
     [view toggleCollapsed:nil];
     [view updateRows:rows revealOrdinal:@30];
     [window.contentView layoutSubtreeIfNeeded];

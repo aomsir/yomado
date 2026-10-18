@@ -210,6 +210,7 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property YMSavedDisplayProfilesView *savedProfilesView;
 @property NSTextField *profileActivityLabel;
 @property(weak) NSView *profileEditorOrigin;
+@property BOOL profileEditorFocusPending;
 - (void)restore:(id)sender;
 - (void)buildWindow;
 - (void)preparePanelPresenter;
@@ -836,9 +837,11 @@ static NSView *YMSpacer(void) {
 }
 - (void)restoreProfileEditorFocus {
     NSWindow *window = self.window;
-    if (!window) return;
-    NSView *origin = self.profileEditorOrigin;
-    self.profileEditorOrigin = nil;
+    if (!window) {
+        self.profileEditorOrigin = nil;
+        self.profileEditorFocusPending = NO;
+        return;
+    }
     // Sheet/editor are already cleared; refresh enabled from the latest gates so
     // focus does not chase a control that updateInventory disabled while open.
     if (self.addDisplayButton) {
@@ -848,6 +851,42 @@ static NSView *YMSpacer(void) {
         self.addDisplayButton.enabled = !self.previewMode && !busy && !self.topologyRecoverySnapshot
             && !self.profileEditor && self.window.attachedSheet == nil;
     }
+    // Completion can run while attachedSheet is still set. Keep origin and wait for
+    // the real detach instead of settling on nil behind the sheet gate.
+    if (self.window.attachedSheet != nil) {
+        BOOL alreadyPending = self.profileEditorFocusPending;
+        self.profileEditorFocusPending = YES;
+        if (!alreadyPending) {
+            __weak ADController *weakSelf = self;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ADController *controller = weakSelf;
+                if (!controller || !controller.profileEditorFocusPending) return;
+                [controller restoreProfileEditorFocus];
+            });
+        }
+        return;
+    }
+    BOOL wasPending = self.profileEditorFocusPending;
+    self.profileEditorFocusPending = NO;
+    if (self.profileEditor != nil) return;
+    if (wasPending) {
+        id current = window.firstResponder;
+        if (current != nil && current != window) {
+            BOOL accepts = ![current respondsToSelector:@selector(acceptsFirstResponder)]
+                || [current acceptsFirstResponder];
+            BOOL enabled = ![current respondsToSelector:@selector(isEnabled)]
+                || [(NSControl *)current isEnabled];
+            id currentWindow = [current respondsToSelector:@selector(window)] ? [current window] : nil;
+            if (currentWindow == window && accepts && enabled
+                && current != (id)self.profileEditorOrigin
+                && current != (id)self.addDisplayButton) {
+                self.profileEditorOrigin = nil;
+                return;
+            }
+        }
+    }
+    NSView *origin = self.profileEditorOrigin;
+    self.profileEditorOrigin = nil;
     if (origin && origin.window == window && origin.acceptsFirstResponder
         && (!([origin respondsToSelector:@selector(isEnabled)]) || [(NSControl *)origin isEnabled])) {
         [window makeFirstResponder:origin];
@@ -1434,6 +1473,9 @@ static NSView *YMSpacer(void) {
         BOOL busy = self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress || self.appOperationInProgress;
         self.addDisplayButton.enabled = !self.previewMode && !busy && !self.topologyRecoverySnapshot
             && !self.profileEditor && self.window.attachedSheet == nil;
+        if (self.profileEditorFocusPending && !self.profileEditor && self.window.attachedSheet == nil) {
+            [self restoreProfileEditorFocus];
+        }
         self.statusPill.text = busy ? @"正在更新" : self.topologyRecoverySnapshot ? @"显示排列待恢复" : virtualCount ? @"工作屏已就绪" : @"尚未启动";
         self.statusPill.tint = busy ? NSColor.systemOrangeColor : virtualCount ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
         [self updateSavedProfilesPresentation];

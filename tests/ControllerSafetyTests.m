@@ -1291,6 +1291,105 @@ int main(void) {
                 [se.pending removeAllObjects];
                 [se.settling removeAllObjects];
             }
+
+            {
+                YMRenameWindow *lw; YMRenameEnvironment *le; YMManagedDisplay *lp;
+                YMRenameController *lc = RenameController(&lw, &le, &lp);
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = lw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                lc.addDisplayButton = (NSButton *)(id)addButton;
+                lw.firstResponder = addButton;
+                [lc addDisplay:nil];
+                Expect(lc.profileEditor != nil && lw.attachedSheet != nil,
+                       "delayed-detach fixture opens create sheet");
+                addButton.enabled = NO;
+                void (^endWhileAttached)(BOOL) = [lc.lastEditor.endHandler copy];
+                Expect(endWhileAttached != nil, "delayed-detach fixture exposes endHandler");
+                lc.lastEditor.finished = YES;
+                lc.lastEditor.endHandler = nil;
+                lc.lastEditor.submitHandler = nil;
+                endWhileAttached(NO);
+                Expect(lc.profileEditor == nil, "endHandler clears editor while sheet still attached");
+                Expect(lw.attachedSheet != nil, "endHandler leaves attachedSheet for later detach");
+                Expect(lc.profileEditorOrigin != nil, "origin is kept until sheet detaches");
+                Expect(!addButton.enabled, "create button stays gated by attachedSheet");
+                lw.attachedSheet = nil;
+                [lc restoreProfileEditorFocus];
+                Expect(addButton.enabled, "delayed detach refreshes create button once");
+                Expect(lw.firstResponder == addButton, "focus restores once after delayed detach");
+                Expect(lc.profileEditorOrigin == nil, "origin clears after successful delayed restore");
+                id responderAfterRestore = lw.firstResponder;
+                [lc restoreProfileEditorFocus];
+                Expect(lw.firstResponder == responderAfterRestore,
+                       "extra restore after success does not reshuffle focus");
+                [lc.panelPresenter invalidate];
+                [le.pending removeAllObjects];
+                [le.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *nw; YMRenameEnvironment *ne; YMManagedDisplay *np;
+                YMRenameController *nc = RenameController(&nw, &ne, &np);
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = nw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                nc.addDisplayButton = (NSButton *)(id)addButton;
+                nw.firstResponder = addButton;
+                [nc addDisplay:nil];
+                addButton.enabled = NO;
+                void (^endWhileAttached)(BOOL) = [nc.lastEditor.endHandler copy];
+                nc.lastEditor.finished = YES;
+                nc.lastEditor.endHandler = nil;
+                nc.lastEditor.submitHandler = nil;
+                endWhileAttached(NO);
+                Expect(nc.profileEditorOrigin != nil, "pending restore keeps origin before new editor");
+                YMRenameEditorStandIn *newer = [YMRenameEditorStandIn new];
+                newer.mode = YMDisplayProfileEditorModeCreate;
+                nc.profileEditor = (YMDisplayProfileEditor *)(id)newer;
+                nw.attachedSheet = nil;
+                [nc restoreProfileEditorFocus];
+                id responderBefore = nw.firstResponder;
+                Expect(nc.profileEditor == (YMDisplayProfileEditor *)(id)newer,
+                       "pending restore does not clear a newer editor");
+                Expect(nw.firstResponder == responderBefore,
+                       "pending restore does not steal focus for a newer editor");
+                [nc.panelPresenter invalidate];
+                [ne.pending removeAllObjects];
+                [ne.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *uw; YMRenameEnvironment *ue; YMManagedDisplay *up;
+                YMRenameController *uc = RenameController(&uw, &ue, &up);
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = uw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                uc.addDisplayButton = (NSButton *)(id)addButton;
+                uw.firstResponder = addButton;
+                [uc addDisplay:nil];
+                addButton.enabled = NO;
+                void (^endWhileAttached)(BOOL) = [uc.lastEditor.endHandler copy];
+                uc.lastEditor.finished = YES;
+                uc.lastEditor.endHandler = nil;
+                uc.lastEditor.submitHandler = nil;
+                endWhileAttached(NO);
+                uw.attachedSheet = nil;
+                YMFocusControl *userChosen = [YMFocusControl new];
+                userChosen.window = uw;
+                userChosen.enabled = YES;
+                userChosen.acceptsFirstResponder = YES;
+                uw.firstResponder = userChosen;
+                [uc restoreProfileEditorFocus];
+                Expect(uw.firstResponder == userChosen, "pending restore does not steal user focus");
+                Expect(uc.profileEditorOrigin == nil, "abandoned pending restore clears origin");
+                [uc.panelPresenter invalidate];
+                [ue.pending removeAllObjects];
+                [ue.settling removeAllObjects];
+            }
         }
     rename_tests_done:
 

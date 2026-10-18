@@ -189,6 +189,12 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
 
 @end
 
+@interface YMSavedRowsStackView : NSStackView
+@end
+@implementation YMSavedRowsStackView
+- (BOOL)isFlipped { return YES; }
+@end
+
 @interface YMSavedDisplayProfilesView ()
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, YMSavedDisplayProfileRowView *> *rowsByOrdinal;
 @property(nonatomic, strong) NSScrollView *scrollView;
@@ -236,7 +242,7 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     [header addArrangedSubview:spacer];
     [header addArrangedSubview:self.collapseButton];
 
-    self.rowsStack = [[NSStackView alloc] init];
+    self.rowsStack = [[YMSavedRowsStackView alloc] init];
     self.rowsStack.translatesAutoresizingMaskIntoConstraints = NO;
     self.rowsStack.orientation = NSUserInterfaceLayoutOrientationVertical;
     self.rowsStack.alignment = NSLayoutAttributeLeading;
@@ -329,24 +335,16 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
     self.viewportPreferredHeight.constant = MIN(184, contentHeight);
 }
 
-- (void)ensureSavedRowsReachable {
-    if (self.collapsed || self.hidden || self.rowsStack.arrangedSubviews.count == 0) return;
-    [self.scrollView layoutSubtreeIfNeeded];
+- (void)restoreSavedScrollOrigin:(NSPoint)savedOrigin {
+    [self layoutSubtreeIfNeeded];
     [self.rowsStack layoutSubtreeIfNeeded];
-    NSRect visible = [self.scrollView documentVisibleRect];
-    BOOL completeRowVisible = NO;
-    for (NSView *row in self.rowsStack.arrangedSubviews) {
-        NSRect rowRect = [row convertRect:row.bounds toView:self.rowsStack];
-        NSRect part = NSIntersectionRect(visible, rowRect);
-        if (part.size.height >= rowRect.size.height - 1.0) {
-            completeRowVisible = YES;
-            break;
-        }
-    }
-    if (completeRowVisible) return;
-    NSView *first = self.rowsStack.arrangedSubviews.firstObject;
-    NSRect firstRect = [first convertRect:first.bounds toView:self.rowsStack];
-    [self.rowsStack scrollRectToVisible:firstRect];
+    CGFloat contentHeight = MAX(self.rowsStack.fittingSize.height, NSHeight(self.rowsStack.bounds));
+    CGFloat viewportHeight = NSHeight(self.scrollView.contentView.bounds);
+    NSPoint target = savedOrigin;
+    // When content fits the viewport, keep the origin at zero so post-layout
+    // clip drift cannot hide the only rows. Mid-list offsets stay untouched.
+    if (contentHeight <= viewportHeight + 0.5) target = NSZeroPoint;
+    [self.scrollView.contentView scrollToPoint:target];
     [self.scrollView reflectScrolledClipView:self.scrollView.contentView];
 }
 
@@ -422,11 +420,8 @@ static NSTextField *YMSavedLabel(NSString *text, CGFloat size, NSFontWeight weig
             [self.scrollView reflectScrolledClipView:self.scrollView.contentView];
         }
     } else if (!self.collapsed && !self.hidden) {
-        [self layoutSubtreeIfNeeded];
-        [self.scrollView.contentView scrollToPoint:savedOrigin];
-        [self.scrollView reflectScrolledClipView:self.scrollView.contentView];
+        [self restoreSavedScrollOrigin:savedOrigin];
     }
-    [self ensureSavedRowsReachable];
 }
 
 @end

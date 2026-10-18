@@ -374,6 +374,45 @@ static void RunAppearanceAndRefresh(void) {
     controller.topologyRecoverySnapshot = nil;
     [controller updateInventory];
     [controller.window close];
+
+    ADController *scrollController = PanelController(30, NSMakeSize(760, 520), YES);
+    AssertContentSize(scrollController, NSMakeSize(760, 520));
+    YMSavedDisplayProfilesView *saved = scrollController.savedProfilesView;
+    Check(saved != nil && !saved.hidden, "30-row min window keeps saved section");
+    NSScrollView *viewport = nil;
+    for (NSView *child in saved.subviews) {
+        if ([child isKindOfClass:NSStackView.class]) {
+            for (NSView *arranged in ((NSStackView *)child).arrangedSubviews) {
+                if ([arranged isKindOfClass:NSScrollView.class]) viewport = (NSScrollView *)arranged;
+            }
+        }
+    }
+    Check(viewport != nil, "min window exposes saved viewport");
+    Check(viewport.bounds.size.height <= 184.5, "min window saved viewport stays capped");
+    NSPoint jagged = NSMakePoint(0, 500);
+    [viewport.contentView scrollToPoint:jagged];
+    [viewport reflectScrolledClipView:viewport.contentView];
+    [scrollController.window.contentView layoutSubtreeIfNeeded];
+    NSPoint before = viewport.contentView.bounds.origin;
+    Check(fabs(before.y - 500.0) < 1.0, "fixture parks at non-aligned offset 500");
+    Check(!NSEqualPoints(before, NSZeroPoint), "fixture scroll is away from top");
+    for (NSUInteger pass = 0; pass < 40; pass++) [scrollController updateInventory];
+    [scrollController.window.contentView layoutSubtreeIfNeeded];
+    Check(NSEqualPoints(before, viewport.contentView.bounds.origin),
+          "ordinary inventory refresh preserves non-aligned saved scroll");
+    for (CGFloat offsetY = 510; offsetY <= 560; offsetY += 10) {
+        NSPoint sample = NSMakePoint(0, offsetY);
+        [viewport.contentView scrollToPoint:sample];
+        [viewport reflectScrolledClipView:viewport.contentView];
+        NSPoint parked = viewport.contentView.bounds.origin;
+        [scrollController updateInventory];
+        Check(NSEqualPoints(parked, viewport.contentView.bounds.origin),
+              "ordinary refresh preserves additional non-aligned offsets");
+    }
+    scrollController.pendingProfileRevealOrdinal = @(scrollController.displayProfiles.lastObject.ordinal);
+    [scrollController updateInventory];
+    Check(scrollController.pendingProfileRevealOrdinal == nil, "explicit reveal still consumes ordinal");
+    [scrollController.window close];
     printf("PASS appearance refresh collapse reveal activity\n");
 }
 
