@@ -10,13 +10,18 @@
 @property NSUInteger creates;
 @property NSUInteger destroys;
 @property CGDirectDisplayID fixtureID;
+@property NSUInteger lastWidth;
+@property NSUInteger lastHeight;
+@property BOOL lastHiDPI;
+@property(copy) NSString *lastName;
 @end
 @implementation YMFakeDisplay
 - (instancetype)init { if ((self = [super init])) _createResult = YES; return self; }
 - (BOOL)isCreated { return self.live; }
 - (CGDirectDisplayID)displayID { return self.live ? self.fixtureID : 0; }
 - (BOOL)createWithWidth:(NSUInteger)w height:(NSUInteger)h hiDPI:(BOOL)hiDPI name:(NSString *)name error:(NSError **)error {
-    (void)w; (void)h; (void)hiDPI; (void)name; self.creates++;
+    self.lastWidth = w; self.lastHeight = h; self.lastHiDPI = hiDPI; self.lastName = [name copy];
+    self.creates++;
     self.live = self.createResult;
     if (!self.createResult && error) *error = [NSError errorWithDomain:@"fixture" code:1 userInfo:nil];
     return self.createResult;
@@ -113,6 +118,13 @@
     self.terminationAfterTopologyRecovery=NO;
 }
 - (BOOL)writeStateEnding:(BOOL)end { (void)end; return YES; }
+- (YMManagedDisplay *)newProfileWithOrdinal:(NSUInteger)ordinal name:(NSString *)name width:(NSUInteger)width height:(NSUInteger)height hiDPI:(BOOL)hiDPI {
+    YMManagedDisplay *profile = [super newProfileWithOrdinal:ordinal name:name width:width height:height hiDPI:hiDPI];
+    YMFakeDisplay *fake = [YMFakeDisplay new];
+    fake.fixtureID = (CGDirectDisplayID)(300 + ordinal);
+    profile.display = fake;
+    return profile;
+}
 - (void)stop:(id)sender {
     (void)sender; self.stopCalls++;
     // The termination decision is production logic. This boundary models the
@@ -229,6 +241,25 @@
 
 @interface ADController (YMRenameTestDeclaration)
 - (NSAlert *)makeRenameAlertForProfile:(YMManagedDisplay *)profile;
+@end
+
+@interface YMHeadlessProfileWindow : NSObject
+@property(nonatomic, strong) id attachedSheet;
+@end
+@implementation YMHeadlessProfileWindow
+@end
+
+@interface YMHeadlessProfileEditor : NSObject
+@property(nonatomic, strong) id window;
+@property(nonatomic, copy) BOOL (^submitHandler)(YMDisplayProfileDraft *draft, NSError **error);
+@property(nonatomic, copy) void (^endHandler)(BOOL accepted);
+@property(nonatomic) YMDisplayProfileEditorMode mode;
+- (void)beginSheetForWindow:(NSWindow *)parent;
+- (void)cancel:(id)sender;
+@end
+@implementation YMHeadlessProfileEditor
+- (void)beginSheetForWindow:(NSWindow *)parent { (void)parent; }
+- (void)cancel:(id)sender { (void)sender; if (self.endHandler) self.endHandler(NO); }
 @end
 
 @interface YMRenameText : NSObject
@@ -1010,6 +1041,317 @@ int main(void) {
             }
         }
     rename_tests_done:
+
+        // Display profile accept/start gates and lifecycle projection.
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            profile.width = 1920; profile.height = 1080;
+            sibling.ordinal = 1;
+            YMHeadlessProfileEditor *marker = [YMHeadlessProfileEditor new];
+            controller.profileEditor = (YMDisplayProfileEditor *)(id)marker;
+            YMDisplayProfileDraft *draft = [[YMDisplayProfileDraft alloc] initWithName:@" Changed " width:2560 hiDPI:YES];
+            NSError *error = nil;
+            controller.selectedProfile = sibling;
+            BOOL accepted = [controller acceptProfileDraft:draft mode:YMDisplayProfileEditorModeEdit
+                ordinal:profile.ordinal editor:(YMDisplayProfileEditor *)(id)marker error:&error];
+            Expect(accepted && [profile.friendlyName isEqualToString:@"Changed"], "stable ordinal selects edited profile");
+            Expect(profile.width == 2560 && profile.height == 1440 && profile.hiDPI, "all edited fields commit together");
+            Expect(display.creates == 0 && controller.saves == 1, "edit saves once without start");
+            Expect(![sibling.friendlyName isEqualToString:@"Changed"], "selected sibling remains untouched");
+            Expect(NSApp == nil, "profile requests stay headless");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            profile.width = 1920; profile.height = 1080; profile.friendlyName = @"Target";
+            sibling.ordinal = 1;
+            YMHeadlessProfileEditor *marker = [YMHeadlessProfileEditor new];
+            controller.profileEditor = (YMDisplayProfileEditor *)(id)marker;
+            NSUInteger baselineProfiles = controller.displayProfiles.count;
+            NSUInteger baselineSaves = controller.saves;
+            NSUInteger baselineCreates = display.creates;
+            YMHeadlessProfileWindow *gateWindow = [YMHeadlessProfileWindow new];
+            controller.window = (NSWindow *)(id)gateWindow;
+            void (^expectRejected)(NSString *, void (^)(void)) = ^(NSString *name, void (^mutate)(void)) {
+                mutate();
+                NSError *error = nil;
+                YMDisplayProfileDraft *draft = [[YMDisplayProfileDraft alloc] initWithName:@"Blocked" width:1920 hiDPI:NO];
+                BOOL accepted = [controller acceptProfileDraft:draft mode:YMDisplayProfileEditorModeEdit
+                    ordinal:profile.ordinal editor:(YMDisplayProfileEditor *)(id)marker error:&error];
+                Expect(!accepted && error != nil, name.UTF8String);
+                Expect(controller.displayProfiles.count == baselineProfiles
+                       && controller.saves == baselineSaves && display.creates == baselineCreates
+                       && [profile.friendlyName isEqualToString:@"Target"],
+                       [[name stringByAppendingString:@" leaves model untouched"] UTF8String]);
+                controller.previewMode = NO;
+                controller.updateWorkspaceBusy = NO;
+                controller.appOperationInProgress = NO;
+                controller.displayOperationInProgress = NO;
+                controller.armed = NO;
+                controller.preparing = NO;
+                controller.restoring = NO;
+                controller.layoutChangedForTrial = NO;
+                controller.recoveryRequested = NO;
+                controller.topologyRecoverySnapshot = nil;
+                gateWindow.attachedSheet = nil;
+                marker.window = nil;
+                controller.window = (NSWindow *)(id)gateWindow;
+            };
+            expectRejected(@"previewMode rejects profile commit", ^{ controller.previewMode = YES; });
+            expectRejected(@"updateWorkspaceBusy rejects profile commit", ^{ controller.updateWorkspaceBusy = YES; });
+            expectRejected(@"appOperationInProgress rejects profile commit", ^{ controller.appOperationInProgress = YES; });
+            expectRejected(@"displayOperationInProgress rejects profile commit", ^{ controller.displayOperationInProgress = YES; });
+            expectRejected(@"armed rejects profile commit", ^{ controller.armed = YES; });
+            expectRejected(@"preparing rejects profile commit", ^{ controller.preparing = YES; });
+            expectRejected(@"restoring rejects profile commit", ^{ controller.restoring = YES; });
+            expectRejected(@"layoutChangedForTrial rejects profile commit", ^{ controller.layoutChangedForTrial = YES; });
+            expectRejected(@"recoveryRequested rejects profile commit", ^{ controller.recoveryRequested = YES; });
+            expectRejected(@"topologyRecoverySnapshot rejects profile commit", ^{
+                controller.topologyRecoverySnapshot = topology.snapshot;
+            });
+            expectRejected(@"foreign attachedSheet rejects profile commit", ^{
+                gateWindow.attachedSheet = [NSObject new];
+                marker.window = [NSObject new];
+            });
+
+            YMHeadlessProfileEditor *stale = [YMHeadlessProfileEditor new];
+            NSError *staleError = nil;
+            Expect(![controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"Stale" width:1920 hiDPI:NO]
+                mode:YMDisplayProfileEditorModeEdit ordinal:profile.ordinal
+                editor:(YMDisplayProfileEditor *)(id)stale error:&staleError]
+                   && controller.saves == baselineSaves, "stale editor identity is rejected");
+
+            NSMutableArray *kept = [NSMutableArray arrayWithObject:sibling];
+            controller.displayProfiles = kept;
+            Expect(![controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"Gone" width:1920 hiDPI:NO]
+                mode:YMDisplayProfileEditorModeEdit ordinal:profile.ordinal
+                editor:(YMDisplayProfileEditor *)(id)marker error:&staleError]
+                   && controller.saves == baselineSaves, "removed ordinal cannot be edited");
+            controller.displayProfiles = [NSMutableArray arrayWithArray:@[sibling, profile]];
+
+            YMManagedDisplay *duplicate = [YMManagedDisplay new];
+            duplicate.ordinal = 9; duplicate.friendlyName = @"Target"; duplicate.width = 1920; duplicate.height = 1080;
+            duplicate.display = [YMFakeDisplay new];
+            [controller.displayProfiles addObject:duplicate];
+            Expect([controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"ByOrdinal" width:1920 hiDPI:NO]
+                mode:YMDisplayProfileEditorModeEdit ordinal:profile.ordinal
+                editor:(YMDisplayProfileEditor *)(id)marker error:&staleError]
+                   && [profile.friendlyName isEqualToString:@"ByOrdinal"]
+                   && [duplicate.friendlyName isEqualToString:@"Target"],
+                   "same-name profiles still resolve by ordinal");
+            profile.friendlyName = @"Target";
+            controller.saves = baselineSaves;
+
+            display.live = YES;
+            Expect(![controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"Live" width:2560 hiDPI:YES]
+                mode:YMDisplayProfileEditorModeEdit ordinal:profile.ordinal
+                editor:(YMDisplayProfileEditor *)(id)marker error:&staleError]
+                   && profile.width == 1920 && controller.saves == baselineSaves,
+                   "edit rejects an already running target");
+            display.live = NO;
+
+            YMManagedDisplay *maxed = [YMManagedDisplay new];
+            maxed.ordinal = UINT16_MAX; maxed.friendlyName = @"Max"; maxed.width = 1920; maxed.height = 1080;
+            maxed.display = [YMFakeDisplay new];
+            [controller.displayProfiles addObject:maxed];
+            Expect(![controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"Overflow" width:1920 hiDPI:NO]
+                mode:YMDisplayProfileEditorModeCreate ordinal:0
+                editor:(YMDisplayProfileEditor *)(id)marker error:&staleError]
+                   && controller.displayProfiles.count == baselineProfiles + 2
+                   && controller.saves == baselineSaves && display.creates == baselineCreates,
+                   "exhausted ordinals reject create before write");
+            [controller.displayProfiles removeObject:maxed];
+
+            Expect(![controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"BadMode" width:1920 hiDPI:NO]
+                mode:(YMDisplayProfileEditorMode)99 ordinal:profile.ordinal
+                editor:(YMDisplayProfileEditor *)(id)marker error:&staleError]
+                   && controller.saves == baselineSaves, "illegal mode is rejected");
+            Expect(![controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"BadOrdinal" width:1920 hiDPI:NO]
+                mode:YMDisplayProfileEditorModeCreate ordinal:7
+                editor:(YMDisplayProfileEditor *)(id)marker error:&staleError]
+                   && controller.saves == baselineSaves, "create requires ordinal zero");
+            Expect(![controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"a\tb" width:1920 hiDPI:NO]
+                mode:YMDisplayProfileEditorModeEdit ordinal:profile.ordinal
+                editor:(YMDisplayProfileEditor *)(id)marker error:&staleError]
+                   && controller.saves == baselineSaves, "control characters reject before write");
+
+            controller.profileEditorCommitInProgress = YES;
+            Expect(![controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@"Reentry" width:1920 hiDPI:NO]
+                mode:YMDisplayProfileEditorModeEdit ordinal:profile.ordinal
+                editor:(YMDisplayProfileEditor *)(id)marker error:&staleError]
+                   && controller.saves == baselineSaves, "synchronous reentry is rejected");
+            controller.profileEditorCommitInProgress = NO;
+
+            id sheet = [NSObject new];
+            marker.window = sheet;
+            gateWindow.attachedSheet = sheet;
+            Expect([controller profileActionsAvailableForEditor:(YMDisplayProfileEditor *)(id)marker],
+                   "current sheet may submit through its own editor");
+            Expect(![controller profileActionsAvailableForEditor:nil],
+                   "external entry stays blocked while sheet is attached");
+            Expect(NSApp == nil, "gate checks stay headless");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1;
+            profile.width = 1920; profile.height = 1080;
+            controller.deferTopologyOperations = YES;
+            NSError *error = nil;
+            Expect([controller startSavedProfileWithOrdinal:profile.ordinal error:&error], "saved start accepted");
+            Expect(profile.starting && controller.displayOperationInProgress, "pending state follows real transaction");
+            Expect(![controller canMoveIntoProfile:profile], "unverified display rejects admission");
+            Expect(display.creates == 1 && controller.saves == 0, "saved start neither duplicates nor resaves profile");
+            [controller runNextTopologyOperation];
+            Expect(!profile.starting && profile.topologyVerified, "verified completion clears pending state");
+            Expect(display.creates == 1 && controller.saves == 0, "completion remains single start with no config write");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1; profile.width = 1920; profile.height = 1080;
+            NSError *error = nil;
+            topology.captureResult = NO;
+            Expect([controller startSavedProfileWithOrdinal:profile.ordinal error:&error], "capture failure still accepted into transaction");
+            Expect(!profile.starting && [profile.startFailureText isEqualToString:@"无法读取显示配置，请重试。"]
+                   && [controller.pendingProfileRevealOrdinal isEqualToNumber:@(profile.ordinal)]
+                   && display.creates == 0 && controller.saves == 0
+                   && [(YMFakeDisplay *)sibling.display destroys] == 0,
+                   "capture failure keeps config and sibling");
+            Expect([[controller profileActivityText] isEqualToString:@""], "idle activity text stays empty after capture failure");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1; profile.width = 1920; profile.height = 1080;
+            NSError *error = nil;
+            display.createResult = NO;
+            Expect([controller startSavedProfileWithOrdinal:profile.ordinal error:&error], "create failure accepted");
+            Expect(!profile.starting && [profile.startFailureText isEqualToString:@"无法创建虚拟屏，请确认当前系统支持该功能。"]
+                   && controller.saves == 0 && [(YMFakeDisplay *)sibling.display destroys] == 0,
+                   "create failure retains saved profile");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1; profile.width = 1920; profile.height = 1080;
+            NSError *error = nil;
+            topology.configureResult = NO;
+            Expect([controller startSavedProfileWithOrdinal:profile.ordinal error:&error], "configure failure accepted");
+            Expect(!profile.starting && [profile.startFailureText isEqualToString:@"显示配置核验失败，已恢复原排列；可重试。"]
+                   && !display.live && controller.saves == 0
+                   && [(YMFakeDisplay *)sibling.display destroys] == 0,
+                   "configure failure restores and keeps sibling");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1; profile.width = 1920; profile.height = 1080;
+            NSError *error = nil;
+            topology.configureResult = NO; topology.restoreResult = NO;
+            Expect([controller startSavedProfileWithOrdinal:profile.ordinal error:&error], "restore failure accepted");
+            Expect(!profile.starting && [profile.startFailureText isEqualToString:@"显示排列待恢复，请先使用恢复入口。"]
+                   && controller.topologyRecoverySnapshot == topology.snapshot
+                   && controller.saves == 0 && [(YMFakeDisplay *)sibling.display destroys] == 0,
+                   "incomplete recovery blocks restart messaging");
+            NSArray<YMSavedDisplayProfileRow *> *rows = [controller savedProfileRows];
+            Expect(rows.count == 1 && rows.firstObject.ordinal == profile.ordinal
+                   && !rows.firstObject.canStart && !rows.firstObject.canEdit
+                   && [rows.firstObject.message containsString:@"待恢复"],
+                   "recovery pending disables saved-row actions");
+            Expect([[controller profileActivityText] containsString:@"待恢复"], "activity text exposes recovery gate");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1; profile.width = 1920; profile.height = 1080;
+            NSError *error = nil;
+            controller.powerFails = YES;
+            Expect([controller startSavedProfileWithOrdinal:profile.ordinal error:&error], "power failure accepted");
+            Expect(!profile.starting && [profile.startFailureText isEqualToString:@"无法保持图形桌面唤醒，已取消启动。"]
+                   && !display.live && controller.saves == 0
+                   && [(YMFakeDisplay *)sibling.display destroys] == 0,
+                   "power failure rolls back only the new target");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1; profile.width = 1920; profile.height = 1080;
+            YMHeadlessProfileEditor *marker = [YMHeadlessProfileEditor new];
+            controller.profileEditor = (YMDisplayProfileEditor *)(id)marker;
+            NSUInteger beforeCount = controller.displayProfiles.count;
+            NSError *error = nil;
+            Expect([controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@" Fresh " width:2560 hiDPI:YES]
+                mode:YMDisplayProfileEditorModeCreate ordinal:0
+                editor:(YMDisplayProfileEditor *)(id)marker error:&error], "create request accepted");
+            Expect(controller.displayProfiles.count == beforeCount + 1 && controller.saves == 1
+                   && display.creates == 0, "create persists once before start");
+            YMManagedDisplay *created = controller.displayProfiles.lastObject;
+            Expect(created.ordinal == 3 && [created.friendlyName isEqualToString:@"Fresh"]
+                   && created.width == 2560 && created.height == 1440 && created.hiDPI
+                   && created.topologyVerified && !created.starting
+                   && [(YMFakeDisplay *)created.display creates] == 1
+                   && [(YMFakeDisplay *)sibling.display destroys] == 0,
+                   "create allocates next ordinal and starts once");
+            NSUInteger createdOrdinal = created.ordinal;
+            NSUInteger savesAfterCreate = controller.saves;
+            [(YMFakeDisplay *)created.display destroy];
+            created.topologyVerified = NO;
+            Expect([controller startSavedProfileWithOrdinal:createdOrdinal error:&error]
+                   && created.ordinal == createdOrdinal
+                   && controller.displayProfiles.count == beforeCount + 1
+                   && controller.saves == savesAfterCreate,
+                   "retry keeps the same ordinal without another save");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            [controller create:nil];
+            Expect(display.creates == 1 && controller.saves == 1 && profile.topologyVerified,
+                   "legacy create wrapper still persists on success");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            sibling.ordinal = 1;
+            profile.width = 1920; profile.height = 1080; profile.hiDPI = YES; profile.friendlyName = @"Saved";
+            YMHeadlessProfileEditor *marker = [YMHeadlessProfileEditor new];
+            controller.profileEditor = (YMDisplayProfileEditor *)(id)marker;
+            NSError *error = nil;
+            VDVirtualDisplay *originalDisplay = profile.display;
+            Expect([controller acceptProfileDraft:[[YMDisplayProfileDraft alloc] initWithName:@" Renamed " width:800 hiDPI:NO]
+                mode:YMDisplayProfileEditorModeRename ordinal:profile.ordinal
+                editor:(YMDisplayProfileEditor *)(id)marker error:&error]
+                   && [profile.friendlyName isEqualToString:@"Renamed"]
+                   && profile.width == 1920 && profile.height == 1080 && profile.hiDPI
+                   && profile.display == originalDisplay && controller.saves == 1 && display.creates == 0,
+                   "rename keeps dimensions display object and saves once");
+            NSArray<YMSavedDisplayProfileRow *> *rows = [controller savedProfileRows];
+            Expect(rows.count == 1 && rows.firstObject.ordinal == profile.ordinal
+                   && [rows.firstObject.name containsString:@"Renamed"]
+                   && [rows.firstObject.detail containsString:@"HiDPI"]
+                   && rows.firstObject.canStart && rows.firstObject.canEdit,
+                   "saved rows project uncreated profiles only");
+            display.live = YES;
+            Expect([controller savedProfileRows].count == 0, "running profiles leave the saved list");
+            display.live = NO;
+            profile.starting = YES;
+            Expect([[controller profileActivityText] containsString:@"启动中"]
+                   && ![controller savedProfileRows].firstObject.canStart,
+                   "starting state wins over ordinary actions");
+            Expect(NSApp == nil, "projection helpers stay headless");
+        }
 
         Expect(NSApp == nil,"all controller tests leave NSApplication uninitialized");
         printf("Controller boundary tests: %lu passed, %lu failed; no GUI or display calls executed.\n",(unsigned long)(Tests-Failures),(unsigned long)Failures);

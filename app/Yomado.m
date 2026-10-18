@@ -16,6 +16,8 @@
 #import "UpdateWorkspaceRecovery.h"
 #import "MenuBarIcon.h"
 #import "PanelPresentation.h"
+#import "DisplayProfileEditor.h"
+#import "SavedDisplayProfilesView.h"
 
 static NSString *YMAppVersion(void) {
     return [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"—";
@@ -126,6 +128,8 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property BOOL hiDPI;
 @property VDVirtualDisplay *display;
 @property BOOL topologyVerified;
+@property BOOL starting;
+@property(copy) NSString *startFailureText;
 @end
 @implementation YMManagedDisplay
 @end
@@ -200,6 +204,9 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property EventHotKeyRef hotkey;
 @property EventHandlerRef keyHandler;
 @property(strong) YMControlPanelPresenter *panelPresenter;
+@property YMDisplayProfileEditor *profileEditor;
+@property BOOL profileEditorCommitInProgress;
+@property(copy) NSNumber *pendingProfileRevealOrdinal;
 - (void)restore:(id)sender;
 - (void)buildWindow;
 - (void)preparePanelPresenter;
@@ -209,6 +216,16 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 - (void)restoreUpdateWorkspace;
 - (void)restoreUpdateProfileAtIndex:(NSUInteger)index;
 - (void)refreshUpdateUI;
+- (BOOL)profileActionsAvailableForEditor:(YMDisplayProfileEditor *)editor;
+- (BOOL)acceptProfileDraft:(YMDisplayProfileDraft *)draft
+                      mode:(YMDisplayProfileEditorMode)mode
+                   ordinal:(NSUInteger)ordinal
+                    editor:(YMDisplayProfileEditor *)editor
+                     error:(NSError **)error;
+- (BOOL)startSavedProfileWithOrdinal:(NSUInteger)ordinal error:(NSError **)error;
+- (NSArray<YMSavedDisplayProfileRow *> *)savedProfileRows;
+- (NSString *)profileActivityText;
+- (void)createSelectedProfilePersistingOnSuccess:(BOOL)persistOnSuccess;
 @end
 
 static OSStatus RecoveryHotkey(EventHandlerCallRef next, EventRef event, void *data) {
@@ -1365,17 +1382,181 @@ static NSView *YMSpacer(void) {
     if (err != kCGErrorSuccess) { CGCancelDisplayConfiguration(config); return NO; }
     return CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly) == kCGErrorSuccess;
 }
+- (BOOL)profileActionsAvailableForEditor:(YMDisplayProfileEditor *)editor {
+    if (self.previewMode || self.updateWorkspaceBusy || self.appOperationInProgress || self.displayOperationInProgress
+        || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested
+        || self.topologyRecoverySnapshot || self.profileEditorCommitInProgress) return NO;
+    id attached = self.window.attachedSheet;
+    if (editor) {
+        if (editor != self.profileEditor) return NO;
+        if (attached && attached != editor.window) return NO;
+        return YES;
+    }
+    return attached == nil;
+}
+- (YMManagedDisplay *)profileWithOrdinal:(NSUInteger)ordinal {
+    if (!ordinal) return nil;
+    for (YMManagedDisplay *profile in self.displayProfiles)
+        if (profile.ordinal == ordinal) return profile;
+    return nil;
+}
+- (void)failProfileRequest:(NSError **)error message:(NSString *)message {
+    if (error) *error = [NSError errorWithDomain:@"dev.chekusu.yomado.profile" code:1
+        userInfo:@{NSLocalizedDescriptionKey:message ?: @"当前无法完成该操作，请稍后重试。"}];
+}
+- (BOOL)acceptProfileDraft:(YMDisplayProfileDraft *)draft
+                      mode:(YMDisplayProfileEditorMode)mode
+                   ordinal:(NSUInteger)ordinal
+                    editor:(YMDisplayProfileEditor *)editor
+                     error:(NSError **)error {
+    if (mode != YMDisplayProfileEditorModeCreate && mode != YMDisplayProfileEditorModeEdit
+        && mode != YMDisplayProfileEditorModeRename) {
+        [self failProfileRequest:error message:@"不支持的编辑模式。"];
+        return NO;
+    }
+    if (mode == YMDisplayProfileEditorModeCreate) {
+        if (ordinal != 0) { [self failProfileRequest:error message:@"新建请求无效。"]; return NO; }
+    } else if (!ordinal) {
+        [self failProfileRequest:error message:@"未找到要编辑的虚拟屏。"];
+        return NO;
+    }
+    if (!editor || editor != self.profileEditor || self.profileEditorCommitInProgress) {
+        [self failProfileRequest:error message:@"配置表单已失效，请关闭后重试。"];
+        return NO;
+    }
+    if (![self profileActionsAvailableForEditor:editor]) {
+        [self failProfileRequest:error message:@"当前无法保存配置，请稍后重试。"];
+        return NO;
+    }
+    BOOL validateSettings = mode != YMDisplayProfileEditorModeRename;
+    YMDisplayProfileDraft *normalized = [draft normalizedCopyValidatingDisplaySettings:validateSettings error:error];
+    if (!normalized) return NO;
+    YMManagedDisplay *target = nil;
+    if (mode == YMDisplayProfileEditorModeCreate) {
+        NSUInteger next = 1;
+        for (YMManagedDisplay *profile in self.displayProfiles) next = MAX(next, profile.ordinal + 1);
+        if (next > UINT16_MAX) {
+            [self failProfileRequest:error message:@"已达到可用的屏幕编号上限。"];
+            return NO;
+        }
+        ordinal = next;
+    } else {
+        target = [self profileWithOrdinal:ordinal];
+        if (!target || ![self.displayProfiles containsObject:target]) {
+            [self failProfileRequest:error message:@"未找到要编辑的虚拟屏。"];
+            return NO;
+        }
+        if (mode == YMDisplayProfileEditorModeEdit && target.display.isCreated) {
+            [self failProfileRequest:error message:@"运行中的虚拟屏请先关闭后再修改显示设置。"];
+            return NO;
+        }
+    }
+    self.profileEditorCommitInProgress = YES;
+    @try {
+        if (mode == YMDisplayProfileEditorModeCreate) {
+            NSUInteger height = normalized.width == 2560 ? 1440 : 1080;
+            YMManagedDisplay *created = [self newProfileWithOrdinal:ordinal name:normalized.name
+                width:normalized.width height:height hiDPI:normalized.hiDPI];
+            [self.displayProfiles addObject:created];
+            [self saveDisplayProfiles];
+            [self selectProfile:created];
+            if (self.selectedProfile == created)
+                [self createSelectedProfilePersistingOnSuccess:NO];
+            return YES;
+        }
+        if (mode == YMDisplayProfileEditorModeRename) {
+            target.friendlyName = normalized.name;
+            [self saveDisplayProfiles];
+            [self updateInventory];
+            self.statusLabel.stringValue = @"名称已保存";
+            self.detailLabel.stringValue = target.display.isCreated
+                ? @"界面中的名称已更新；系统显示器名称将在这块虚拟屏下次启动时更新。"
+                : @"下次启动这块虚拟屏时会使用新名称。";
+            return YES;
+        }
+        target.friendlyName = normalized.name;
+        target.width = normalized.width;
+        target.height = normalized.width == 2560 ? 1440 : 1080;
+        target.hiDPI = normalized.hiDPI;
+        [self saveDisplayProfiles];
+        [self updateInventory];
+        self.statusLabel.stringValue = @"设置已保存";
+        self.detailLabel.stringValue = @"启动这块虚拟屏时会使用新的名称与显示设置。";
+        return YES;
+    } @finally {
+        self.profileEditorCommitInProgress = NO;
+    }
+}
+- (BOOL)startSavedProfileWithOrdinal:(NSUInteger)ordinal error:(NSError **)error {
+    if (![self profileActionsAvailableForEditor:nil]) {
+        [self failProfileRequest:error message:@"当前无法启动虚拟屏，请稍后重试。"];
+        return NO;
+    }
+    YMManagedDisplay *profile = [self profileWithOrdinal:ordinal];
+    if (!profile || ![self.displayProfiles containsObject:profile] || profile.display.isCreated || profile.starting) {
+        [self failProfileRequest:error message:@"未找到可启动的虚拟屏。"];
+        return NO;
+    }
+    [self selectProfile:profile];
+    if (self.selectedProfile != profile) {
+        [self failProfileRequest:error message:@"当前无法启动虚拟屏，请稍后重试。"];
+        return NO;
+    }
+    [self createSelectedProfilePersistingOnSuccess:NO];
+    return profile.starting || profile.display.isCreated || profile.topologyVerified
+        || self.displayOperationInProgress || self.topologyRecoverySnapshot != nil
+        || profile.startFailureText.length > 0;
+}
+- (NSArray<YMSavedDisplayProfileRow *> *)savedProfileRows {
+    BOOL available = [self profileActionsAvailableForEditor:nil];
+    BOOL recoveryPending = self.topologyRecoverySnapshot != nil;
+    NSMutableArray<YMSavedDisplayProfileRow *> *rows = [NSMutableArray array];
+    for (YMManagedDisplay *profile in self.displayProfiles) {
+        if (profile.display.isCreated) continue;
+        NSString *detail = [NSString stringWithFormat:@"%lu × %lu%@",
+            (unsigned long)profile.width, (unsigned long)profile.height,
+            profile.hiDPI ? @" · HiDPI" : @""];
+        NSString *message = @"";
+        if (profile.starting) message = @"启动中…";
+        else if (recoveryPending) message = @"显示排列待恢复，请先使用恢复入口。";
+        else if (profile.startFailureText.length) message = profile.startFailureText;
+        BOOL actionable = available && !profile.starting && !recoveryPending;
+        [rows addObject:[[YMSavedDisplayProfileRow alloc] initWithOrdinal:profile.ordinal
+            name:[self titleForProfile:profile] detail:detail message:message
+            starting:profile.starting canStart:actionable canEdit:actionable]];
+    }
+    return rows;
+}
+- (NSString *)profileActivityText {
+    for (YMManagedDisplay *profile in self.displayProfiles) {
+        if (!profile.starting) continue;
+        if (profile.display.isCreated && !profile.topologyVerified)
+            return [NSString stringWithFormat:@"%@ 核验中…", profile.friendlyName];
+        return [NSString stringWithFormat:@"%@ 启动中…", profile.friendlyName];
+    }
+    if (self.topologyRecoverySnapshot) return @"显示排列待恢复，请先使用恢复入口。";
+    return @"";
+}
 - (void)create:(id)sender {
     (void)sender;
+    [self createSelectedProfilePersistingOnSuccess:YES];
+}
+- (void)createSelectedProfilePersistingOnSuccess:(BOOL)persistOnSuccess {
     if (self.previewMode || self.updateWorkspaceBusy || self.topologyRecoverySnapshot || self.virtualDisplay.isCreated || !self.selectedProfile
         || self.displayOperationInProgress || self.appOperationInProgress || self.armed || self.preparing
         || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) return;
     YMManagedDisplay *profile = self.selectedProfile;
     profile.topologyVerified = NO;
+    profile.starting = YES;
+    profile.startFailureText = nil;
     self.displayOperationInProgress = YES;
+    [self updateInventory];
     NSError *error = nil;
     YMDisplayTopologySnapshot *before = [self.displayTopology captureSnapshotWithError:&error];
     if (!before) {
+        profile.starting = NO;
+        profile.startFailureText = @"无法读取显示配置，请重试。";
+        self.pendingProfileRevealOrdinal = @(profile.ordinal);
         self.displayOperationInProgress = NO;
         [self reportTopologyError:error];
         [self updateInventory];
@@ -1388,18 +1569,29 @@ static NSView *YMSpacer(void) {
     BOOL hiDPI = profile.hiDPI;
     YMDisplayTopology *topology = self.displayTopology;
     void (^completeCreation)(BOOL, NSError *) = ^(BOOL configured, NSError *configurationError) {
+        BOOL powerFailed = NO;
         if (configured) {
             [self powerAssertions:YES];
             configured = self.systemAssertion != kIOPMNullAssertionID && self.displayAssertion != kIOPMNullAssertionID;
-            if (!configured) configurationError = [NSError errorWithDomain:YMDisplayTopologyErrorDomain code:50
-                userInfo:@{NSLocalizedDescriptionKey:@"保持唤醒请求失败，已取消创建工作屏。"}];
+            if (!configured) {
+                powerFailed = YES;
+                configurationError = [NSError errorWithDomain:YMDisplayTopologyErrorDomain code:50
+                    userInfo:@{NSLocalizedDescriptionKey:@"保持唤醒请求失败，已取消创建工作屏。"}];
+            }
         }
         if (!configured) {
             // Only this operation's frozen owned object is removed. The main
             // event loop stays available while WindowServer removes it.
+            BOOL createFailed = !profile.display.isCreated && createdID == 0 && !powerFailed;
+            NSString *stageFailure = powerFailed ? @"无法保持图形桌面唤醒，已取消启动。"
+                : (createFailed ? @"无法创建虚拟屏，请确认当前系统支持该功能。"
+                                : @"显示配置核验失败，已恢复原排列；可重试。");
             if (profile.display.isCreated) [profile.display destroy];
             [self recoverTopology:before removedID:createdID completion:^(BOOL recovered, NSError *recoveryError) {
                 if (![self activeProfiles].count) [self powerAssertions:NO];
+                profile.starting = NO;
+                profile.startFailureText = recovered ? stageFailure : @"显示排列待恢复，请先使用恢复入口。";
+                self.pendingProfileRevealOrdinal = @(profile.ordinal);
                 self.displayOperationInProgress = NO;
                 [self reportTopologyError:recovered ? configurationError : recoveryError];
                 [self updateInventory];
@@ -1407,7 +1599,9 @@ static NSView *YMSpacer(void) {
             return;
         }
         profile.topologyVerified = YES;
-        [self saveDisplayProfiles];
+        profile.starting = NO;
+        profile.startFailureText = nil;
+        if (persistOnSuccess) [self saveDisplayProfiles];
         self.displayOperationInProgress = NO;
         self.statusLabel.stringValue = [NSString stringWithFormat:@"%@ 已启动", [self titleForProfile:profile]];
         self.detailLabel.stringValue = @"扩展模式与原有显示配置已核对，可以移入应用。";
