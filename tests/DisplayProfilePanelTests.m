@@ -8,6 +8,7 @@
 @interface ADController (YMPreviewInstallTestDeclaration)
 - (void)installPreviewProfilesForState:(NSString *)state;
 - (NSArray<YMSavedDisplayProfileRow *> *)savedProfileRows;
+@property(nonatomic) BOOL profileEditorFocusPending;
 @end
 
 @interface YMPreviewProfileDisplay : VDVirtualDisplay
@@ -416,6 +417,26 @@ static void RunAppearanceAndRefresh(void) {
     printf("PASS appearance refresh collapse reveal activity\n");
 }
 
+static NSButton *PanelFindTaggedButton(NSView *root, NSString *title, NSInteger tag) {
+    if ([root isKindOfClass:NSButton.class]) {
+        NSButton *button = (NSButton *)root;
+        if (button.tag == tag && [button.title isEqualToString:title]) return button;
+    }
+    for (NSView *child in root.subviews) {
+        NSButton *found = PanelFindTaggedButton(child, title, tag);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void PanelDrainSheet(ADController *controller) {
+    for (NSUInteger pass = 0; pass < 80; pass++) {
+        if (!controller.window.attachedSheet && controller.profileEditor == nil
+            && !controller.profileEditorFocusPending) return;
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    }
+}
+
 static void RunEntryActions(void) {
     ADController *controller = PanelController(1, NSMakeSize(1000, 620), NO);
     AssertBasics(controller, 1);
@@ -430,6 +451,52 @@ static void RunEntryActions(void) {
     Check(editor != nil && editor.mode == YMDisplayProfileEditorModeCreate, "factory builds create editor");
     (void)editor.window;
     [controller window];
+
+    Check(controller.savedProfilesView.onStart != nil, "production onStart is installed");
+    Check(controller.savedProfilesView.onEdit != nil, "production onEdit is installed");
+    YMManagedDisplay *saved = nil;
+    for (YMManagedDisplay *profile in controller.displayProfiles) {
+        if (!profile.display.isCreated) { saved = profile; break; }
+    }
+    Check(saved != nil, "fixture exposes a stopped saved profile");
+    NSString *nameBefore = [saved.friendlyName copy];
+    BOOL createdBefore = saved.display.isCreated;
+    controller.savedProfilesView.onStart(saved.ordinal);
+    Check(!saved.display.isCreated && createdBefore == saved.display.isCreated,
+          "production onStart rejection does not start a display");
+    Check(saved.startFailureText.length > 0, "production onStart rejection leaves row-visible reason");
+    BOOL sawMessage = NO;
+    for (YMSavedDisplayProfileRow *row in [controller savedProfileRows]) {
+        if (row.ordinal == saved.ordinal && row.message.length > 0) sawMessage = YES;
+    }
+    Check(sawMessage, "production onStart rejection is visible on the saved row");
+    Check([saved.friendlyName isEqualToString:nameBefore], "production onStart rejection does not rewrite profile");
+
+    NSButton *editButton = PanelFindTaggedButton(controller.savedProfilesView, @"编辑", (NSInteger)saved.ordinal);
+    Check(editButton != nil, "saved row exposes an edit button");
+    controller.previewMode = NO;
+    [controller updateSavedProfilesPresentation];
+    Check(editButton.enabled, "leaving preview enables saved-row edit");
+    [controller.window makeFirstResponder:editButton];
+    Check(controller.window.firstResponder == editButton, "fixture focuses saved-row edit button");
+    controller.savedProfilesView.onEdit(saved.ordinal);
+    Check(controller.profileEditor != nil
+          && controller.profileEditor.mode == YMDisplayProfileEditorModeEdit,
+          "production onEdit opens edit mode for the ordinal");
+    Check(!saved.display.isCreated, "production onEdit does not auto-start");
+    Check(controller.profileEditorOrigin == editButton, "production onEdit keeps saved-row origin");
+    editButton.enabled = NO;
+    controller.addDisplayButton.enabled = NO;
+    [controller.profileEditor cancel:nil];
+    PanelDrainSheet(controller);
+    Check(controller.profileEditor == nil && controller.window.attachedSheet == nil,
+          "production onEdit cancel clears sheet");
+    Check(editButton.enabled, "cancel refreshes saved-row edit after production onEdit");
+    Check(controller.window.firstResponder == editButton,
+          "cancel restores focus to production saved-row edit origin");
+    controller.previewMode = YES;
+    [controller updateSavedProfilesPresentation];
+
     [controller.window close];
     printf("PASS entry actions and factory\n");
 }

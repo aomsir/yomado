@@ -844,26 +844,25 @@ static NSView *YMSpacer(void) {
     }
     // Sheet/editor are already cleared; refresh enabled from the latest gates so
     // focus does not chase a control that updateInventory disabled while open.
+    BOOL busy = self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring
+        || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress
+        || self.appOperationInProgress;
+    BOOL actionable = !self.previewMode && !busy && !self.topologyRecoverySnapshot
+        && !self.profileEditor && self.window.attachedSheet == nil;
     if (self.addDisplayButton) {
-        BOOL busy = self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring
-            || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress
-            || self.appOperationInProgress;
-        self.addDisplayButton.enabled = !self.previewMode && !busy && !self.topologyRecoverySnapshot
-            && !self.profileEditor && self.window.attachedSheet == nil;
+        self.addDisplayButton.enabled = actionable;
     }
     // Completion can run while attachedSheet is still set. Keep origin and wait for
-    // the real detach instead of settling on nil behind the sheet gate.
+    // the real detach instead of settling on nil behind the sheet gate. Always
+    // re-queue: an early async may itself observe the sheet still attached.
     if (self.window.attachedSheet != nil) {
-        BOOL alreadyPending = self.profileEditorFocusPending;
         self.profileEditorFocusPending = YES;
-        if (!alreadyPending) {
-            __weak ADController *weakSelf = self;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                ADController *controller = weakSelf;
-                if (!controller || !controller.profileEditorFocusPending) return;
-                [controller restoreProfileEditorFocus];
-            });
-        }
+        __weak ADController *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ADController *controller = weakSelf;
+            if (!controller || !controller.profileEditorFocusPending) return;
+            [controller restoreProfileEditorFocus];
+        });
         return;
     }
     BOOL wasPending = self.profileEditorFocusPending;
@@ -883,6 +882,16 @@ static NSView *YMSpacer(void) {
                 self.profileEditorOrigin = nil;
                 return;
             }
+        }
+    }
+    // Refresh saved-row button permission before deciding origin vs fallback.
+    if (self.savedProfilesView) {
+        [self updateSavedProfilesPresentation];
+    } else {
+        NSView *pendingOrigin = self.profileEditorOrigin;
+        if (pendingOrigin && pendingOrigin.window == window
+            && [pendingOrigin respondsToSelector:@selector(setEnabled:)]) {
+            [(id)pendingOrigin setEnabled:actionable];
         }
     }
     NSView *origin = self.profileEditorOrigin;
@@ -1150,7 +1159,27 @@ static NSView *YMSpacer(void) {
         ADController *controller = weakSelf;
         if (!controller) return;
         NSError *error = nil;
-        [controller startSavedProfileWithOrdinal:ordinal error:&error];
+        BOOL started = [controller startSavedProfileWithOrdinal:ordinal error:&error];
+        if (!started) {
+            NSString *message = nil;
+            if (error && [error.domain isEqualToString:@"dev.chekusu.yomado.profile"]) {
+                message = error.localizedDescription;
+            }
+            if (!message.length) message = @"当前无法启动虚拟屏，请稍后重试。";
+            YMManagedDisplay *profile = [controller profileWithOrdinal:ordinal];
+            if (profile && [controller.displayProfiles containsObject:profile] && !profile.display.isCreated) {
+                profile.startFailureText = message;
+                controller.pendingProfileRevealOrdinal = @(ordinal);
+                [controller updateSavedProfilesPresentation];
+            } else {
+                [controller updateSavedProfilesPresentation];
+                if (controller.profileActivityLabel) {
+                    controller.profileActivityLabel.stringValue = message;
+                    controller.profileActivityLabel.hidden = NO;
+                }
+            }
+            return;
+        }
         [controller updateSavedProfilesPresentation];
     };
     self.savedProfilesView.onEdit = ^(NSUInteger ordinal) {
@@ -1473,12 +1502,12 @@ static NSView *YMSpacer(void) {
         BOOL busy = self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress || self.appOperationInProgress;
         self.addDisplayButton.enabled = !self.previewMode && !busy && !self.topologyRecoverySnapshot
             && !self.profileEditor && self.window.attachedSheet == nil;
+        [self updateSavedProfilesPresentation];
         if (self.profileEditorFocusPending && !self.profileEditor && self.window.attachedSheet == nil) {
             [self restoreProfileEditorFocus];
         }
         self.statusPill.text = busy ? @"正在更新" : self.topologyRecoverySnapshot ? @"显示排列待恢复" : virtualCount ? @"工作屏已就绪" : @"尚未启动";
         self.statusPill.tint = busy ? NSColor.systemOrangeColor : virtualCount ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
-        [self updateSavedProfilesPresentation];
         if (self.previewMode) {
             self.permissionContainer.hidden = YES;
             self.wechatRestoreButton.hidden = YES;

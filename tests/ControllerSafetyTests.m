@@ -429,6 +429,7 @@
 
 @interface ADController (YMProfileEditorFocusTestAccess)
 @property(nonatomic, weak) id profileEditorOrigin;
+@property(nonatomic) BOOL profileEditorFocusPending;
 @end
 
 @interface YMRenameController : YMFakeController
@@ -1248,6 +1249,183 @@ int main(void) {
             }
 
             {
+                YMRenameWindow *rw; YMRenameEnvironment *re; YMManagedDisplay *rp;
+                YMRenameController *rc = RenameController(&rw, &re, &rp);
+                YMFocusControl *origin = [YMFocusControl new];
+                origin.window = rw;
+                origin.enabled = YES;
+                origin.acceptsFirstResponder = YES;
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = rw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                rc.addDisplayButton = (NSButton *)(id)addButton;
+                [rc presentProfileEditorForOrdinal:rp.ordinal mode:YMDisplayProfileEditorModeEdit];
+                rc.profileEditorOrigin = (NSView *)(id)origin;
+                origin.enabled = NO;
+                addButton.enabled = NO;
+                [rc.lastEditor cancel:nil];
+                Expect(origin.enabled, "cancel refreshes stale saved-row origin before restore");
+                Expect(rw.firstResponder == origin, "cancel restores focus to refreshed saved-row origin");
+                Expect(addButton.enabled, "cancel still refreshes create button after origin refresh");
+                [rc.panelPresenter invalidate];
+                [re.pending removeAllObjects];
+                [re.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *sw; YMRenameEnvironment *se; YMManagedDisplay *sp;
+                YMRenameController *sc = RenameController(&sw, &se, &sp);
+                YMFocusControl *origin = [YMFocusControl new];
+                origin.window = sw;
+                origin.enabled = YES;
+                origin.acceptsFirstResponder = YES;
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = sw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                sc.addDisplayButton = (NSButton *)(id)addButton;
+                [sc presentProfileEditorForOrdinal:sp.ordinal mode:YMDisplayProfileEditorModeEdit];
+                sc.profileEditorOrigin = (NSView *)(id)origin;
+                origin.enabled = NO;
+                addButton.enabled = NO;
+                [sc.lastEditor submitName:@"SavedFocus"];
+                Expect([sp.friendlyName isEqualToString:@"SavedFocus"] && sc.saves == 1,
+                       "valid save commits before focus restore");
+                Expect(origin.enabled, "valid save refreshes stale saved-row origin before restore");
+                Expect(sw.firstResponder == origin, "valid save restores focus to refreshed saved-row origin");
+                [sc.panelPresenter invalidate];
+                [se.pending removeAllObjects];
+                [se.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *dw; YMRenameEnvironment *de; YMManagedDisplay *dp;
+                YMRenameController *dc = RenameController(&dw, &de, &dp);
+                YMFocusControl *origin = [YMFocusControl new];
+                origin.window = dw;
+                origin.enabled = YES;
+                origin.acceptsFirstResponder = YES;
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = dw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                dc.addDisplayButton = (NSButton *)(id)addButton;
+                [dc presentProfileEditorForOrdinal:dp.ordinal mode:YMDisplayProfileEditorModeEdit];
+                dc.profileEditorOrigin = (NSView *)(id)origin;
+                origin.enabled = NO;
+                addButton.enabled = NO;
+                void (^endWhileAttached)(BOOL) = [dc.lastEditor.endHandler copy];
+                dc.lastEditor.finished = YES;
+                dc.lastEditor.endHandler = nil;
+                dc.lastEditor.submitHandler = nil;
+                endWhileAttached(NO);
+                Expect(dw.attachedSheet != nil, "delayed-detach saved origin keeps attachedSheet");
+                Expect(!origin.enabled, "origin stays stale while sheet still attached");
+                dw.attachedSheet = nil;
+                [dc restoreProfileEditorFocus];
+                Expect(origin.enabled, "delayed detach refreshes saved-row origin once");
+                Expect(dw.firstResponder == origin, "delayed detach restores refreshed saved-row origin");
+                [dc.panelPresenter invalidate];
+                [de.pending removeAllObjects];
+                [de.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *pw; YMRenameEnvironment *pe; YMManagedDisplay *pp;
+                YMRenameController *pc = RenameController(&pw, &pe, &pp);
+                YMFocusControl *origin = [YMFocusControl new];
+                origin.window = pw;
+                origin.enabled = YES;
+                origin.acceptsFirstResponder = YES;
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = pw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                pc.addDisplayButton = (NSButton *)(id)addButton;
+                [pc presentProfileEditorForOrdinal:pp.ordinal mode:YMDisplayProfileEditorModeEdit];
+                pc.profileEditorOrigin = (NSView *)(id)origin;
+                origin.enabled = NO;
+                addButton.enabled = NO;
+                void (^endWhileAttached)(BOOL) = [pc.lastEditor.endHandler copy];
+                pc.lastEditor.finished = YES;
+                pc.lastEditor.endHandler = nil;
+                pc.lastEditor.submitHandler = nil;
+                endWhileAttached(NO);
+                Expect(pw.attachedSheet != nil && pc.profileEditorFocusPending,
+                       "early async fixture keeps sheet and pending restore");
+                // Let the first deferred restore fire while AppKit still reports attachedSheet.
+                for (NSUInteger pass = 0; pass < 40 && pw.attachedSheet != nil; pass++) {
+                    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+                }
+                Expect(pw.attachedSheet != nil && pc.profileEditorFocusPending && !origin.enabled,
+                       "early async restore leaves origin gated while sheet remains");
+                pw.attachedSheet = nil;
+                for (NSUInteger pass = 0; pass < 40
+                     && (pc.profileEditorFocusPending || !origin.enabled || pw.firstResponder != origin);
+                     pass++) {
+                    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+                }
+                Expect(origin.enabled, "rescheduled restore refreshes origin after early async");
+                Expect(pw.firstResponder == origin, "rescheduled restore focuses refreshed origin");
+                Expect(!pc.profileEditorFocusPending, "rescheduled restore clears pending flag");
+                [pc.panelPresenter invalidate];
+                [pe.pending removeAllObjects];
+                [pe.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *gw; YMRenameEnvironment *ge; YMManagedDisplay *gp;
+                YMRenameController *gc = RenameController(&gw, &ge, &gp);
+                YMFocusControl *origin = [YMFocusControl new];
+                origin.window = gw;
+                origin.enabled = YES;
+                origin.acceptsFirstResponder = YES;
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = gw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                gc.addDisplayButton = (NSButton *)(id)addButton;
+                [gc presentProfileEditorForOrdinal:gp.ordinal mode:YMDisplayProfileEditorModeEdit];
+                gc.profileEditorOrigin = (NSView *)(id)origin;
+                origin.enabled = NO;
+                addButton.enabled = NO;
+                origin.window = nil;
+                [gc.lastEditor cancel:nil];
+                Expect(gw.firstResponder == addButton, "missing saved-row origin falls back to create");
+                Expect(addButton.enabled, "fallback create button is refreshed");
+                [gc.panelPresenter invalidate];
+                [ge.pending removeAllObjects];
+                [ge.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *bw; YMRenameEnvironment *be; YMManagedDisplay *bp;
+                YMRenameController *bc = RenameController(&bw, &be, &bp);
+                YMFocusControl *origin = [YMFocusControl new];
+                origin.window = bw;
+                origin.enabled = YES;
+                origin.acceptsFirstResponder = YES;
+                YMFocusControl *addButton = [YMFocusControl new];
+                addButton.window = bw;
+                addButton.enabled = YES;
+                addButton.acceptsFirstResponder = YES;
+                bc.addDisplayButton = (NSButton *)(id)addButton;
+                [bc presentProfileEditorForOrdinal:bp.ordinal mode:YMDisplayProfileEditorModeEdit];
+                bc.profileEditorOrigin = (NSView *)(id)origin;
+                origin.enabled = NO;
+                addButton.enabled = NO;
+                bc.updateWorkspaceBusy = YES;
+                [bc.lastEditor cancel:nil];
+                Expect(!origin.enabled, "busy keeps refreshed origin disabled");
+                Expect(!addButton.enabled, "busy keeps create button disabled");
+                Expect(bw.firstResponder == nil, "busy falls back safely when no control is enabled");
+                [bc.panelPresenter invalidate];
+                [be.pending removeAllObjects];
+                [be.settling removeAllObjects];
+            }
+
+            {
                 YMRenameWindow *dw; YMRenameEnvironment *de; YMManagedDisplay *dp;
                 YMRenameController *dc = RenameController(&dw, &de, &dp);
                 YMFocusControl *addButton = [YMFocusControl new];
@@ -1350,8 +1528,8 @@ int main(void) {
                 newer.mode = YMDisplayProfileEditorModeCreate;
                 nc.profileEditor = (YMDisplayProfileEditor *)(id)newer;
                 nw.attachedSheet = nil;
-                [nc restoreProfileEditorFocus];
                 id responderBefore = nw.firstResponder;
+                [nc restoreProfileEditorFocus];
                 Expect(nc.profileEditor == (YMDisplayProfileEditor *)(id)newer,
                        "pending restore does not clear a newer editor");
                 Expect(nw.firstResponder == responderBefore,
@@ -1543,6 +1721,56 @@ int main(void) {
             Expect(![controller profileActionsAvailableForEditor:nil],
                    "external entry stays blocked while sheet is attached");
             Expect(NSApp == nil, "gate checks stay headless");
+        }
+
+        {
+            YMFakeTopology *topology; YMFakeDisplay *display; YMManagedDisplay *profile, *sibling;
+            YMFakeController *controller = Controller(&topology, &display, &profile, &sibling);
+            profile.width = 1920; profile.height = 1080; profile.friendlyName = @"StartTarget";
+            sibling.ordinal = 1;
+            YMHeadlessProfileWindow *startWindow = [YMHeadlessProfileWindow new];
+            controller.window = (NSWindow *)(id)startWindow;
+            controller.profileEditor = nil;
+            NSUInteger baselineCreates = display.creates;
+            NSUInteger baselineSaves = controller.saves;
+            void (^expectStartRejected)(NSString *, void (^)(void)) = ^(NSString *name, void (^mutate)(void)) {
+                mutate();
+                NSError *error = nil;
+                BOOL started = [controller startSavedProfileWithOrdinal:profile.ordinal error:&error];
+                Expect(!started && error != nil, name.UTF8String);
+                Expect(display.creates == baselineCreates && controller.saves == baselineSaves
+                       && !profile.starting && !profile.display.isCreated
+                       && [profile.friendlyName isEqualToString:@"StartTarget"],
+                       [[name stringByAppendingString:@" leaves model untouched"] UTF8String]);
+                controller.previewMode = NO;
+                controller.updateWorkspaceBusy = NO;
+                controller.appOperationInProgress = NO;
+                controller.displayOperationInProgress = NO;
+                controller.armed = NO;
+                controller.preparing = NO;
+                controller.restoring = NO;
+                controller.layoutChangedForTrial = NO;
+                controller.recoveryRequested = NO;
+                controller.topologyRecoverySnapshot = nil;
+                startWindow.attachedSheet = nil;
+                controller.profileEditor = nil;
+                controller.window = (NSWindow *)(id)startWindow;
+            };
+            expectStartRejected(@"updateWorkspaceBusy rejects saved start", ^{ controller.updateWorkspaceBusy = YES; });
+            expectStartRejected(@"appOperationInProgress rejects saved start", ^{ controller.appOperationInProgress = YES; });
+            expectStartRejected(@"displayOperationInProgress rejects saved start", ^{ controller.displayOperationInProgress = YES; });
+            expectStartRejected(@"armed rejects saved start", ^{ controller.armed = YES; });
+            expectStartRejected(@"preparing rejects saved start", ^{ controller.preparing = YES; });
+            expectStartRejected(@"restoring rejects saved start", ^{ controller.restoring = YES; });
+            expectStartRejected(@"layoutChangedForTrial rejects saved start", ^{ controller.layoutChangedForTrial = YES; });
+            expectStartRejected(@"recoveryRequested rejects saved start", ^{ controller.recoveryRequested = YES; });
+            expectStartRejected(@"topologyRecoverySnapshot rejects saved start", ^{
+                controller.topologyRecoverySnapshot = topology.snapshot;
+            });
+            expectStartRejected(@"attachedSheet rejects saved start", ^{
+                startWindow.attachedSheet = [NSObject new];
+            });
+            Expect(NSApp == nil, "saved start gate checks stay headless");
         }
 
         {
