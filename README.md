@@ -150,7 +150,7 @@ bash ./test.sh
 
 These tests check display placement, app/window ownership and recovery geometry, diagnostic redaction, WeChat checkpoint policies, and update checks. Update tests use a simulated network transport to cover version comparison, experimental releases, pagination, duplicate requests and failures without contacting GitHub. They do not exercise private APIs or prove live display configuration or cross-app input.
 
-A separate hidden AppKit layout regression checks screen proportions, top alignment, inventory changes, scrolling and resizing. It requires a macOS WindowServer session, but does not inspect or move real application windows or create displays:
+A separate hidden AppKit layout regression checks screen proportions, top alignment, inventory changes, scrolling and resizing. It also builds the control panel from synthetic displays to check that the overview cards fit the board without scrollers, with overlay and legacy scrollers, and that the window never grows to fit them. It requires a macOS WindowServer session, but does not inspect or move real application windows or create displays:
 
 ```sh
 bash ./scripts/test-layout.sh
