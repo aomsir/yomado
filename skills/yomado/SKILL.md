@@ -14,7 +14,7 @@ Let the agent prepare its own work screen; the user does not need to create it m
 - The macOS desktop must be logged in and unlocked. The user handles first-time macOS permission grants and any authentication. yomado needs window-control permission; the agent's tools need their own capture/input permissions.
 - Identify the task's apps and windows from the user's request. Inspect the current screen layout, physical main display, virtual display names/IDs, bounds and scale, plus the original bounds of the windows that may move. Keep this recovery record local; do not publish window titles, screenshots or machine identifiers.
 - Reuse a suitable screen belonging to this task when possible. A familiar name does not prove ownership: do not reuse, rename or close another task's screen without authority. Coordinate with any existing desktop owner before GUI operations.
-- Virtual screens share the login session, focus, keyboard and pointer. They do not provide independent agent input. When uninterrupted personal computer use is required, establish that the actual tool supports the needed non-interference before input; otherwise stop and explain the limitation.
+- Virtual screens share the login session, focus, keyboard and pointer. They do not provide independent agent input. Follow **Share the mouse and keyboard** below before any input.
 
 ## Prepare the screen
 
@@ -52,6 +52,33 @@ If the header shows a lock icon, window movement needs permission. The icon open
 
 Screen creation, an accessibility tree, a running process or a synthetic preview is not evidence of target-app visual input. Keep claims specific to the app and operation actually observed. This skill does not establish locked-session operation or input isolation.
 
+## Share the mouse and keyboard
+
+The user may be working on the physical screens while the agent works on the virtual one. Choose input in this order:
+
+1. **Background input (default).** Use the tool's methods that leave the user's pointer, keyboard focus and frontmost app untouched: Accessibility actions on specific elements (press, set value, set window position), and events delivered to the target process only. Verify with a fresh capture that the pointer did not move and the frontmost app did not change. Browsers, Electron and ordinary Mac apps usually work this way.
+2. **Borrowed real input (only when background input cannot work).** 3D viewports and other canvas apps (for example Blender or Marvelous Designer viewports, games) often accept only real pointer and keyboard events. Before posting any such event, ask the user through yomado and wait for the answer:
+
+   ```sh
+   /path/to/Yomado.app/Contents/MacOS/Yomado --input request --agent "Codex" --reason "Orbit the Blender viewport" --seconds 120
+   ```
+
+   It prints one JSON line. Continue only on `"status":"granted"` (exit 0) and keep its `leaseID`. `denied`, `timeout` and `busy` (exit 2) mean do not take the pointer: stop and report, or keep to background input. `not-running` (exit 3) means yomado is not running or is older than this feature; do not take the pointer without asking the user another way.
+
+   While the lease is active, yomado shows "Agent 正在使用你的鼠标键盘" with a Stop button at the top-right of the main screen. Before each batch of real input, check the lease:
+
+   ```sh
+   Yomado --input status --lease <leaseID>
+   ```
+
+   Continue only while it reports `"status":"active"`. `ended` with reason `stopped` means the user took the controls back: stop at once and do not ask again for this step without the user. When done, release it so yomado hides the notice and puts the user's pointer and front app back:
+
+   ```sh
+   Yomado --input release --lease <leaseID>
+   ```
+
+   Request only the time the step needs (10–600 seconds). A lease is permission to post input, not a guarantee the user is away; keep batches short and re-capture before each one. Never borrow real input without a granted lease, and never ask repeatedly after a denial.
+
 ## Return windows and finish
 
 - Save task work as authorized before recovery. Return only the windows moved for this task. Inspect scope again if new windows appeared during the task.
@@ -63,4 +90,4 @@ Screen creation, an accessibility tree, a running process or a synthetic preview
 
 ## Current command-line boundary
 
-The public v0.3.3 app has `--diagnose` for local capability/display diagnostics. It has no public create/move/restore CLI or management RPC; do not invent or probe such commands, including `--help` (unknown arguments open the normal app UI). Do not add `--include-device-identifiers` to shared diagnostics. `--preview-ui` renders sample data, while `--self-test` and `--watchdog-test` are developer tests that can change displays; none is a normal work-screen setup command.
+The public v0.3.3 app has `--diagnose` for local capability/display diagnostics. Versions that include the input lease also accept `--input request|status|release` as described above. There is no public create/move/restore CLI or management RPC; do not invent or probe such commands, including `--help` (unknown arguments open the normal app UI). Do not add `--include-device-identifiers` to shared diagnostics. `--preview-ui` renders sample data, while `--self-test` and `--watchdog-test` are developer tests that can change displays; none is a normal work-screen setup command.

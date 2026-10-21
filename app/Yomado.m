@@ -16,6 +16,7 @@
 #import "UpdateWorkspaceRecovery.h"
 #import "MenuBarIcon.h"
 #import "PanelPresentation.h"
+#import "InputLease.h"
 
 static NSString *YMAppVersion(void) {
     return [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"—";
@@ -168,6 +169,7 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property YMManagedDisplay *selectedProfile;
 @property NSButton *addDisplayButton;
 @property YMAppWorkspace *appWorkspace;
+@property YMInputLeaseCenter *inputLeases;
 @property NSStackView *applicationCards;
 @property NSView *permissionContainer;
 @property NSMutableDictionary<NSNumber *, YMAppWorkspaceView *> *workspaceViews;
@@ -339,6 +341,8 @@ static NSView *YMSpacer(void) {
     [main addItem:appItem];
     NSApp.mainMenu = main;
     [self buildWindow];
+    self.inputLeases = [[YMInputLeaseCenter alloc] init];
+    [self.inputLeases start];
     EventTypeSpec type = { kEventClassKeyboard, kEventHotKeyPressed };
     OSStatus handlerStatus = InstallEventHandler(GetApplicationEventTarget(), RecoveryHotkey, 1, &type,
                                                 (__bridge void *)self, &_keyHandler);
@@ -1783,6 +1787,7 @@ static NSView *YMSpacer(void) {
     if (self.previewMode) return;
     (void)notification;
     [self.panelPresenter invalidate];
+    [self.inputLeases stop];
     [NSNotificationCenter.defaultCenter removeObserver:self];
     [self.heartbeatTimer invalidate];
     if (self.hotkey) UnregisterEventHotKey(self.hotkey);
@@ -2044,6 +2049,7 @@ int main(int argc, const char *argv[]) {
                 @"physicalDisplaySwitchAPI":@(EnableAPI() != NULL), @"displays":DisplaySnapshot()}, includeIdentifiers).UTF8String);
             return 0;
         }
+        if (argc > 1 && strcmp(argv[1], "--input") == 0) return YMInputLeaseCommand(argc, argv);
         if (argc > 2 && strcmp(argv[1], "--self-test") == 0)
             return SelfTest([NSString stringWithUTF8String:argv[2]], argc > 3 && strcmp(argv[3], "hidpi") == 0);
         if (argc > 3 && strcmp(argv[1], "--watchdog-test") == 0)
