@@ -57,6 +57,7 @@ Screen creation, an accessibility tree, a running process or a synthetic preview
 The user may be working on the physical screens while the agent works on the virtual one. Choose input in this order:
 
 1. **Background input (default).** Use the tool's methods that leave the user's pointer, keyboard focus and frontmost app untouched: Accessibility actions on specific elements (press, set value, set window position), and events delivered to the target process only. Verify with a fresh capture that the pointer did not move and the frontmost app did not change. Browsers, Electron and ordinary Mac apps usually work this way.
+   A background tool can report an event as delivered while the app ignores it. Confirm every effect in a fresh capture or by reading the app's state; do not trust the delivery result alone. If the app has a scripting interface or a dedicated MCP (for example Blender's Python API), prefer that over pointer input.
 2. **Borrowed real input (only when background input cannot work).** 3D viewports and other canvas apps (for example Blender or Marvelous Designer viewports, games) often accept only real pointer and keyboard events. Before posting any such event, ask the user through yomado and wait for the answer:
 
    ```sh
