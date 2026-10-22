@@ -195,6 +195,14 @@ static NSScreen *YMLeasePrimaryScreen(void) {
     [panel setFrameOrigin:NSMakePoint(NSMidX(visible) - size.width / 2,
                                       NSMaxY(visible) - size.height - visible.size.height * 0.18)];
 
+    // Remember where the person left off before the prompt appeared: clicking
+    // it can bring yomado forward. A lease that finishes normally hands back
+    // the same front app and pointer position.
+    self.previousApplication = NSWorkspace.sharedWorkspace.frontmostApplication;
+    CGEventRef probe = CGEventCreate(NULL);
+    self.hasPreviousCursor = probe != NULL;
+    if (probe) { self.previousCursor = CGEventGetLocation(probe); CFRelease(probe); }
+
     self.prompt = panel;
     self.promptRequestID = requestID;
     self.promptAgent = agent;
@@ -227,14 +235,12 @@ static NSScreen *YMLeasePrimaryScreen(void) {
     self.prompt = nil;
     self.promptRequestID = nil;
     self.promptCountdown = nil;
-    if (!granted) { [self respond:requestID status:status extra:@{}]; return; }
-
-    // Remember where the person left off so a lease that finishes normally can
-    // hand back the same front app and pointer position.
-    self.previousApplication = NSWorkspace.sharedWorkspace.frontmostApplication;
-    CGEventRef probe = CGEventCreate(NULL);
-    self.hasPreviousCursor = probe != NULL;
-    if (probe) { self.previousCursor = CGEventGetLocation(probe); CFRelease(probe); }
+    if (!granted) {
+        self.previousApplication = nil;
+        self.hasPreviousCursor = NO;
+        [self respond:requestID status:status extra:@{}];
+        return;
+    }
 
     NSString *leaseID = NSUUID.UUID.UUIDString.lowercaseString;
     self.activeLeaseID = leaseID;
