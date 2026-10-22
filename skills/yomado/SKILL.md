@@ -45,7 +45,7 @@ If the header shows a lock icon, window movement needs permission. The icon open
 
 ## Verify before working
 
-1. Select the actual target display/window in the agent's capture tool. Acquire a fresh target-app screenshot and current window bounds, pixel dimensions and scale; discard pre-move coordinates. A correct, fresh target screenshot is required before any test input.
+1. Select the actual target display/window in the agent's capture tool. The tool may list the virtual screen under a generic name (such as `display 7`) rather than its yomado name; match it by display ID or bounds. Acquire a fresh target-app screenshot and current window bounds, pixel dimensions and scale; discard pre-move coordinates. A correct, fresh target screenshot is required before any test input.
 2. Perform one authorized, reversible operation in the real target app, such as opening and dismissing a menu or changing and restoring a view. Confirm the change in a new screenshot before claiming visual operation works.
 3. If targeting fails only after the move, stop input and safely return only this task's moved windows using their checkpoint. If recovery cannot be verified, leave the screen running and report the pending recovery. Do not make the virtual screen primary or move unrelated windows as a workaround.
 4. Stop on blank/stale capture, wrong-window input, unexpected layout changes, login/security prompts or rejected movement. Use the same scoped recovery path for failed capture/input. On a login/security prompt, return only the moved app's windows to their recorded physical display if safe, then let the user handle the prompt. Do not repeatedly attempt login or dismiss security checks.
@@ -78,7 +78,9 @@ The user may be working on the physical screens while the agent works on the vir
    Yomado --input release --lease <leaseID>
    ```
 
-   Request only the time the step needs (10–600 seconds). A lease is permission to post input, not a guarantee the user is away; keep batches short and re-capture before each one. Never borrow real input without a granted lease, and never ask repeatedly after a denial.
+   Get every other approval the step needs first (for example the agent tool's own full-control or app-access prompts), then request the lease, so the lease time is not spent waiting on them. If the agent's tool hides other apps while it has full control, include yomado in its allowed apps so the prompt and notice stay visible. Run each `status` check on its own and wait for it before the next input batch.
+
+   Request only the time the step needs (10–600 seconds), with room for capture and verification. A lease is permission to post input, not a guarantee the user is away; keep batches short and re-capture before each one. Never borrow real input without a granted lease, and never ask repeatedly after a denial.
 
 ## Return windows and finish
 
