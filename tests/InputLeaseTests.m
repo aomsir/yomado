@@ -29,7 +29,8 @@ static void TextFixtures(void) {
     Check([YMInputLeaseDisplayText(@" \n\t ", 40, @"fallback") isEqualToString:@"fallback"], @"blank text uses the fallback");
     Check([YMInputLeaseDisplayText(@"  Codex\n\n允许\tBlender  ", 40, @"x") isEqualToString:@"Codex 允许 Blender"],
           @"newlines, tabs and runs collapse to single spaces");
-    Check([YMInputLeaseDisplayText(@"a‮b\u0007c", 40, @"x") isEqualToString:@"a b c"],
+    NSString *hostile = [NSString stringWithFormat:@"a%Cb%Cc", (unichar)0x202E, (unichar)0x0007];
+    Check([YMInputLeaseDisplayText(hostile, 40, @"x") isEqualToString:@"a b c"],
           @"control and bidi override characters cannot reshape the prompt");
     NSString *capped = YMInputLeaseDisplayText(@"abcdefghij", 5, @"x");
     Check([capped isEqualToString:@"abcd…"], @"long text is capped with an ellipsis");
