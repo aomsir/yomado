@@ -26,6 +26,14 @@ static NSTextField *YMLeaseLabel(NSString *text, CGFloat size, NSFontWeight weig
     return label;
 }
 
+// The prompt and notice never become active, so their buttons must act on the
+// first click instead of spending it on bringing the panel forward.
+@interface YMLeaseButton : NSButton
+@end
+@implementation YMLeaseButton
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
+@end
+
 static NSScreen *YMLeasePrimaryScreen(void) {
     // The first screen holds the menu bar; yomado keeps a physical display main.
     return NSScreen.screens.firstObject ?: NSScreen.mainScreen;
@@ -159,9 +167,9 @@ static NSScreen *YMLeasePrimaryScreen(void) {
     countdown.textColor = NSColor.secondaryLabelColor;
     [stack addArrangedSubview:countdown];
 
-    NSButton *deny = [NSButton buttonWithTitle:@"拒绝" target:self action:@selector(denyPrompt:)];
+    NSButton *deny = [YMLeaseButton buttonWithTitle:@"拒绝" target:self action:@selector(denyPrompt:)];
     deny.keyEquivalent = @"\e";
-    NSButton *allow = [NSButton buttonWithTitle:@"允许" target:self action:@selector(allowPrompt:)];
+    NSButton *allow = [YMLeaseButton buttonWithTitle:@"允许" target:self action:@selector(allowPrompt:)];
     allow.bezelColor = NSColor.controlAccentColor;
     NSStackView *buttons = [NSStackView stackViewWithViews:@[deny, allow]];
     buttons.spacing = 8;
@@ -279,7 +287,7 @@ static NSScreen *YMLeasePrimaryScreen(void) {
     text.spacing = 2;
     [text setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
                                    forOrientation:NSLayoutConstraintOrientationHorizontal];
-    NSButton *stop = [NSButton buttonWithTitle:@"停止" target:self action:@selector(stopPressed:)];
+    NSButton *stop = [YMLeaseButton buttonWithTitle:@"停止" target:self action:@selector(stopPressed:)];
     stop.toolTip = @"立即收回鼠标键盘，Agent 下次检查时会停下。";
     NSStackView *row = [NSStackView stackViewWithViews:@[icon, text, stop]];
     row.spacing = 10;
