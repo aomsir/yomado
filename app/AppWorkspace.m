@@ -1,5 +1,6 @@
 #import "AppWorkspace.h"
 #import "AppWorkspacePolicy.h"
+#import "UpdateWorkspaceRecovery.h"
 #import <ApplicationServices/ApplicationServices.h>
 
 NSString * const YMAppWorkspaceErrorDomain = @"dev.chekusu.yomado.app-workspace";
@@ -49,6 +50,9 @@ static BOOL YMWOrdinaryWindow(id element) {
 @property(nonatomic, strong) NSMutableArray<YMWPlacement *> *placements;
 @property(nonatomic) BOOL inventoryValid;
 @property(nonatomic) BOOL operationInProgress;
+// Displays whose unmatched windows the user agreed to leave for macOS to
+// relocate when the display is removed.
+@property(nonatomic, strong) NSMutableSet<NSNumber *> *unmovableAllowedIDs;
 @end
 
 @implementation YMAppWorkspace
@@ -57,6 +61,7 @@ static BOOL YMWOrdinaryWindow(id element) {
     if (!self) return nil;
     _rows = @[]; _ownedIDs = @[]; _displays = @[]; _windows = @[];
     _placements = [NSMutableArray array];
+    _unmovableAllowedIDs = [NSMutableSet set];
     _statusText = @"拖入已打开的 App，或手动把窗口拖到虚拟屏。原位置只保留到退出 yomado。";
     return self;
 }
@@ -76,6 +81,7 @@ static BOOL YMWOrdinaryWindow(id element) {
     NSMutableOrderedSet *IDs = [NSMutableOrderedSet orderedSet];
     for (id value in displayIDs) if ([value isKindOfClass:NSNumber.class] && [value unsignedIntValue]) [IDs addObject:value];
     self.ownedIDs = IDs.array;
+    [self.unmovableAllowedIDs intersectSet:[NSSet setWithArray:self.ownedIDs]];
     NSMutableArray *normalized = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, NSScreen *> *screens = [NSMutableDictionary dictionary];
     for (NSScreen *screen in NSScreen.screens) {
@@ -196,7 +202,8 @@ static BOOL YMWOrdinaryWindow(id element) {
 - (NSArray<NSDictionary *> *)rowsForDisplayID:(CGDirectDisplayID)ID { return [self groupedRowsForDisplay:ID ownedOnly:NO]; }
 - (BOOL)needsRestoreForDisplayID:(CGDirectDisplayID)ID {
     if (![self.ownedIDs containsObject:@(ID)]) return NO;
-    if (!self.inventoryValid || [self rowsForDisplayID:ID].count) return YES;
+    if (!self.inventoryValid) return YES;
+    if ([self rowsForDisplayID:ID].count && ![self.unmovableAllowedIDs containsObject:@(ID)]) return YES;
     for (YMWPlacement *placement in self.placements) if (placement.lastDisplayID == ID) return YES;
     return NO;
 }
@@ -228,6 +235,20 @@ static BOOL YMWOrdinaryWindow(id element) {
     return nil;
 }
 - (NSArray<NSDictionary *> *)candidatesForApplication:(NSRunningApplication *)app sourceFilter:(NSNumber *)filter error:(NSError **)error {
+    NSUInteger visibleCount = 0;
+    NSArray *result = [self matchedWindowsForApplication:app sourceFilter:filter visibleCount:&visibleCount error:error];
+    if (!result || result.count == visibleCount) return result;
+    if (filter.unsignedIntValue && [self.unmovableAllowedIDs containsObject:filter]) return result;
+    NSString *name = app.localizedName.length ? app.localizedName : (app.bundleIdentifier ?: @"应用");
+    [self fail:error code:7 text:[NSString stringWithFormat:@"「%@」有 %lu 个窗口无法可靠匹配或移动（常见于弹窗、启动画面或工具窗）。请关闭这些窗口、展开普通窗口后重试；尚未继续移屏。",
+        name, (unsigned long)(visibleCount - result.count)]];
+    return nil;
+}
+// Visible CG windows that match exactly one movable ordinary AX window. The
+// rest (dialogs, splash screens, tool windows, overlapping twins) cannot be
+// returned to a remembered origin; visibleCount lets callers count them.
+- (NSArray<NSDictionary *> *)matchedWindowsForApplication:(NSRunningApplication *)app sourceFilter:(NSNumber *)filter
+                                             visibleCount:(NSUInteger *)visibleCount error:(NSError **)error {
     NSMutableArray *visible = [NSMutableArray array];
     for (NSDictionary *window in self.windows)
         if ([window[@"pid"] intValue] == app.processIdentifier && YMWorkspaceMatchesSource(window, filter))
@@ -260,10 +281,34 @@ static BOOL YMWOrdinaryWindow(id element) {
         NSDictionary *entry = matches.firstObject; [used addObject:entry[@"windowID"]];
         [result addObject:@{@"element": window, @"frame": frame, @"windowID": entry[@"windowID"], @"displayID": entry[@"displayID"]}];
     }
-    if (result.count != visible.count) {
-        [self fail:error code:7 text:@"部分窗口无法可靠匹配或移动。请关闭弹窗、展开普通窗口后重试；尚未继续移屏。"]; return nil;
+    if (visibleCount) *visibleCount = visible.count;
+    return result;
+}
+- (NSArray<NSDictionary *> *)unmovableWindowsForDisplayID:(CGDirectDisplayID)ID {
+    NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
+    if (self.operationInProgress || !self.accessibilityTrusted || ![self.ownedIDs containsObject:@(ID)] ||
+        [self.unmovableAllowedIDs containsObject:@(ID)]) return @[];
+    [self refreshInventory];
+    if (!self.inventoryValid) return @[];
+    NSMutableArray *result = [NSMutableArray array];
+    for (NSDictionary *row in [self rowsForDisplayID:ID]) {
+        NSString *bundle = row[@"bundleIdentifier"];
+        if (!YMWorkspaceGenericRestoreAllowed(bundle)) continue;
+        NSUInteger unmatched = 0;
+        for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle]) {
+            if (app.terminated) continue;
+            NSUInteger visibleCount = 0;
+            // An app that does not answer AX is not listed: the restore itself
+            // reports that failure and keeps the display.
+            NSArray *matched = [self matchedWindowsForApplication:app sourceFilter:@(ID) visibleCount:&visibleCount error:NULL];
+            if (matched) unmatched += visibleCount - matched.count;
+        }
+        if (unmatched) [result addObject:@{@"appName": row[@"appName"], @"count": @(unmatched)}];
     }
     return result;
+}
+- (void)allowUnmovableWindowsOnDisplayID:(CGDirectDisplayID)ID {
+    if ([self.ownedIDs containsObject:@(ID)]) [self.unmovableAllowedIDs addObject:@(ID)];
 }
 - (BOOL)displayStillCurrent:(NSDictionary *)display {
     CGDirectDisplayID ID = [display[@"displayID"] unsignedIntValue];
@@ -444,6 +489,67 @@ static BOOL YMWOrdinaryWindow(id element) {
         }
         return YES;
     } @finally { self.operationInProgress = NO; [self refreshInventory]; }
+}
+- (NSArray<NSDictionary *> *)restartOriginCheckpointsWithError:(NSError **)error {
+    NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
+    if (self.operationInProgress) { [self fail:error code:30 text:@"窗口操作尚未结束，稍后再更新。"]; return nil; }
+    [self refreshInventory];
+    if (!self.inventoryValid) { [self fail:error code:30 text:@"无法核对窗口清单，保留当前工作区。"]; return nil; }
+    NSMutableArray *result = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (YMWPlacement *placement in self.placements) {
+        if (!placement.origin || !YMWorkspaceCheckpointWindow(placement.application.processIdentifier,
+            placement.windowID,self.windows,self.ownedIDs)) continue;
+        NSDictionary *identity = YMUpdateIdentityForWindowElement(placement.element);
+        NSDictionary *frame = YMWFrame(placement.element);
+        NSDictionary *display = YMWorkspaceDisplayForFrame(frame, self.displays);
+        NSDictionary *relative = YMWorkspaceGeometry(placement.origin[@"relative"]);
+        NSString *uuid = placement.origin[@"displayUUID"];
+        if (!identity || [identity[@"pid"] intValue] != placement.application.processIdentifier ||
+            [identity[@"windowID"] unsignedIntValue] != placement.windowID || !frame ||
+            ![self.ownedIDs containsObject:display[@"displayID"]] || !relative ||
+            ![uuid isKindOfClass:NSString.class] || !uuid.length || [seen containsObject:identity]) {
+            [self fail:error code:31 text:@"已有窗口的原位置无法精确交接，已暂停更新。"]; return nil;
+        }
+        [seen addObject:identity];
+        [result addObject:@{@"identity": identity, @"origin": @{@"displayUUID": uuid, @"relative": relative}}];
+    }
+    return result.copy;
+}
+- (BOOL)adoptRestartOriginCheckpoints:(NSArray<NSDictionary *> *)checkpoints error:(NSError **)error {
+    NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
+    if (self.operationInProgress || ![checkpoints isKindOfClass:NSArray.class])
+        return [self fail:error code:30 text:@"窗口恢复尚未完成。"];
+    NSMutableArray *pending = [NSMutableArray array]; NSMutableSet *seen = [NSMutableSet set];
+    for (NSDictionary *checkpoint in checkpoints) {
+        NSDictionary *identity = checkpoint[@"identity"], *origin = checkpoint[@"origin"];
+        NSDictionary *relative = YMWorkspaceGeometry(origin[@"relative"]);
+        NSString *uuid = origin[@"displayUUID"];
+        id element = YMUpdateResolveWindowIdentity(identity, error);
+        NSDictionary *frame = element ? YMWFrame(element) : nil;
+        NSDictionary *display = YMWorkspaceDisplayForFrame(frame, self.displays);
+        if (!element || !frame || ![self.ownedIDs containsObject:display[@"displayID"]] || !relative ||
+            ![uuid isKindOfClass:NSString.class] || !uuid.length || [seen containsObject:identity])
+            return [self fail:error code:31 text:@"窗口原位置接管未完成，保留恢复记录供重试。"];
+        [seen addObject:identity];
+        YMWPlacement *placement = [YMWPlacement new];
+        placement.element = element;
+        placement.application = [NSRunningApplication runningApplicationWithProcessIdentifier:[identity[@"pid"] intValue]];
+        placement.bundleID = identity[@"bundleID"];
+        placement.windowID = [identity[@"windowID"] unsignedIntValue];
+        placement.lastDisplayID = [display[@"displayID"] unsignedIntValue];
+        placement.origin = @{@"displayUUID": uuid, @"relative": relative};
+        [pending addObject:placement];
+    }
+    // All exact lookups complete before changing any in-memory ownership.
+    for (YMWPlacement *placement in pending) {
+        for (YMWPlacement *old in self.placements.copy)
+            if (old.windowID == placement.windowID && old.application.processIdentifier == placement.application.processIdentifier)
+                [self.placements removeObject:old];
+        [self.placements addObject:placement];
+    }
+    [self refreshInventory];
+    return YES;
 }
 - (BOOL)restoreAll:(NSError **)error {
     for (NSNumber *ID in self.ownedIDs.copy) if (![self restoreDisplayID:ID.unsignedIntValue error:error]) return NO;

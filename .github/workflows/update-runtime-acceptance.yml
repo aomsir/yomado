@@ -1,0 +1,43 @@
+name: Isolated native update acceptance
+on:
+  push:
+    branches: [qa/in-app-update-runtime]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Runtime acceptance scope
+        type: choice
+        options: [all, occupied]
+        default: all
+permissions:
+  contents: read
+concurrency:
+  group: yomado-update-runtime-acceptance
+  cancel-in-progress: false
+jobs:
+  update-runtime:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Record exact revision and run isolated update fixtures
+        shell: bash
+        env:
+          YM_UPDATE_RUNTIME_CASE: ${{ github.event_name == 'workflow_dispatch' && inputs.suite || 'all' }}
+        run: |
+          mkdir -p test-output/update-runtime
+          git rev-parse HEAD > test-output/update-runtime/revision.txt
+          git diff --exit-code
+          bash scripts/test-update-runtime.sh "$GITHUB_WORKSPACE/test-output/update-runtime"
+      - name: Collect acceptance evidence, excluding keys and application bundles
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-update-runtime
+          path: |
+            test-output/update-runtime/
+            !test-output/update-runtime/UpdateRuntimeFixture
+            !test-output/update-runtime/UpdateRuntimeWindow
+          retention-days: 7

@@ -68,6 +68,7 @@
 
 @interface YMFakeController : ADController
 @property NSUInteger inventoryUpdates;
+@property NSUInteger panelCheckpoints;
 @property NSUInteger saves;
 @property NSUInteger reports;
 @property BOOL powerFails;
@@ -76,6 +77,7 @@
 @property NSUInteger showCalls;
 @property NSUInteger resumedTerminations;
 @property BOOL deferTopologyOperations;
+@property BOOL useRealPanelPresentation;
 @property NSMutableArray<NSDictionary *> *pendingTopologyOperations;
 - (void)runNextTopologyOperation;
 @end
@@ -97,11 +99,16 @@
     NSError *error=nil; BOOL succeeded=operation(&error); completion(succeeded,error);
 }
 - (void)updateInventory { self.inventoryUpdates++; }
+- (void)storeUpdatePanelState { self.panelCheckpoints++; }
 - (void)saveDisplayProfiles { self.saves++; }
 - (void)reportTopologyError:(NSError *)error { (void)error; self.reports++; }
 - (void)powerAssertions:(BOOL)on { self.systemAssertion = self.displayAssertion = on && !self.powerFails ? 1 : 0; }
 - (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID { (void)displayID; return YES; }
-- (void)showWindow:(id)sender { (void)sender; self.showCalls++; }
+- (BOOL)confirmUnmovableWindowsOnDisplayIDs:(NSArray<NSNumber *> *)displayIDs { (void)displayIDs; return YES; }
+- (void)showWindow:(id)sender {
+    self.showCalls++;
+    if (self.useRealPanelPresentation) [super showWindow:sender];
+}
 - (void)resumeTerminationAfterTopologyRecovery:(BOOL)recovered {
     if (self.terminationAfterTopologyRecovery && recovered) self.resumedTerminations++;
     self.terminationAfterTopologyRecovery=NO;
@@ -125,6 +132,255 @@
     }
 }
 @end
+
+@interface YMSpyPanelPresenter : NSObject
+@property NSUInteger opens;
+@property NSUInteger closes;
+@property NSUInteger invalidations;
+@property BOOL acceptClose;
+@property NSWindow *lastClosedWindow;
+@end
+@implementation YMSpyPanelPresenter
+- (void)open { self.opens++; }
+- (BOOL)closeWindow:(NSWindow *)window {
+    self.closes++; self.lastClosedWindow = window; return self.acceptClose;
+}
+- (void)invalidate { self.invalidations++; }
+@end
+
+@interface YMSpyPanelWindow : NSObject
+@property NSUInteger ordersOut;
+@end
+@implementation YMSpyPanelWindow
+- (void)orderOut:(id)sender { (void)sender; self.ordersOut++; }
+@end
+
+@interface YMSpyHeartbeat : NSObject
+@property NSUInteger invalidations;
+@end
+@implementation YMSpyHeartbeat
+- (void)invalidate { self.invalidations++; }
+@end
+
+@interface YMControllerUpdateEngine : NSObject
+@property BOOL installationPending;
+@property BOOL installationAuthorized;
+@property BOOL automaticUpdatesEnabled;
+@property BOOL busy;
+@property BOOL canCancel;
+@property YMAutomaticUpdateStatus status;
+@property double progress;
+@property NSError *lastError;
+@property BOOL canCheck;
+@property NSString *latestVersion;
+@property NSString *latestBuild;
+@property NSUInteger deferrals;
+@end
+@implementation YMControllerUpdateEngine
+- (void)installationWasDeferredWithError:(NSError *)error { (void)error; self.deferrals++; self.installationAuthorized=NO; }
+@end
+@interface YMControllerUpdateRecovery : NSObject
+@property BOOL commitResult;
+@property NSUInteger commits;
+@property NSUInteger preparations;
+@property NSUInteger cancellations;
+@property BOOL restoreResult;
+@property NSArray *restoredOriginCheckpoints;
+@property NSMutableArray *events;
+@end
+@implementation YMControllerUpdateRecovery
+- (BOOL)prepareRestartWithProfiles:(NSArray *)profiles targetVersion:(NSString *)version targetBuild:(NSString *)build originCheckpoints:(NSArray *)origins error:(NSError **)error {
+    (void)profiles; (void)version; (void)build; (void)origins; (void)error; self.preparations++; return YES;
+}
+- (BOOL)restoreWithProfiles:(NSArray *)profiles error:(NSError **)error { (void)profiles; (void)error; [self.events addObject:@"restore"]; return self.restoreResult; }
+- (BOOL)completeRestoration:(NSError **)error { (void)error; [self.events addObject:@"complete"]; return YES; }
+- (BOOL)cancelPreparedRestart:(NSError **)error { (void)error; self.cancellations++; return YES; }
+- (BOOL)commitPreparedRestart:(NSError **)error {
+    self.commits++;
+    if (!self.commitResult && error) *error=[NSError errorWithDomain:@"fixture" code:1 userInfo:nil];
+    return self.commitResult;
+}
+@end
+@interface YMControllerUpdateWorkspace : NSObject
+@property NSMutableArray *events;
+@property BOOL adoptedNonemptyOrigins;
+@end
+@implementation YMControllerUpdateWorkspace
+- (NSArray *)restartOriginCheckpointsWithError:(NSError **)error { (void)error; return @[]; }
+- (BOOL)adoptRestartOriginCheckpoints:(NSArray *)points error:(NSError **)error {
+    (void)error;
+    self.adoptedNonemptyOrigins=points.count>0 && [self.events.lastObject isEqual:@"inventory"];
+    [self.events addObject:@"adopt"];
+    return self.adoptedNonemptyOrigins;
+}
+@end
+@interface YMControllerLegacyRecovery : NSObject
+@property BOOL needsRestoreBeforeRemovingVirtualDisplay;
+@end
+@implementation YMControllerLegacyRecovery
+@end
+@interface YMUpdateCompletionController : YMFakeController
+@property NSMutableArray *events;
+@property NSError *completionError;
+@end
+@implementation YMUpdateCompletionController
+- (void)updateInventory { [self.events addObject:@"inventory"]; }
+- (void)finishUpdateRecoveryWithError:(NSError *)error { self.completionError=error; [self.events addObject:@"finished"]; }
+@end
+
+@interface ADController (YMRenameTestDeclaration)
+- (NSAlert *)makeRenameAlertForProfile:(YMManagedDisplay *)profile;
+@end
+
+@interface YMRenameText : NSObject
+@property(nonatomic, copy) NSString *stringValue;
+@end
+@implementation YMRenameText
+@end
+
+@interface YMRenameWindow : NSObject
+@property(nonatomic) BOOL visible;
+@property(nonatomic, strong) id attachedSheet;
+@end
+@implementation YMRenameWindow
+@end
+
+@interface YMRenameAlert : NSObject
+@property(nonatomic, strong) YMRenameText *accessoryView;
+@property(nonatomic, weak) YMRenameWindow *parent;
+@property(nonatomic, copy) void (^completion)(NSModalResponse);
+@property(nonatomic) NSUInteger begins;
+- (void)beginSheetModalForWindow:(NSWindow *)window
+              completionHandler:(void (^)(NSModalResponse))completion;
+- (void)finish:(NSModalResponse)response;
+@end
+@implementation YMRenameAlert
+- (void)beginSheetModalForWindow:(NSWindow *)window
+              completionHandler:(void (^)(NSModalResponse))completion {
+    self.parent = (YMRenameWindow *)(id)window;
+    self.parent.attachedSheet = self;
+    self.parent.visible = YES;
+    self.completion = completion;
+    self.begins++;
+}
+- (void)finish:(NSModalResponse)response {
+    self.parent.attachedSheet = nil;
+    void (^completion)(NSModalResponse) = self.completion;
+    self.completion = nil;
+    if (completion) completion(response);
+}
+@end
+
+@interface YMRenameMenuItem : NSObject
+@property(nonatomic, strong) id representedObject;
+@end
+@implementation YMRenameMenuItem
+@end
+
+@interface YMRenameEnvironment : NSObject <YMPanelPresentationEnvironment>
+@property(nonatomic) NSApplicationActivationPolicy activationPolicy;
+@property(nonatomic) BOOL rejectAccessory;
+@property(nonatomic) NSUInteger hides;
+@property(nonatomic) NSUInteger presentations;
+@property(nonatomic) NSUInteger policyRequests;
+@property(nonatomic, strong) NSMutableArray *pending;
+@property(nonatomic, strong) NSMutableArray *settling;
+- (void)drain;
+- (void)drainSettling;
+@end
+@implementation YMRenameEnvironment
+- (instancetype)init {
+    if ((self = [super init])) {
+        _activationPolicy = NSApplicationActivationPolicyAccessory;
+        _pending = [NSMutableArray array];
+        _settling = [NSMutableArray array];
+    }
+    return self;
+}
+- (BOOL)requestActivationPolicy:(NSApplicationActivationPolicy)policy {
+    self.policyRequests++;
+    if (self.rejectAccessory && policy == NSApplicationActivationPolicyAccessory) return NO;
+    self.activationPolicy = policy;
+    return YES;
+}
+- (void)activateApplication {}
+- (void)deferUntilAfterMenuTracking:(dispatch_block_t)block {
+    [self.pending addObject:[block copy]];
+}
+- (void)deferUntilPolicySettles:(dispatch_block_t)block {
+    [self.settling addObject:[block copy]];
+}
+- (BOOL)isWindowVisible:(NSWindow *)window {
+    return ((YMRenameWindow *)(id)window).visible;
+}
+- (BOOL)hasAttachedSheetForWindow:(NSWindow *)window {
+    return ((YMRenameWindow *)(id)window).attachedSheet != nil;
+}
+- (void)presentWindow:(NSWindow *)window {
+    self.presentations++;
+    ((YMRenameWindow *)(id)window).visible = YES;
+}
+- (void)hideWindow:(NSWindow *)window {
+    self.hides++;
+    ((YMRenameWindow *)(id)window).visible = NO;
+}
+- (void)reportActivationPolicyFailure:(NSApplicationActivationPolicy)requested
+                        actualPolicy:(NSApplicationActivationPolicy)actual {
+    (void)requested; (void)actual;
+}
+- (void)drain {
+    while (self.pending.count) {
+        dispatch_block_t block = self.pending.firstObject;
+        [self.pending removeObjectAtIndex:0];
+        block();
+    }
+}
+- (void)drainSettling {
+    while (self.settling.count) {
+        dispatch_block_t block = self.settling.firstObject;
+        [self.settling removeObjectAtIndex:0];
+        block();
+    }
+}
+@end
+
+@interface YMRenameController : YMFakeController
+@property(nonatomic) NSUInteger alertCreations;
+@property(nonatomic, strong) YMRenameAlert *lastRenameAlert;
+@end
+@implementation YMRenameController
+- (NSAlert *)makeRenameAlertForProfile:(YMManagedDisplay *)profile {
+    self.alertCreations++;
+    YMRenameAlert *alert = [YMRenameAlert new];
+    alert.accessoryView = [YMRenameText new];
+    alert.accessoryView.stringValue = profile.friendlyName ?: @"";
+    self.lastRenameAlert = alert;
+    return (NSAlert *)(id)alert;
+}
+@end
+
+static YMRenameController *RenameController(YMRenameWindow **window, YMRenameEnvironment **environment, YMManagedDisplay **profile) {
+    YMRenameController *c = [YMRenameController new];
+    YMRenameWindow *w = [YMRenameWindow new];
+    YMRenameEnvironment *e = [YMRenameEnvironment new];
+    YMFakeDisplay *display = [YMFakeDisplay new];
+    YMManagedDisplay *p = [YMManagedDisplay new];
+    p.width = 800; p.height = 600; p.ordinal = 1;
+    p.friendlyName = @"Original";
+    p.display = display;
+    c.displayProfiles = [NSMutableArray arrayWithObject:p];
+    c.selectedProfile = p;
+    c.virtualDisplay = display;
+    c.statusLabel = (NSTextField *)(id)[YMRenameText new];
+    c.detailLabel = (NSTextField *)(id)[YMRenameText new];
+    c.window = (NSWindow *)(id)w;
+    c.useRealPanelPresentation = YES;
+    c.panelPresenter = [[YMControlPanelPresenter alloc] initWithWindow:(NSWindow *)(id)w environment:e];
+    if (window) *window = w;
+    if (environment) *environment = e;
+    if (profile) *profile = p;
+    return c;
+}
 
 static NSUInteger Tests, Failures;
 static void Expect(BOOL value, const char *name) { Tests++; if (!value) { Failures++; fprintf(stderr,"FAIL %s\n",name); } }
@@ -267,6 +523,495 @@ int main(void) {
         [c runNextTopologyOperation];
         Expect(c.resumedTerminations==2&&c.pendingTopologyOperations.count==0,"second verified removal schedules final termination exactly once");
         Expect([c applicationShouldTerminate:unusedSender]==NSTerminateNow,"multi-output quit completes only after both restorations");
+
+        YMFakeController *panelController = [YMFakeController new];
+        YMSpyPanelWindow *panel = [YMSpyPanelWindow new];
+        panelController.window = (NSWindow *)(id)panel;
+        [panelController preparePanelPresenter];
+        Expect(panelController.panelPresenter != nil && NSApp == nil,
+               "binding creates no application or window");
+        YMSpyPanelPresenter *spy = [YMSpyPanelPresenter new];
+        spy.acceptClose = YES;
+        panelController.panelPresenter = (YMControlPanelPresenter *)(id)spy;
+        panelController.useRealPanelPresentation = YES;
+        YMSpyHeartbeat *heartbeat = [YMSpyHeartbeat new];
+        panelController.heartbeatTimer = (NSTimer *)(id)heartbeat;
+        [panelController showWindow:nil];
+        Expect(spy.opens == 1, "showWindow uses the retained presenter");
+        Expect(![panelController applicationShouldHandleReopen:(NSApplication *)(id)[NSObject new] hasVisibleWindows:NO] && spy.opens == 2,
+               "application reopen uses the same presenter");
+        Expect(![panelController windowShouldClose:panelController.window] && spy.closes == 1,
+               "panel close is delegated but never destroys the NSWindow");
+        Expect(spy.lastClosedWindow == panelController.window && panel.ordersOut == 0,
+               "controller does not bypass the presenter's sheet and identity guard");
+        Expect(heartbeat.invalidations == 0 && panelController.stopCalls == 0,
+               "closing panel neither invalidates heartbeat nor stops workspaces");
+        spy.acceptClose = NO;
+        Expect(![panelController windowShouldClose:panelController.window] && panel.ordersOut == 0,
+               "refused close leaves the panel untouched");
+        YMSpyPanelWindow *other = [YMSpyPanelWindow new];
+        NSUInteger closes = spy.closes;
+        [panelController windowShouldClose:(NSWindow *)(id)other];
+        Expect(spy.closes == closes && other.ordersOut == 1,
+               "other-window close preserves old hide behavior without application demotion");
+        panelController.previewMode = YES;
+        NSUInteger opens = spy.opens;
+        [panelController showWindow:nil];
+        Expect(spy.opens == opens, "preview cannot activate the interactive presenter");
+        [panelController preparePanelPresenter];
+        Expect(!panelController.panelPresenter && spy.invalidations == 1,
+               "preview binding drops the interactive presenter");
+        panelController.previewMode = NO;
+        panelController.panelPresenter = (YMControlPanelPresenter *)(id)spy;
+        [panelController applicationWillTerminate:(NSNotification *)(id)[NSObject new]];
+        Expect(spy.invalidations == 2 && heartbeat.invalidations == 1,
+               "actual termination invalidates lifecycle before cleanup completes");
+
+        c = Controller(&t, &d, &p, &s);
+        YMSpyPanelPresenter *recoverySpy = [YMSpyPanelPresenter new];
+        recoverySpy.acceptClose = YES;
+        c.window = (NSWindow *)(id)[YMSpyPanelWindow new];
+        c.panelPresenter = (YMControlPanelPresenter *)(id)recoverySpy;
+        c.useRealPanelPresentation = YES;
+        [c windowShouldClose:c.window];
+        Expect(s.display.isCreated && [(YMFakeDisplay *)s.display destroys] == 0 && c.stopCalls == 0,
+               "closing panel preserves an existing virtual display object");
+        c.displayProfiles = [NSMutableArray arrayWithObject:s];
+        c.selectedProfile = s; c.virtualDisplay = s.display;
+        c.simulateFinalRemovalRecoveryFailure = YES; t.restoreResult = NO;
+        Expect([c applicationShouldTerminate:unusedSender] == NSTerminateCancel,
+               "existing topology failure still cancels quit");
+        Expect(recoverySpy.opens == 1,
+               "safety recovery can reopen a previously closed panel through the actual showWindow path");
+
+        // Exact production updater termination branch, with no defaults writes,
+        // WindowServer calls, process termination or third-party app access.
+        c=Controller(&t,&d,&p,&s);
+        YMControllerUpdateEngine *updater=[YMControllerUpdateEngine new];
+        updater.installationPending=YES; updater.installationAuthorized=YES;
+        updater.latestVersion=@"0.3.7"; updater.latestBuild=@"13";
+        c.automaticUpdater=(YMAutomaticUpdater *)(id)updater;
+        YMControllerUpdateRecovery *journal=[YMControllerUpdateRecovery new]; journal.commitResult=YES;
+        c.updateRecovery=(YMUpdateWorkspaceRecovery *)(id)journal;
+        c.appWorkspace=(YMAppWorkspace *)(id)[YMControllerUpdateWorkspace new];
+        Expect([c prepareUpdateRestart:NULL] && journal.preparations==1 && c.updateWorkspaceBusy,
+            "preparation checkpoints and freezes yomado workspace controls");
+        Expect(![c canMoveIntoProfile:s], "prepared update prevents moving more apps into owned screens");
+        NSUInteger saved=c.saves;
+        [c create:nil]; [c stop:nil];
+        // Fake stop itself does not include production action guard; create must.
+        Expect(d.creates==0 && c.saves==saved, "prepared update prevents a new screen operation");
+        c.stopCalls=0;
+        Expect([c applicationShouldTerminate:unusedSender]==NSTerminateNow && journal.commits==1,
+            "authorized update rechecks checkpoint immediately at termination");
+        Expect(c.stopCalls==0 && [(YMFakeDisplay *)s.display destroys]==0 && c.panelCheckpoints==1,
+            "update quit does not sweep apps back to physical screens or remove sibling displays early");
+        journal.commitResult=NO; c.updateWorkspaceBusy=YES;
+        Expect([c applicationShouldTerminate:unusedSender]==NSTerminateCancel && updater.deferrals==1,
+            "late window change vetoes installer termination");
+        Expect(!c.updateWorkspaceBusy && !updater.installationAuthorized && updater.installationPending,
+            "late veto unlocks app controls while keeping installer pending and gated");
+        NSUInteger commits=journal.commits;
+        Expect([c applicationShouldTerminate:unusedSender]==NSTerminateCancel && journal.commits==commits,
+            "later ordinary quit cannot bypass a deferred update's preparation gate");
+        c.displayOperationInProgress=YES;
+        NSUInteger preparations=journal.preparations;
+        Expect(![c prepareUpdateRestart:NULL] && journal.preparations==preparations,
+            "in-flight display operation prevents preparing an updater restart");
+        c.displayOperationInProgress=NO; c.updateRecoveryFailed=YES;
+        Expect(![c prepareUpdateRestart:NULL] && journal.preparations==preparations,
+            "failed recovery cannot be overwritten by another update checkpoint");
+        c.updateRecoveryFailed=NO;
+        YMControllerLegacyRecovery *legacyRecovery=[YMControllerLegacyRecovery new];
+        legacyRecovery.needsRestoreBeforeRemovingVirtualDisplay=YES;
+        c.windowRecovery=(YMWindowRecovery *)(id)legacyRecovery;
+        NSError *legacyError=nil;
+        Expect(![c prepareUpdateRestart:&legacyError] && legacyError.code==106 && journal.preparations==preparations,
+            "pending dedicated WeChat recovery defers update before replacing its exact tracked window state");
+        Expect(legacyRecovery.needsRestoreBeforeRemovingVirtualDisplay,
+            "update gate leaves the dedicated recovery record untouched");
+
+        c=Controller(&t,&d,&p,&s);
+        updater=[YMControllerUpdateEngine new];
+        c.automaticUpdater=(YMAutomaticUpdater *)(id)updater;
+        journal=[YMControllerUpdateRecovery new];
+        c.updateRecovery=(YMUpdateWorkspaceRecovery *)(id)journal;
+        c.updateRecoveryFailed=YES; c.updateRecoveryMessage=@"pending recovery";
+        [c automaticUpdateStateDidChange];
+        Expect(journal.cancellations==0 && [c.updateRecoveryMessage isEqual:@"pending recovery"],
+            "idle updater retains failed startup recovery even without claimed profiles");
+        updater.status=YMAutomaticUpdateChecking;
+        [c automaticUpdateStateDidChange];
+        Expect(journal.cancellations==0 && [c.updateRecoveryMessage isEqual:@"pending recovery"],
+            "scheduled checking cannot clear a failed recovery record or explanation");
+        c.updateRecoveryFailed=NO; c.pendingUpdateProfiles=@[];
+        [c automaticUpdateStateDidChange];
+        Expect(journal.cancellations==0,"claimed recovery remains protected from updater cleanup");
+        c.pendingUpdateProfiles=nil; updater.status=YMAutomaticUpdateCancelled;
+        c.updateWorkspaceBusy=YES;
+        [c automaticUpdateStateDidChange];
+        Expect(journal.cancellations==1 && !c.updateWorkspaceBusy,
+            "ordinary cancelled preparation still releases its own checkpoint and controls");
+
+        YMUpdateCompletionController *completionController=[YMUpdateCompletionController new];
+        NSMutableArray *events=[NSMutableArray array]; completionController.events=events;
+        completionController.pendingUpdateProfiles=@[];
+        YMControllerUpdateRecovery *restoreJournal=[YMControllerUpdateRecovery new];
+        restoreJournal.events=events; restoreJournal.restoreResult=YES;
+        restoreJournal.restoredOriginCheckpoints=@[@{@"fixture":@"nonempty-return-point"}];
+        completionController.updateRecovery=(YMUpdateWorkspaceRecovery *)(id)restoreJournal;
+        YMControllerUpdateWorkspace *restoreWorkspace=[YMControllerUpdateWorkspace new];
+        restoreWorkspace.events=events;
+        completionController.appWorkspace=(YMAppWorkspace *)(id)restoreWorkspace;
+        [completionController restoreUpdateProfileAtIndex:0];
+        Expect(restoreWorkspace.adoptedNonemptyOrigins && [events isEqual:@[@"restore",@"inventory",@"adopt",@"complete",@"finished"]],
+            "nonempty return points are adopted only after refreshing recreated display inventory");
+        Expect(completionController.completionError==nil,"verified complete recovery succeeds");
+        [events removeAllObjects]; restoreJournal.restoreResult=NO;
+        [completionController restoreUpdateProfileAtIndex:0];
+        Expect(completionController.completionError!=nil && [events isEqual:@[@"restore",@"finished"]],
+            "backend failure without NSError cannot be announced as a successful recovery");
+
+        {
+            BOOL seamAvailable = [ADController instancesRespondToSelector:
+                @selector(makeRenameAlertForProfile:)];
+            Expect(seamAvailable, "rename alert construction has a headless boundary");
+            if (!seamAvailable) goto rename_tests_done;
+
+            YMRenameWindow *w;
+            YMRenameEnvironment *e;
+            YMManagedDisplay *profile;
+            YMRenameController *c = RenameController(&w, &e, &profile);
+            [c showWindow:nil]; [e drain];
+            [c windowShouldClose:c.window]; [e drain];
+            NSUInteger hides = e.hides, opens = c.showCalls;
+            YMRenameMenuItem *item = [YMRenameMenuItem new];
+            item.representedObject = profile;
+            [c renameManagedDisplayFromMenu:(NSMenuItem *)(id)item];
+            Expect(c.showCalls == opens + 1, "menu rename uses the normal open entry");
+            Expect(c.panelPresenter.panelOpen, "rename restores logical open state");
+            [e drain];
+            Expect(e.activationPolicy == NSApplicationActivationPolicyRegular,
+                   "rename restores regular lifecycle");
+            [c.lastRenameAlert finish:NSAlertSecondButtonReturn];
+            Expect(c.panelPresenter.panelOpen && w.visible && c.saves == 0,
+                   "cancel keeps the panel open without saving");
+            [c windowShouldClose:c.window]; [e drain];
+            Expect(!w.visible && !c.panelPresenter.panelOpen && e.hides == hides + 1,
+                   "explicit close after rename hides the same panel");
+            NSWindow *originalWindow = c.window;
+            [c showWindow:nil]; [e drain];
+            Expect(w.visible && c.panelPresenter.panelOpen && c.window == originalWindow,
+                   "normal reopen reuses the panel");
+            [c windowShouldClose:c.window]; [e drain];
+            Expect(!w.visible && e.hides == hides + 2, "reopened panel closes again");
+            Expect(NSApp == nil, "rename regression never initializes the application");
+            [c.panelPresenter invalidate];
+            [e.pending removeAllObjects];
+            [e.settling removeAllObjects];
+
+            NSArray<NSString *> *blockedFlags = @[
+                @"previewMode", @"updateWorkspaceBusy", @"appOperationInProgress",
+                @"displayOperationInProgress", @"armed", @"preparing", @"restoring",
+                @"layoutChangedForTrial", @"recoveryRequested"
+            ];
+            for (NSString *flag in blockedFlags) {
+                YMRenameWindow *bw; YMRenameEnvironment *be; YMManagedDisplay *bp;
+                YMRenameController *bc = RenameController(&bw, &be, &bp);
+                NSUInteger showBefore = bc.showCalls, alertsBefore = bc.alertCreations, savesBefore = bc.saves;
+                [bc setValue:@YES forKey:flag];
+                YMRenameMenuItem *blockedItem = [YMRenameMenuItem new];
+                blockedItem.representedObject = bp;
+                [bc renameManagedDisplayFromMenu:(NSMenuItem *)(id)blockedItem];
+                Expect(bc.showCalls == showBefore && bc.alertCreations == alertsBefore && bc.saves == savesBefore,
+                       [[NSString stringWithFormat:@"blocked flag %@ rejects rename", flag] UTF8String]);
+                [bc.panelPresenter invalidate];
+                [be.pending removeAllObjects];
+                [be.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *rw; YMRenameEnvironment *re; YMManagedDisplay *rp;
+                YMRenameController *rc = RenameController(&rw, &re, &rp);
+                NSUInteger showBefore = rc.showCalls, alertsBefore = rc.alertCreations, savesBefore = rc.saves;
+                YMRenameMenuItem *nilItem = [YMRenameMenuItem new];
+                nilItem.representedObject = nil;
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)nilItem];
+                Expect(rc.showCalls == showBefore && rc.alertCreations == alertsBefore && rc.saves == savesBefore,
+                       "nil representedObject rejects rename");
+                YMRenameMenuItem *objItem = [YMRenameMenuItem new];
+                objItem.representedObject = [NSObject new];
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)objItem];
+                Expect(rc.showCalls == showBefore && rc.alertCreations == alertsBefore && rc.saves == savesBefore,
+                       "non-profile representedObject rejects rename");
+                YMManagedDisplay *outsider = [YMManagedDisplay new];
+                outsider.friendlyName = @"Outsider";
+                YMRenameMenuItem *outItem = [YMRenameMenuItem new];
+                outItem.representedObject = outsider;
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)outItem];
+                Expect(rc.showCalls == showBefore && rc.alertCreations == alertsBefore && rc.saves == savesBefore,
+                       "profile outside displayProfiles rejects rename");
+                rw.attachedSheet = [NSObject new];
+                YMRenameMenuItem *sheetItem = [YMRenameMenuItem new];
+                sheetItem.representedObject = rp;
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)sheetItem];
+                Expect(rc.showCalls == showBefore && rc.alertCreations == alertsBefore && rc.saves == savesBefore,
+                       "existing attachedSheet rejects second rename");
+                [rc.panelPresenter invalidate];
+                [re.pending removeAllObjects];
+                [re.settling removeAllObjects];
+            }
+
+            NSArray<NSDictionary *> *cases = @[
+                @{ @"text": @"Ignored", @"response": @(NSAlertSecondButtonReturn), @"saves": @0, @"name": @"Original" },
+                @{ @"text": @"  Renamed  ", @"response": @(NSAlertFirstButtonReturn), @"saves": @1, @"name": @"Renamed" },
+                @{ @"text": @"x", @"response": @(NSAlertFirstButtonReturn), @"saves": @1, @"name": @"x" },
+                @{ @"text": [@"" stringByPaddingToLength:60 withString:@"x" startingAtIndex:0],
+                   @"response": @(NSAlertFirstButtonReturn), @"saves": @1,
+                   @"name": [@"" stringByPaddingToLength:60 withString:@"x" startingAtIndex:0] },
+                @{ @"text": @"   ", @"response": @(NSAlertFirstButtonReturn), @"saves": @0, @"name": @"Original" },
+                @{ @"text": @"A\nB", @"response": @(NSAlertFirstButtonReturn), @"saves": @0, @"name": @"Original" },
+                @{ @"text": [@"" stringByPaddingToLength:61 withString:@"x" startingAtIndex:0],
+                   @"response": @(NSAlertFirstButtonReturn), @"saves": @0, @"name": @"Original" }
+            ];
+            for (NSDictionary *caseInfo in cases) {
+                YMRenameWindow *cw; YMRenameEnvironment *ce; YMManagedDisplay *cp;
+                YMRenameController *cc = RenameController(&cw, &ce, &cp);
+                NSUInteger inventoryBefore = cc.inventoryUpdates;
+                NSUInteger hidesBefore = ce.hides;
+                YMRenameMenuItem *caseItem = [YMRenameMenuItem new];
+                caseItem.representedObject = cp;
+                [cc renameManagedDisplayFromMenu:(NSMenuItem *)(id)caseItem];
+                [ce drain];
+                cc.lastRenameAlert.accessoryView.stringValue = caseInfo[@"text"];
+                [cc.lastRenameAlert finish:[caseInfo[@"response"] integerValue]];
+                NSUInteger expectedSaves = [caseInfo[@"saves"] unsignedIntegerValue];
+                Expect(cc.saves == expectedSaves && [cp.friendlyName isEqualToString:caseInfo[@"name"]],
+                       [[NSString stringWithFormat:@"rename case %@ saves and name", caseInfo[@"name"]] UTF8String]);
+                if (expectedSaves == 1) {
+                    Expect(cc.inventoryUpdates == inventoryBefore + 1, "valid save updates inventory once");
+                } else {
+                    Expect(cc.inventoryUpdates == inventoryBefore, "non-save leaves inventory unchanged");
+                }
+                Expect(cc.panelPresenter.panelOpen && cw.visible && ce.hides == hidesBefore,
+                       "rename completion keeps panel open without hiding");
+                [cc windowShouldClose:cc.window]; [ce drain];
+                Expect(!cw.visible && !cc.panelPresenter.panelOpen && ce.hides == hidesBefore + 1,
+                       "explicit close after rename case hides once");
+                [cc.panelPresenter invalidate];
+                [ce.pending removeAllObjects];
+                [ce.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *iw; YMRenameEnvironment *ie; YMManagedDisplay *ip;
+                YMRenameController *ic = RenameController(&iw, &ie, &ip);
+                YMManagedDisplay *selected = [YMManagedDisplay new];
+                selected.friendlyName = @"Selected";
+                YMFakeDisplay *selectedDisplay = [YMFakeDisplay new];
+                selected.display = selectedDisplay;
+                [ic.displayProfiles addObject:selected];
+                ic.selectedProfile = selected;
+                ic.virtualDisplay = selectedDisplay;
+                YMRenameMenuItem *targetItem = [YMRenameMenuItem new];
+                targetItem.representedObject = ip;
+                [ic renameManagedDisplayFromMenu:(NSMenuItem *)(id)targetItem];
+                [ie drain];
+                ic.lastRenameAlert.accessoryView.stringValue = @"MenuTarget";
+                [ic.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                Expect([ip.friendlyName isEqual:@"MenuTarget"] && [selected.friendlyName isEqual:@"Selected"],
+                       "valid save renames only the menu target");
+                Expect(ic.selectedProfile == selected && ic.virtualDisplay == selectedDisplay,
+                       "rename preserves selectedProfile and virtualDisplay identity");
+                [ic.panelPresenter invalidate];
+                [ie.pending removeAllObjects];
+                [ie.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *iw; YMRenameEnvironment *ie; YMManagedDisplay *ip;
+                YMRenameController *ic = RenameController(&iw, &ie, &ip);
+                YMRenameMenuItem *targetItem = [YMRenameMenuItem new];
+                targetItem.representedObject = ip;
+                [ic renameManagedDisplayFromMenu:(NSMenuItem *)(id)targetItem];
+                [ie drain];
+                [ic.displayProfiles removeObject:ip];
+                ic.lastRenameAlert.accessoryView.stringValue = @"Gone";
+                [ic.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                Expect(ic.saves == 0 && [ip.friendlyName isEqual:@"Original"] && ic.panelPresenter.panelOpen,
+                       "removed target at finish does not save");
+                [ic windowShouldClose:ic.window]; [ie drain];
+                Expect(!iw.visible && !ic.panelPresenter.panelOpen, "panel still closes after removed-target finish");
+                [ic.panelPresenter invalidate];
+                [ie.pending removeAllObjects];
+                [ie.settling removeAllObjects];
+            }
+            {
+                YMRenameWindow *iw; YMRenameEnvironment *ie; YMManagedDisplay *ip;
+                YMRenameController *ic = RenameController(&iw, &ie, &ip);
+                YMRenameMenuItem *targetItem = [YMRenameMenuItem new];
+                targetItem.representedObject = ip;
+                [ic renameManagedDisplayFromMenu:(NSMenuItem *)(id)targetItem];
+                [ie drain];
+                ic.updateWorkspaceBusy = YES;
+                ic.lastRenameAlert.accessoryView.stringValue = @"Busy";
+                [ic.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                Expect(ic.saves == 0 && [ip.friendlyName isEqual:@"Original"] && ic.panelPresenter.panelOpen,
+                       "busy at finish does not save");
+                ic.updateWorkspaceBusy = NO;
+                [ic windowShouldClose:ic.window]; [ie drain];
+                Expect(!iw.visible && !ic.panelPresenter.panelOpen, "panel still closes after busy finish");
+                [ic.panelPresenter invalidate];
+                [ie.pending removeAllObjects];
+                [ie.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *sw; YMRenameEnvironment *se; YMManagedDisplay *sp;
+                YMRenameController *sc = RenameController(&sw, &se, &sp);
+                YMRenameMenuItem *sheetItem = [YMRenameMenuItem new];
+                sheetItem.representedObject = sp;
+                [sc renameManagedDisplayFromMenu:(NSMenuItem *)(id)sheetItem];
+                [se drain];
+                NSUInteger hidesBefore = se.hides;
+                id sheet = sw.attachedSheet;
+                [sc windowShouldClose:sc.window];
+                Expect(sw.attachedSheet == sheet && se.hides == hidesBefore && sc.panelPresenter.panelOpen,
+                       "sheet protects against close");
+                [sc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                [sc windowShouldClose:sc.window]; [se drain];
+                Expect(!sw.visible && !sc.panelPresenter.panelOpen && se.hides == hidesBefore + 1,
+                       "close works after sheet cancel");
+                [sc.panelPresenter invalidate];
+                [se.pending removeAllObjects];
+                [se.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *dw; YMRenameEnvironment *de; YMManagedDisplay *dp;
+                YMRenameController *dc = RenameController(&dw, &de, &dp);
+                YMRenameMenuItem *dupItem = [YMRenameMenuItem new];
+                dupItem.representedObject = dp;
+                [dc renameManagedDisplayFromMenu:(NSMenuItem *)(id)dupItem];
+                [de drain];
+                [dc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                NSUInteger hidesBefore = de.hides;
+                [dc windowShouldClose:dc.window];
+                [dc windowShouldClose:dc.window];
+                [de drain];
+                Expect(de.hides == hidesBefore + 1 && de.activationPolicy == NSApplicationActivationPolicyAccessory,
+                       "duplicate close hides once and settles to Accessory");
+                Expect(de.pending.count == 0 && de.settling.count == 0, "duplicate close leaves no deferred work");
+                [dc showWindow:nil]; [de drain];
+                Expect(dw.visible && dc.panelPresenter.panelOpen, "reopen after duplicate close works");
+                [dc.panelPresenter invalidate];
+                [de.pending removeAllObjects];
+                [de.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *ow; YMRenameEnvironment *oe; YMManagedDisplay *op;
+                YMRenameController *oc = RenameController(&ow, &oe, &op);
+                [oc showWindow:nil]; [oe drain];
+                [oc.panelPresenter closeWindow:oc.window];
+                YMRenameMenuItem *lateItem = [YMRenameMenuItem new];
+                lateItem.representedObject = op;
+                [oc renameManagedDisplayFromMenu:(NSMenuItem *)(id)lateItem];
+                [oe drain];
+                Expect(oc.panelPresenter.panelOpen && ow.visible
+                       && oe.activationPolicy == NSApplicationActivationPolicyRegular,
+                       "stale ordinary close cannot demote after rename open");
+                [oc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                [oc.panelPresenter invalidate];
+                [oe.pending removeAllObjects];
+                [oe.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *rw; YMRenameEnvironment *re; YMManagedDisplay *rp;
+                YMRenameController *rc = RenameController(&rw, &re, &rp);
+                [rc showWindow:nil]; [re drain];
+                re.rejectAccessory = YES;
+                [rc windowShouldClose:rc.window]; [re drain];
+                Expect(re.settling.count == 1, "rejected Accessory schedules one settling retry");
+                re.rejectAccessory = NO;
+                YMRenameMenuItem *retryItem = [YMRenameMenuItem new];
+                retryItem.representedObject = rp;
+                [rc renameManagedDisplayFromMenu:(NSMenuItem *)(id)retryItem];
+                [re drain];
+                NSUInteger policyBefore = re.policyRequests;
+                [re drainSettling];
+                Expect(re.policyRequests == policyBefore,
+                       "stale settling retry adds no policy request after rename");
+                Expect(re.activationPolicy == NSApplicationActivationPolicyRegular,
+                       "rename wins over stale Accessory retry");
+                [rc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                [rc.panelPresenter invalidate];
+                [re.pending removeAllObjects];
+                [re.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *nw; YMRenameEnvironment *ne; YMManagedDisplay *np;
+                YMRenameController *nc = RenameController(&nw, &ne, &np);
+                YMSpyHeartbeat *heartbeat = [YMSpyHeartbeat new];
+                nc.heartbeatTimer = (NSTimer *)(id)heartbeat;
+                YMFakeDisplay *display = (YMFakeDisplay *)np.display;
+                NSWindow *windowIdentity = nc.window;
+                YMRenameMenuItem *sideItem = [YMRenameMenuItem new];
+                sideItem.representedObject = np;
+                [nc renameManagedDisplayFromMenu:(NSMenuItem *)(id)sideItem];
+                [ne drain];
+                [nc.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                [nc windowShouldClose:nc.window]; [ne drain];
+                [nc showWindow:nil]; [ne drain];
+                sideItem = [YMRenameMenuItem new];
+                sideItem.representedObject = np;
+                [nc renameManagedDisplayFromMenu:(NSMenuItem *)(id)sideItem];
+                [ne drain];
+                nc.lastRenameAlert.accessoryView.stringValue = @"SideEffect";
+                [nc.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                [nc windowShouldClose:nc.window]; [ne drain];
+                [nc showWindow:nil]; [ne drain];
+                Expect(heartbeat.invalidations == 0 && display.creates == 0 && display.destroys == 0
+                       && nc.stopCalls == 0 && nc.window == windowIdentity,
+                       "rename lifecycle has no heartbeat display or stop side effects");
+                [nc.panelPresenter invalidate];
+                [ne.pending removeAllObjects];
+                [ne.settling removeAllObjects];
+            }
+
+            {
+                YMRenameWindow *aw; YMRenameEnvironment *ae; YMManagedDisplay *ap;
+                YMRenameController *ac = RenameController(&aw, &ae, &ap);
+                [ac showWindow:nil]; [ae drain];
+                NSWindow *windowIdentity = ac.window;
+                YMRenameMenuItem *alreadyItem = [YMRenameMenuItem new];
+                alreadyItem.representedObject = ap;
+                [ac renameManagedDisplayFromMenu:(NSMenuItem *)(id)alreadyItem];
+                [ae drain];
+                [ac.lastRenameAlert finish:NSAlertSecondButtonReturn];
+                Expect(ac.panelPresenter.panelOpen && aw.visible && ac.saves == 0,
+                       "already-open cancel keeps panel open");
+                [ac renameManagedDisplayFromMenu:(NSMenuItem *)(id)alreadyItem];
+                [ae drain];
+                ac.lastRenameAlert.accessoryView.stringValue = @"AlreadyOpen";
+                [ac.lastRenameAlert finish:NSAlertFirstButtonReturn];
+                Expect(ac.saves == 1 && [ap.friendlyName isEqual:@"AlreadyOpen"]
+                       && ac.panelPresenter.panelOpen && aw.visible && ac.window == windowIdentity,
+                       "already-open save keeps same panel identity");
+                NSUInteger hidesBefore = ae.hides;
+                [ac windowShouldClose:ac.window]; [ae drain];
+                Expect(!aw.visible && !ac.panelPresenter.panelOpen && ae.hides == hidesBefore + 1
+                       && ac.window == windowIdentity,
+                       "already-open path closes once without changing window identity");
+                [ac.panelPresenter invalidate];
+                [ae.pending removeAllObjects];
+                [ae.settling removeAllObjects];
+            }
+        }
+    rename_tests_done:
+
         Expect(NSApp == nil,"all controller tests leave NSApplication uninitialized");
         printf("Controller boundary tests: %lu passed, %lu failed; no GUI or display calls executed.\n",(unsigned long)(Tests-Failures),(unsigned long)Failures);
         return Failures?1:0;

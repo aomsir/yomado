@@ -4,7 +4,7 @@ Generated with the built-in `image_gen` tool. These are original AI-generated co
 
 - `yomado-logo.png`: the selected night-window app icon, identical to `../../app/Resources/night-window.png`; the outer corners are transparent, while the deep navy tile stays opaque.
 - `yomado-usage-night-window.png`: the usage illustration updated with the selected night-window icon and the existing lowercase wordmark.
-- `../../app/Resources/night-window.png`: the canonical application icon. `Yomado.icns` packages standard macOS sizes from this source via `bash scripts/build-icon.sh`.
+- `../../app/Resources/night-window.png`: the canonical application icon. `Yomado.icns` is generated from the unchanged source via `bash scripts/build-icon.sh`, which centers the artwork on transparent canvases with app-icon padding before packaging the standard macOS sizes.
 
 The old cyan four-pane window identity has been replaced in the published assets. Both language READMEs use the same current brand images; their narrated demo videos remain at the beginning.
 

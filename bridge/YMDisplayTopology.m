@@ -670,6 +670,37 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
     return [self index:snapshot.displays error:error] && [self verifyExpected:snapshot.displays error:error];
 }
 
+- (BOOL)positionOwnedDisplays:(NSDictionary<NSNumber *, NSDictionary *> *)origins
+                     baseline:(YMDisplayTopologySnapshot *)baseline error:(NSError **)error {
+    self.modeRetriesRemaining = 50;
+    NSDictionary *byID = [self index:baseline.displays error:error];
+    if (!byID || !origins.count || baseline.readOnlyRecovery)
+        return YMFail(error, 32, @"A stable display baseline is required before restoring workspace positions.");
+    NSMutableArray *expected = [NSMutableArray array];
+    for (NSNumber *ident in origins) {
+        NSDictionary *screen = byID[ident], *origin = origins[ident];
+        double x = [origin[@"x"] doubleValue], y = [origin[@"y"] doubleValue];
+        if (!screen || [screen[@"main"] boolValue] || [screen[@"inMirrorSet"] boolValue]
+            || ![screen[@"active"] boolValue] || !origin[@"x"] || !origin[@"y"]
+            || !isfinite(x) || !isfinite(y) || x != trunc(x) || y != trunc(y)
+            || x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX)
+            return YMFail(error, 33, @"The saved virtual screen position cannot be restored safely.");
+    }
+    for (NSDictionary *screen in baseline.displays) {
+        NSMutableDictionary *target = screen.mutableCopy;
+        NSDictionary *origin = origins[screen[@"displayID"]];
+        if (origin) { target[@"x"] = origin[@"x"]; target[@"y"] = origin[@"y"]; }
+        [expected addObject:target];
+    }
+    // A journal cannot authorize undoing any change made after this baseline.
+    NSArray *current = [self readCompleteDisplaysWithGuard:^BOOL(NSArray *items, NSError **guardError) {
+        return [self identitiesOf:items match:baseline.displays error:guardError];
+    } error:error];
+    if (!current || ![self statesOf:current match:baseline.displays])
+        return YMFail(error, 34, @"The display layout changed during workspace restoration; no positions were written.");
+    return [self apply:expected from:current error:error];
+}
+
 - (BOOL)isExtendedTarget:(CGDirectDisplayID)displayID width:(NSUInteger)width height:(NSUInteger)height hiDPI:(BOOL)hiDPI {
     NSUInteger generation = self.backend.reconfigurationGeneration;
     NSArray *items = [self.backend readDisplaysWithError:NULL];

@@ -566,6 +566,19 @@ static void RunTests(void) {
     b.modeMissingReads = 3;
     Check([t verifySnapshot:s error:NULL], @"read-only verification also waits for a complete mode inventory");
 
+    // Update restart restores only owned output origins; all other state is pinned.
+    b = [FakeBackend new]; AddNew(b); t = [[YMDisplayTopology alloc] initWithBackend:b]; s = Baseline(t);
+    NSArray *physicalBefore = @[[b find:1 in:b.screens].copy, [b find:2 in:b.screens].copy];
+    Check([t positionOwnedDisplays:@{@3:@{@"x":@2560,@"y":@176}} baseline:s error:NULL], @"restart can restore an owned origin");
+    Check([[b find:3 in:b.screens][@"x"] isEqual:@2560] && [[b find:3 in:b.screens][@"y"] isEqual:@176], @"saved virtual origin restored exactly");
+    Check([[b find:1 in:b.screens] isEqual:physicalBefore[0]] && [[b find:2 in:b.screens] isEqual:physicalBefore[1]], @"restart positioning preserves both physical screens exactly");
+    s = Baseline(t); [b.calls removeAllObjects];
+    Check(![t positionOwnedDisplays:@{@1:@{@"x":@20,@"y":@0}} baseline:s error:NULL] && b.calls.count == 0, @"restart cannot reposition main screen");
+    Check(![t positionOwnedDisplays:@{@99:@{@"x":@20,@"y":@0}} baseline:s error:NULL] && b.calls.count == 0, @"unknown owned identity refused without writes");
+    Check(![t positionOwnedDisplays:@{@3:@{@"x":@2.5,@"y":@0}} baseline:s error:NULL] && b.calls.count == 0, @"fractional saved origin refused");
+    [b find:2 in:b.screens][@"y"] = @333;
+    Check(![t positionOwnedDisplays:@{@3:@{@"x":@2560,@"y":@0}} baseline:s error:NULL] && b.calls.count == 0, @"concurrent physical edit preserved without writes");
+
     printf("Display topology: %lu checks passed (synthetic backend; no live display changes).\n", (unsigned long)checks);
 }
 int main(void) { @autoreleasepool {

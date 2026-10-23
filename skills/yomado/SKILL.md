@@ -14,7 +14,7 @@ Let the agent prepare its own work screen; the user does not need to create it m
 - The macOS desktop must be logged in and unlocked. The user handles first-time macOS permission grants and any authentication. yomado needs window-control permission; the agent's tools need their own capture/input permissions.
 - Identify the task's apps and windows from the user's request. Inspect the current screen layout, physical main display, virtual display names/IDs, bounds and scale, plus the original bounds of the windows that may move. Keep this recovery record local; do not publish window titles, screenshots or machine identifiers.
 - Reuse a suitable screen belonging to this task when possible. A familiar name does not prove ownership: do not reuse, rename or close another task's screen without authority. Coordinate with any existing desktop owner before GUI operations.
-- Virtual screens share the login session, focus, keyboard and pointer. They do not provide independent agent input. When uninterrupted personal computer use is required, establish that the actual tool supports the needed non-interference before input; otherwise stop and explain the limitation.
+- Virtual screens share the login session, focus, keyboard and pointer. They do not provide independent agent input. Follow **Share the mouse and keyboard** below before any input.
 
 ## Prepare the screen
 
@@ -45,12 +45,43 @@ If the header shows a lock icon, window movement needs permission. The icon open
 
 ## Verify before working
 
-1. Select the actual target display/window in the agent's capture tool. Acquire a fresh target-app screenshot and current window bounds, pixel dimensions and scale; discard pre-move coordinates. A correct, fresh target screenshot is required before any test input.
+1. Select the actual target display/window in the agent's capture tool. The tool may list the virtual screen under a generic name (such as `display 7`) rather than its yomado name; match it by display ID or bounds. Acquire a fresh target-app screenshot and current window bounds, pixel dimensions and scale; discard pre-move coordinates. A correct, fresh target screenshot is required before any test input.
 2. Perform one authorized, reversible operation in the real target app, such as opening and dismissing a menu or changing and restoring a view. Confirm the change in a new screenshot before claiming visual operation works.
 3. If targeting fails only after the move, stop input and safely return only this task's moved windows using their checkpoint. If recovery cannot be verified, leave the screen running and report the pending recovery. Do not make the virtual screen primary or move unrelated windows as a workaround.
 4. Stop on blank/stale capture, wrong-window input, unexpected layout changes, login/security prompts or rejected movement. Use the same scoped recovery path for failed capture/input. On a login/security prompt, return only the moved app's windows to their recorded physical display if safe, then let the user handle the prompt. Do not repeatedly attempt login or dismiss security checks.
 
 Screen creation, an accessibility tree, a running process or a synthetic preview is not evidence of target-app visual input. Keep claims specific to the app and operation actually observed. This skill does not establish locked-session operation or input isolation.
+
+## Share the mouse and keyboard
+
+The user may be working on the physical screens while the agent works on the virtual one. Choose input in this order:
+
+1. **Background input (default).** Use the tool's methods that leave the user's pointer, keyboard focus and frontmost app untouched: Accessibility actions on specific elements (press, set value, set window position), and events delivered to the target process only. Verify with a fresh capture that the pointer did not move and the frontmost app did not change. Browsers, Electron and ordinary Mac apps usually work this way.
+   A background tool can report an event as delivered while the app ignores it. Confirm every effect in a fresh capture or by reading the app's state; do not trust the delivery result alone. If the app has a scripting interface or a dedicated MCP (for example Blender's Python API), prefer that over pointer input.
+   Do not open modal tools from the background. A background menu press that opens a modal window can leave the app unresponsive to Accessibility until it is brought forward or restarted (seen with Marvelous Designer's Plugins ▸ Python Editor). Open such tools only under a lease, in the foreground.
+2. **Borrowed real input (only when background input cannot work).** 3D viewports and other canvas apps (for example Blender or Marvelous Designer viewports, games) often accept only real pointer and keyboard events. Check first that the tool can produce the input the app needs; Marvelous Designer, for example, orbits with a right-drag, which some tools cannot send. Before posting any such event, ask the user through yomado and wait for the answer:
+
+   ```sh
+   /path/to/Yomado.app/Contents/MacOS/Yomado --input request --agent "Codex" --reason "Orbit the Blender viewport" --seconds 120
+   ```
+
+   It prints one JSON line. Continue only on `"status":"granted"` (exit 0) and keep its `leaseID`. `denied`, `timeout` and `busy` (exit 2) mean do not take the pointer: stop and report, or keep to background input. `not-running` (exit 3) means yomado is not running or is older than this feature; do not take the pointer without asking the user another way.
+
+   While the lease is active, yomado shows "Agent 正在使用你的鼠标键盘" with a Stop button at the top-right of the main screen. Before each batch of real input, check the lease:
+
+   ```sh
+   Yomado --input status --lease <leaseID>
+   ```
+
+   Continue only while it reports `"status":"active"`. `ended` with reason `stopped` means the user took the controls back: stop at once and do not ask again for this step without the user. When done, release it so yomado hides the notice and puts the user's pointer and front app back:
+
+   ```sh
+   Yomado --input release --lease <leaseID>
+   ```
+
+   Get every other approval the step needs first (for example the agent tool's own full-control or app-access prompts), then request the lease, so the lease time is not spent waiting on them. If the agent's tool hides other apps while it has full control, include yomado in its allowed apps so the prompt and notice stay visible. Run each `status` check on its own and wait for it before the next input batch.
+
+   Request only the time the step needs (10–600 seconds), with room for capture and verification. A lease is permission to post input, not a guarantee the user is away; keep batches short and re-capture before each one. Never borrow real input without a granted lease, and never ask repeatedly after a denial.
 
 ## Return windows and finish
 
@@ -63,4 +94,4 @@ Screen creation, an accessibility tree, a running process or a synthetic preview
 
 ## Current command-line boundary
 
-The public v0.3.3 app has `--diagnose` for local capability/display diagnostics. It has no public create/move/restore CLI or management RPC; do not invent or probe such commands, including `--help` (unknown arguments open the normal app UI). Do not add `--include-device-identifiers` to shared diagnostics. `--preview-ui` renders sample data, while `--self-test` and `--watchdog-test` are developer tests that can change displays; none is a normal work-screen setup command.
+The public v0.3.3 app has `--diagnose` for local capability/display diagnostics. Versions that include the input lease also accept `--input request|status|release` as described above. There is no public create/move/restore CLI or management RPC; do not invent or probe such commands, including `--help` (unknown arguments open the normal app UI). Do not add `--include-device-identifiers` to shared diagnostics. `--preview-ui` renders sample data, while `--self-test` and `--watchdog-test` are developer tests that can change displays; none is a normal work-screen setup command.

@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#import <dispatch/dispatch.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -24,10 +25,28 @@ FOUNDATION_EXPORT YMPanelPlacement YMControlPanelPlacement(
     NSRect panelFrame, const YMPanelScreen * _Nullable screens,
     NSUInteger screenCount, NSPoint pointerLocation);
 
-// Explicit open/reopen only; never call from inventory refresh or a timer.
-// Requests activation immediately on the main thread, then queues presentation
-// after menu tracking. Only the passed panel is repositioned; no displays or
-// other applications are changed.
-FOUNDATION_EXPORT void YMPresentControlPanel(NSWindow * _Nullable window);
+@protocol YMPanelPresentationEnvironment <NSObject>
+- (NSApplicationActivationPolicy)activationPolicy;
+- (BOOL)requestActivationPolicy:(NSApplicationActivationPolicy)policy;
+- (void)activateApplication;
+- (void)deferUntilAfterMenuTracking:(dispatch_block_t)block;
+- (void)deferUntilPolicySettles:(dispatch_block_t)block;
+- (BOOL)isWindowVisible:(NSWindow *)window;
+- (BOOL)hasAttachedSheetForWindow:(NSWindow *)window;
+- (void)presentWindow:(NSWindow *)window;
+- (void)hideWindow:(NSWindow *)window;
+- (void)reportActivationPolicyFailure:(NSApplicationActivationPolicy)requested
+                        actualPolicy:(NSApplicationActivationPolicy)actual;
+@end
+
+@interface YMControlPanelPresenter : NSObject
+@property(nonatomic, readonly) BOOL panelOpen;
+- (instancetype)initWithWindow:(NSWindow * _Nullable)window;
+- (instancetype)initWithWindow:(NSWindow * _Nullable)window
+                  environment:(id<YMPanelPresentationEnvironment>)environment;
+- (void)open;
+- (BOOL)closeWindow:(NSWindow * _Nullable)window;
+- (void)invalidate;
+@end
 
 NS_ASSUME_NONNULL_END

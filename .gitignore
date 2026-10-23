@@ -1,6 +1,8 @@
 # Generated applications, archives, and test output.
 /dist/
 /test-output/
+/.build-deps/
+/.cache/
 *.dSYM/
 
 # macOS metadata and local editor settings.

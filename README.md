@@ -4,7 +4,7 @@
 
 A work screen for visual agents, designed to let physical screens rest.
 
-[Website](https://yomado.app/) · [Download for Apple Silicon](https://github.com/chekusu/yomado/releases/download/v0.3.5/Yomado-v0.3.5.zip) · [Release notes](https://github.com/chekusu/yomado/releases/tag/v0.3.5) · [简体中文](README.zh-CN.md) · [MIT license](LICENSE)
+[Website](https://yomado.app/) · [Download for Apple Silicon](https://github.com/chekusu/yomado/releases/download/v0.3.7/Yomado.zip) · [Release notes](https://github.com/chekusu/yomado/releases/tag/v0.3.7) · [简体中文](README.zh-CN.md) · [MIT license](LICENSE)
 
 ## See yomado in 60 seconds
 
@@ -74,7 +74,7 @@ dist/Yomado.zip
 
 The build script selects the active Xcode or Command Line Tools installation through `xcrun`. Set `YOMADO_DEVELOPER_DIR` to select another developer directory.
 
-The native Apple Silicon build has been verified. The macOS 14 deployment target is a build setting, not a claim that every macOS 14+ system or Intel Mac is supported. An experimental Apple Silicon build is available in [GitHub Releases](https://github.com/chekusu/yomado/releases/tag/v0.3.5), with a SHA-256 checksum. Intel binaries are not supplied. The official v0.3.5 archive is signed by CHEKUSU INC. with Developer ID, notarized by Apple, and includes a stapled notarization ticket. Notarization is separate from Mac App Store review.
+The native Apple Silicon build has been verified. The macOS 14 deployment target is a build setting, not a claim that every macOS 14+ system or Intel Mac is supported. An experimental Apple Silicon build is available in [GitHub Releases](https://github.com/chekusu/yomado/releases/tag/v0.3.7), with a SHA-256 checksum. Intel binaries are not supplied. The official v0.3.7 archive is signed by CHEKUSU INC. with Developer ID, notarized by Apple, and includes a stapled notarization ticket. Notarization is separate from Mac App Store review.
 
 Local builds receive an **ad hoc signature** by default. Setting `YOMADO_SIGNING_IDENTITY` explicitly enables Developer ID Application signing with the hardened runtime and secure timestamps for both the app and its recovery helper. This signing step does not submit the app for notarization. See the [website distribution process](docs/distribution.md) for signing, Apple notarization, stapling and release checks. A release is described as notarized only after Apple accepts that exact build and its final download passes verification. Follow your Mac's normal security policies when choosing whether to run a local build.
 
@@ -90,19 +90,37 @@ Keep a physical display as the main display. Adjust the actual display arrangeme
 
 Changing displays, window positions, or scaling can invalidate an agent's saved coordinates. Refresh its screenshot and window state after each change. A successful screenshot does not by itself prove that keyboard or mouse input works.
 
-Keep yomado running while using its displays. The app appears in both the Dock and menu bar so its control panel can participate independently in Stage Manager. Closing the panel keeps the app and menu-bar controls running. Each display has its own app submenu and close action; **Quit yomado** closes all displays. Closing first attempts to return that display’s windows to physical screens and keeps the display if recovery cannot be confirmed. Sibling virtual displays continue running.
+Keep yomado running while using its displays. While its control panel is open, yomado shows a Dock icon and can participate independently in Stage Manager. Closing the panel returns it to menu-bar mode while its background workspaces keep running; reopen the same panel from the menu bar. Minimizing, hiding, or switching to another app does not close the panel, so the Dock icon remains. This behavior does not remove a launcher you have manually pinned to the Dock. Each display has its own app submenu and close action; **Quit yomado** closes all displays. Closing first attempts to return that display’s windows to physical screens and keeps the display if recovery cannot be confirmed. Sibling virtual displays continue running.
 
-For ordinary apps moved through yomado, original placement is held in memory for this run and survives transfers between virtual displays. Dropping back on the original physical display restores that placement. Dropping on a different physical display centers the windows there; manually moved windows without a checkpoint are also centered on the chosen physical display. The icon’s general return action uses the recorded original display, or the current physical main display when no checkpoint exists. Friendly names and resolution preferences are saved locally. Displays are not automatically recreated at login or after a restart. Multiple displays still share keyboard, pointer and focus; they do not give agents independent input sessions.
+For ordinary apps moved through yomado, original placement is held in memory for this run and survives transfers between virtual displays. Dropping back on the original physical display restores that placement. Dropping on a different physical display centers the windows there; manually moved windows without a checkpoint are also centered on the chosen physical display. The icon’s general return action uses the recorded original display, or the current physical main display when no checkpoint exists. Friendly names and resolution preferences are saved locally. Displays are not automatically recreated at login or after an ordinary restart; a verified in-app update restores its saved workspace. Multiple displays still share keyboard, pointer and focus; they do not give agents independent input sessions.
 
 Yomado does not change passwords, lock-screen policy, screen savers, or login settings. Its wake requests do not unlock a Mac. Screenshot and input permissions remain the responsibility of the tools that perform those actions.
 
+## Share the mouse and keyboard
+
+Agents should prefer background input that leaves your pointer, focus and front app alone: Accessibility actions and events delivered to the target app only. Some apps, such as 3D viewports and games, accept only real pointer and keyboard events. For those, an agent can ask yomado first:
+
+```sh
+./dist/Yomado.app/Contents/MacOS/Yomado --input request --agent "Codex" --reason "Orbit the Blender viewport" --seconds 120
+./dist/Yomado.app/Contents/MacOS/Yomado --input status --lease <leaseID>
+./dist/Yomado.app/Contents/MacOS/Yomado --input release --lease <leaseID>
+```
+
+yomado shows the request on the main screen with **允许** and **拒绝**; an unanswered request is refused after 60 seconds. While a lease is active, a notice stays at the top-right of the main screen, "Agent 正在使用你的鼠标键盘", with the agent's name, the time left and a **停止** button. A lease lasts 10 to 600 seconds and ends on release, expiry or Stop. After a release or expiry, yomado puts the pointer and front app back where they were; after Stop it leaves them with you. Each command prints one JSON line; exit status 0 means granted, released, active or idle.
+
+yomado does not post input itself and cannot block an agent's tool. The lease is a permission and a visible notice: the [yomado skill](skills/yomado/SKILL.md) tells agents to check it before each batch of real input and to stop when it ends.
+
 ## Version and updates
 
-The panel footer links to [yomado.app](https://yomado.app/), this GitHub repository and the MIT license, alongside the installed version. Click the refresh icon next to the version, or **Check for Updates…** (`检查更新…`) in the menu-bar menu. The menu bar uses a transparent, monochrome silhouette of the night-window logo that follows the system appearance; the full app icon keeps its dark background.
+The panel footer links to [yomado.app](https://yomado.app/), this GitHub repository and the MIT license, alongside the installed version. Click the refresh icon next to the version, or **Check and Install Updates…** (`检查并安装更新…`) in the menu-bar menu. The menu bar uses a transparent, monochrome silhouette of the night-window logo that follows the system appearance; the full app icon keeps its dark background.
 
 Opening yomado again brings back its control panel, including after closing or minimizing it. Explicitly opening the panel recovers it onto a visible physical screen when one is available, without moving other apps or changing the display layout.
 
-Checking is manual: yomado queries the official GitHub releases list, including experimental prereleases, and offers a link to the newer release. Network errors are shown explicitly with a retry action. No account, telemetry or device identifiers are sent. Checking does not download, install, quit the app or change displays. To install a downloaded version, first save work and return apps from virtual displays, then quit the old copy and open the new one. Virtual displays are not retained across an app restart.
+Automatic updates are enabled by default and can be switched off in the panel or menu bar. The refresh icon and **Check and Install Updates…** use the same in-app flow: download a compatible stable release, verify the signed feed and archive, install it, and reopen yomado. Experimental releases are not installed automatically. No GitHub account or browser download is required. Errors and progress appear in the panel; an update can be cancelled before installation starts.
+
+Before restarting, yomado checkpoints active virtual screens and the exact existing windows inside them, then recreates those screens and restores those windows. It does not save documents or reconnect remote sessions. Dialogs, full-screen/minimized or unidentifiable windows, a pending dedicated WeChat recovery checkpoint, a virtual main display, missing window-control permission, or a changing layout postpone installation while the current app keeps running. After resolving the cause, check again to retry. Physical-display settings and unrelated application windows are not intentionally changed. Recovery refuses replacement windows or a different process, and stops if the display configuration changes. The private, short-lived checkpoint contains only window/process identities and geometry. See [update distribution and verification](docs/AUTOMATIC-UPDATES.md).
+
+Older versions without the in-app updater need one ordinary upgrade to an updater-capable version. Subsequent stable releases can install through yomado.
 
 ## WeChat window recovery (experimental)
 

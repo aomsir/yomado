@@ -8,8 +8,8 @@ ym_panel_developer="${YOMADO_DEVELOPER_DIR:-$(xcode-select -p)}"
 ym_panel_clang="$(DEVELOPER_DIR="$ym_panel_developer" /usr/bin/xcrun --find clang)"
 ym_panel_sdk="$(DEVELOPER_DIR="$ym_panel_developer" /usr/bin/xcrun --sdk macosx --show-sdk-path)"
 
-# Compiles the production presenter, but the test calls only its pure geometry
-# function. No NSApplication/NSWindow is created and the display bridge is idle.
+# Compiles the production presenter. Tests cover geometry + injected lifecycle;
+# no NSApplication/NSWindow or real display operations.
 "$ym_panel_clang" -fobjc-arc -Wall -Wextra -Werror -isysroot "$ym_panel_sdk" \
   -mmacosx-version-min=14.0 \
   -ffile-prefix-map="$ym_panel_root"=. -fmacro-prefix-map="$ym_panel_root"=. \

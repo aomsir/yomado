@@ -60,6 +60,11 @@ FOUNDATION_EXPORT NSString *const YMDisplayTopologyDiagnosticsKey;
             excludingDisplayID:(CGDirectDisplayID)displayID
                          error:(NSError **)error;
 - (BOOL)verifySnapshot:(YMDisplayTopologySnapshot *)snapshot error:(NSError **)error;
+/// Restores only the caller's recreated extended outputs to their saved origins.
+/// The full fresh baseline must still match. Other output modes, main status,
+/// mirror relationships and positions are pinned and verified unchanged.
+- (BOOL)positionOwnedDisplays:(NSDictionary<NSNumber *, NSDictionary *> *)origins
+                     baseline:(YMDisplayTopologySnapshot *)baseline error:(NSError **)error;
 /// Fresh read-only admission check, including mirror roots and followers.
 - (BOOL)isExtendedTarget:(CGDirectDisplayID)displayID
                   width:(NSUInteger)width height:(NSUInteger)height hiDPI:(BOOL)hiDPI;
