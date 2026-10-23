@@ -1031,7 +1031,7 @@ static os_log_t YMQuitLog(void) {
     board.autohidesScrollers = YES;
     self.applicationCards = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 14);
     self.applicationCards.alignment = NSLayoutAttributeTop;
-    self.applicationCards.distribution = NSStackViewDistributionFill;
+    self.applicationCards.distribution = NSStackViewDistributionGravityAreas;
     self.workspaceViews = [NSMutableDictionary dictionary];
     board.documentView = self.applicationCards;
     NSLayoutConstraint *preferredBoardWidth = [self.applicationCards.widthAnchor constraintEqualToAnchor:board.contentView.widthAnchor];
@@ -1045,7 +1045,11 @@ static os_log_t YMQuitLog(void) {
         [board.heightAnchor constraintGreaterThanOrEqualToConstant:210]
     ]];
     [stack addArrangedSubview:board]; YMFillWidth(board, stack);
-    [board setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
+    // The header, footer and update rows hug at DefaultLow. The board and its
+    // cards hug less, so the board alone takes the spare height and card
+    // fitting has a determinate board height.
+    [board setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationVertical];
+    [self.applicationCards setHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationVertical];
 
     NSStackView *footer = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 10);
     [footer addArrangedSubview:[self footerLink:@"yomado.app" action:@selector(openWebsite:) tooltip:@"官方网站 · https://yomado.app"]];
@@ -1234,9 +1238,10 @@ static os_log_t YMQuitLog(void) {
     }];
     NSArray<NSNumber *> *ids = [displays valueForKey:@"displayID"];
     NSMutableArray<NSString *> *layoutSignature = [NSMutableArray array];
-    double logicalWidth = 0;
+    double logicalWidth = 0, logicalHeight = 0;
     for (NSDictionary *item in displays) {
         logicalWidth += [item[@"logicalWidth"] doubleValue];
+        logicalHeight = MAX(logicalHeight, [item[@"logicalHeight"] doubleValue]);
         [layoutSignature addObject:[NSString stringWithFormat:@"%@:%@:%@:%@:%@", item[@"displayID"], item[@"logicalWidth"], item[@"logicalHeight"], item[@"x"], item[@"y"]]];
     }
     if (![self.workspaceLayoutSignature isEqualToArray:layoutSignature]) {
@@ -1260,7 +1265,17 @@ static os_log_t YMQuitLog(void) {
             };
             [self.applicationCards addArrangedSubview:view];
             CGFloat fraction = [item[@"logicalWidth"] doubleValue] / MAX(1, logicalWidth);
-            [view.widthAnchor constraintEqualToAnchor:self.applicationCards.widthAnchor multiplier:fraction constant:-14.0 * (CGFloat)(displays.count - 1) * fraction].active = YES;
+            NSLayoutConstraint *fillWidth = [view.widthAnchor constraintEqualToAnchor:self.applicationCards.widthAnchor multiplier:fraction constant:-14.0 * (CGFloat)(displays.count - 1) * fraction];
+            // Both card constraints stay below the window's stay-put priority, so
+            // cards shrink, or the board scrolls, rather than the window growing.
+            fillWidth.priority = NSLayoutPriorityWindowSizeStayPut - 2;
+            fillWidth.active = YES;
+            // Fit the tallest display to the visible board so every card keeps one
+            // shared scale. The required minimum width wins in a very small window.
+            NSLayoutConstraint *fitHeight = [view.heightAnchor constraintLessThanOrEqualToAnchor:self.applicationCards.enclosingScrollView.contentView.heightAnchor
+                multiplier:[item[@"logicalHeight"] doubleValue] / MAX(1, logicalHeight)];
+            fitHeight.priority = NSLayoutPriorityWindowSizeStayPut - 1;
+            fitHeight.active = YES;
             [view.widthAnchor constraintGreaterThanOrEqualToConstant:140].active = YES;
             self.workspaceViews[@(displayID)] = view;
         }
