@@ -698,7 +698,7 @@ static void YMReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlag
     } error:error];
     if (!current || ![self statesOf:current match:baseline.displays])
         return YMFail(error, 34, @"The display layout changed during workspace restoration; no positions were written.");
-    return [self apply:expected from:current error:error];
+    return [self apply:expected from:current newDisplayID:0 error:error];
 }
 
 - (BOOL)isExtendedTarget:(CGDirectDisplayID)displayID width:(NSUInteger)width height:(NSUInteger)height hiDPI:(BOOL)hiDPI {
