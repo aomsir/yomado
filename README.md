@@ -96,6 +96,20 @@ For ordinary apps moved through yomado, original placement is held in memory for
 
 Yomado does not change passwords, lock-screen policy, screen savers, or login settings. Its wake requests do not unlock a Mac. Screenshot and input permissions remain the responsibility of the tools that perform those actions.
 
+## Share the mouse and keyboard
+
+Agents should prefer background input that leaves your pointer, focus and front app alone: Accessibility actions and events delivered to the target app only. Some apps, such as 3D viewports and games, accept only real pointer and keyboard events. For those, an agent can ask yomado first:
+
+```sh
+./dist/Yomado.app/Contents/MacOS/Yomado --input request --agent "Codex" --reason "Orbit the Blender viewport" --seconds 120
+./dist/Yomado.app/Contents/MacOS/Yomado --input status --lease <leaseID>
+./dist/Yomado.app/Contents/MacOS/Yomado --input release --lease <leaseID>
+```
+
+yomado shows the request on the main screen with **允许** and **拒绝**; an unanswered request is refused after 60 seconds. While a lease is active, a notice stays at the top-right of the main screen, "Agent 正在使用你的鼠标键盘", with the agent's name, the time left and a **停止** button. A lease lasts 10 to 600 seconds and ends on release, expiry or Stop. After a release or expiry, yomado puts the pointer and front app back where they were; after Stop it leaves them with you. Each command prints one JSON line; exit status 0 means granted, released, active or idle.
+
+yomado does not post input itself and cannot block an agent's tool. The lease is a permission and a visible notice: the [yomado skill](skills/yomado/SKILL.md) tells agents to check it before each batch of real input and to stop when it ends.
+
 ## Version and updates
 
 The panel footer links to [yomado.app](https://yomado.app/), this GitHub repository and the MIT license, alongside the installed version. Click the refresh icon next to the version, or **Check and Install Updates…** (`检查并安装更新…`) in the menu-bar menu. The menu bar uses a transparent, monochrome silhouette of the night-window logo that follows the system appearance; the full app icon keeps its dark background.
@@ -150,7 +164,7 @@ bash ./test.sh
 
 These tests check display placement, app/window ownership and recovery geometry, diagnostic redaction, WeChat checkpoint policies, and update checks. Update tests use a simulated network transport to cover version comparison, experimental releases, pagination, duplicate requests and failures without contacting GitHub. They do not exercise private APIs or prove live display configuration or cross-app input.
 
-A separate hidden AppKit layout regression checks screen proportions, top alignment, inventory changes, scrolling and resizing. It requires a macOS WindowServer session, but does not inspect or move real application windows or create displays:
+A separate hidden AppKit layout regression checks screen proportions, top alignment, inventory changes, scrolling and resizing. It also builds the control panel from synthetic displays to check that the overview cards fit the board without scrollers, with overlay and legacy scrollers, and that the window never grows to fit them. It requires a macOS WindowServer session, but does not inspect or move real application windows or create displays:
 
 ```sh
 bash ./scripts/test-layout.sh

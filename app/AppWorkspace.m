@@ -53,6 +53,11 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 @property(nonatomic, copy) NSString *inventoryObservedCGSignature;
 @property(nonatomic, copy) NSSet<NSString *> *inventoryConfirmedExcludedKeys;
 @property(nonatomic) NSUInteger inventoryPIDCursor;
+@property(nonatomic) BOOL inventoryCloseEvidenceReady;
+@property(nonatomic, copy) NSArray<NSDictionary *> *inventoryUnmovableWindows;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSArray *> *offeredUnmovableWindows;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSArray *> *allowedUnmovableWindows;
+@property(nonatomic) CGDirectDisplayID closingDisplayID;
 @end
 
 @implementation YMAppWorkspace
@@ -66,6 +71,9 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     _rows = @[]; _ownedIDs = @[]; _displays = @[]; _windows = @[];
     _placements = [NSMutableArray array];
     _inventoryCachedCG = @[];
+    _inventoryUnmovableWindows = @[];
+    _offeredUnmovableWindows = [NSMutableDictionary dictionary];
+    _allowedUnmovableWindows = [NSMutableDictionary dictionary];
     _statusText = @"拖入已打开的 App，或手动把窗口拖到虚拟屏。原位置只保留到退出 yomado。";
     _inventoryQueue = dispatch_queue_create("dev.chekusu.yomado.app-workspace.inventory", DISPATCH_QUEUE_SERIAL);
     return self;
@@ -84,6 +92,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 }
 - (void)setInventoryReady:(BOOL)inventoryReady {
     self.inventoryReadyPublished = inventoryReady;
+    if (!inventoryReady) self.inventoryCloseEvidenceReady = NO;
 }
 - (void)scheduleInventoryRead:(dispatch_block_t)read {
     dispatch_async(self.inventoryQueue, read);
@@ -96,6 +105,13 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 }
 - (NSArray<NSScreen *> *)workspaceScreens {
     return NSScreen.screens;
+}
+- (NSString *)displayUUIDForID:(CGDirectDisplayID)ID {
+    CFUUIDRef value = CGDisplayCreateUUIDFromDisplayID(ID);
+    if (!value) return nil;
+    NSString *uuid = CFBridgingRelease(CFUUIDCreateString(kCFAllocatorDefault, value));
+    CFRelease(value);
+    return uuid;
 }
 - (void)invalidateInventoryForMutation {
     NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
@@ -133,6 +149,10 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     NSArray *previousOwned = self.ownedIDs;
     BOOL previousTrusted = self.accessibilityTrusted;
     self.ownedIDs = IDs.array;
+    for (NSNumber *ID in self.allowedUnmovableWindows.allKeys.copy)
+        if (![self.ownedIDs containsObject:ID]) [self.allowedUnmovableWindows removeObjectForKey:ID];
+    for (NSNumber *ID in self.offeredUnmovableWindows.allKeys.copy)
+        if (![self.ownedIDs containsObject:ID]) [self.offeredUnmovableWindows removeObjectForKey:ID];
     NSMutableArray *normalized = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, NSScreen *> *screens = [NSMutableDictionary dictionary];
     for (NSScreen *screen in [self workspaceScreens]) {
@@ -148,10 +168,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         if (!bounds) continue;
         BOOL virtualDisplay = [self.ownedIDs containsObject:@(ID)] || [raw[@"isVirtual"] boolValue];
         NSString *uuid = [raw[@"displayUUID"] isKindOfClass:NSString.class] ? raw[@"displayUUID"] : nil;
-        if (!uuid && !virtualDisplay) {
-            CFUUIDRef value = CGDisplayCreateUUIDFromDisplayID(ID);
-            if (value) { uuid = CFBridgingRelease(CFUUIDCreateString(kCFAllocatorDefault, value)); CFRelease(value); }
-        }
+        if (!uuid.length) uuid = [self displayUUIDForID:ID];
         NSMutableDictionary *display = [@{@"displayID": @(ID), @"displayUUID": uuid ?: @"", @"bounds": bounds,
             @"isMain": @([raw[@"isMain"] boolValue]), @"isActive": @([raw[@"isActive"] boolValue]),
             @"isOnline": @([raw[@"isOnline"] boolValue]), @"isVirtual": @(virtualDisplay)} mutableCopy];
@@ -518,6 +535,43 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
     return NO;
 }
+- (NSDictionary *)unmovableTokenForWindow:(NSDictionary *)window {
+    NSDictionary *identity = window[@"identity"];
+    NSDictionary *display = [self display:[window[@"displayID"] unsignedIntValue]];
+    NSString *reason = window[@"reason"];
+    if (!reason && [window[@"positionSettableKnown"] boolValue] &&
+        ![window[@"positionSettable"] boolValue]) reason = @"positionNotSettable";
+    if (!YMWorkspaceIdentityValid(identity) || !YMWorkspaceGeometry(window[@"frame"]) ||
+        ![display[@"displayUUID"] length] ||
+        !YMWorkspaceGenericRestoreAllowed(identity[@"bundleID"]) ||
+        ![@[@"nonOrdinary", @"minimized", @"positionNotSettable"] containsObject:reason ?: @""]) return nil;
+    // Consent cannot discard a remembered origin or hide a failed restoration.
+    for (YMWPlacement *placement in self.placements)
+        if (placement.application.processIdentifier == [identity[@"pid"] intValue] &&
+            placement.windowID == [identity[@"windowID"] unsignedIntValue]) return nil;
+    return @{@"identity": identity, @"displayID": display[@"displayID"],
+        @"displayUUID": display[@"displayUUID"], @"frame": window[@"frame"], @"reason": reason};
+}
+- (NSArray<NSDictionary *> *)unmovableTokensInSnapshot:(NSDictionary *)snapshot {
+    NSMutableArray *tokens = [NSMutableArray array];
+    for (NSDictionary *entry in [snapshot[@"windows"] arrayByAddingObjectsFromArray:snapshot[@"blockers"]]) {
+        NSDictionary *token = [self unmovableTokenForWindow:entry];
+        if (token) [tokens addObject:token];
+    }
+    return tokens;
+}
+- (BOOL)unmovableTokenIsAllowed:(NSDictionary *)token displayID:(CGDirectDisplayID)ID {
+    return token && [token[@"displayID"] unsignedIntValue] == ID &&
+        [self.allowedUnmovableWindows[@(ID)] containsObject:token];
+}
+- (NSDictionary *)snapshot:(NSDictionary *)snapshot excludingUnmovableTokens:(NSArray *)tokens {
+    NSMutableArray *windows = [NSMutableArray array], *blockers = [NSMutableArray array];
+    for (NSDictionary *entry in snapshot[@"windows"])
+        if (![tokens containsObject:[self unmovableTokenForWindow:entry] ?: @{}]) [windows addObject:entry];
+    for (NSDictionary *entry in snapshot[@"blockers"])
+        if (![tokens containsObject:[self unmovableTokenForWindow:entry] ?: @{}]) [blockers addObject:entry];
+    return @{@"windows": windows, @"blockers": blockers, @"complete": snapshot[@"complete"] ?: @NO};
+}
 - (void)retirePlacementsAgainstWindows:(NSArray<NSDictionary *> *)windows {
     if (self.operationInProgress) return;
     for (YMWPlacement *placement in self.placements.copy) {
@@ -560,6 +614,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
     self.inventoryReady = ready;
     self.inventoryValid = ready;
+    self.inventoryUnmovableWindows = @[];
     self.inventoryConfirmedExcludedKeys = ready ? [excludedKeys copy] : nil;
     BOOL rowsChanged = ![previousRows isEqual:self.rows];
     BOOL windowsChanged = ![previousWindows isEqual:self.windows];
@@ -653,9 +708,14 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
     // Admission Visible filtering must not erase unclassifiable CG (missing
     // identity/frame/layer/onScreen/alpha); those still block ready/empty close.
+    NSArray *unmovable = [self unmovableTokensInSnapshot:snapshot];
+    NSMutableSet *classifiedKeys = [excludedKeys mutableCopy];
+    for (NSDictionary *token in unmovable)
+        [classifiedKeys addObject:YMWorkspaceWindowKey(token[@"identity"][@"pid"], token[@"identity"][@"windowID"])];
+    NSDictionary *movableSnapshot = [self snapshot:snapshot excludingUnmovableTokens:unmovable];
     if (!complete || !snapshot || ![snapshot[@"complete"] boolValue] ||
         [self cgHasUnclassifiableEvidence:liveCG] ||
-        [self snapshotHasUnresolvedEvidence:snapshot cg:liveCG excludedKeys:excludedKeys]) {
+        [self snapshotHasUnresolvedEvidence:movableSnapshot cg:liveCG excludedKeys:classifiedKeys]) {
         NSArray *partial = snapshot
             ? [self assembledWindowsFromSnapshot:snapshot observedApps:observedApps]
             : self.windows;
@@ -687,8 +747,11 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         return;
     }
     NSArray *windows = [self assembledWindowsFromSnapshot:snapshot observedApps:observedApps];
-    [self publishWindows:windows ready:YES key:liveKey generation:jobGeneration
+    [self publishWindows:windows ready:unmovable.count == 0 key:liveKey generation:jobGeneration
             excludedKeys:excludedKeys];
+    self.inventoryUnmovableWindows = unmovable;
+    self.inventoryCloseEvidenceReady = YES;
+    self.inventoryConfirmedExcludedKeys = excludedKeys;
     [self drainLatestInventoryRequest];
 }
 - (void)drainLatestInventoryRequest {
@@ -774,8 +837,10 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
 - (NSArray<NSDictionary *> *)rowsForDisplayID:(CGDirectDisplayID)ID { return [self groupedRowsForDisplay:ID ownedOnly:NO]; }
 - (BOOL)needsRestoreForDisplayID:(CGDirectDisplayID)ID {
     if (![self.ownedIDs containsObject:@(ID)]) return NO;
-    if (!self.inventoryReady || ![self inventoryCacheFresh]) return YES;
-    if ([self rowsForDisplayID:ID].count) return YES;
+    if (![self inventoryReadyForClosingDisplayID:ID]) return YES;
+    for (NSDictionary *window in self.windows)
+        if ([window[@"displayID"] unsignedIntValue] == ID &&
+            ![self unmovableTokenIsAllowed:[self unmovableTokenForWindow:window] displayID:ID]) return YES;
     for (YMWPlacement *placement in self.placements) if (placement.lastDisplayID == ID) return YES;
     // Close uses the same admission/exclusion evidence as inventory ready.
     // Non-admitted system surfaces and confirmed exclusions must not block empty close.
@@ -784,12 +849,17 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     NSArray *admitted = [self admittedCGCandidates:self.inventoryCachedCG truncated:&truncated];
     if (truncated) return YES;
     NSSet *excluded = self.inventoryConfirmedExcludedKeys ?: [NSSet set];
+    NSMutableSet *allowed = [NSMutableSet set];
+    for (NSDictionary *token in self.inventoryUnmovableWindows)
+        if ([token[@"displayID"] unsignedIntValue] != ID || [self unmovableTokenIsAllowed:token displayID:ID])
+            [allowed addObject:YMWorkspaceWindowKey(token[@"identity"][@"pid"], token[@"identity"][@"windowID"])];
     for (NSDictionary *cg in admitted) {
         NSDictionary *frame = YMWorkspaceGeometry(cg[@"frame"]);
         NSDictionary *display = frame ? YMWorkspaceDisplayForFrame(frame, self.displays) : nil;
         if ([display[@"displayID"] unsignedIntValue] != ID) continue;
         NSString *key = YMWorkspaceWindowKey(cg[@"pid"], cg[@"windowID"]);
         if ([excluded containsObject:key]) continue;
+        if ([allowed containsObject:key]) continue;
         BOOL published = NO;
         for (NSDictionary *window in self.windows) {
             if ([window[@"pid"] isEqual:cg[@"pid"]] && [window[@"windowID"] isEqual:cg[@"windowID"]]) {
@@ -799,6 +869,47 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         if (!published) return YES;
     }
     return NO;
+}
+- (BOOL)inventoryReadyForClosingDisplayID:(CGDirectDisplayID)ID {
+    if (![self.ownedIDs containsObject:@(ID)]) return NO;
+    if (self.inventoryReady) return YES;
+    if (!self.inventoryCloseEvidenceReady || ![self inventoryCacheFresh] || !self.accessibilityTrusted) return NO;
+    for (NSDictionary *token in self.inventoryUnmovableWindows)
+        if ([token[@"displayID"] unsignedIntValue] == ID &&
+            (![self unmovableTokenIsAllowed:token displayID:ID] ||
+             ![[self displayUUIDForID:ID] isEqual:token[@"displayUUID"]] ||
+             ![self displayStillCurrent:[self display:ID]])) return NO;
+    return YES;
+}
+- (NSArray<NSDictionary *> *)unmovableWindowsForDisplayID:(CGDirectDisplayID)ID {
+    NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
+    if (![self.ownedIDs containsObject:@(ID)]) return @[];
+    if (self.operationInProgress) return nil;
+    [self refreshInventory];
+    if (!self.inventoryReady && !(self.inventoryCloseEvidenceReady && [self inventoryCacheFresh] && self.accessibilityTrusted)) return nil;
+    NSMutableArray *offered = [NSMutableArray array], *result = [NSMutableArray array];
+    for (NSDictionary *token in self.inventoryUnmovableWindows) {
+        if ([token[@"displayID"] unsignedIntValue] != ID) continue;
+        [offered addObject:token];
+        if ([self unmovableTokenIsAllowed:token displayID:ID]) continue;
+        NSRunningApplication *app = [self.windowAccess applicationForPID:[token[@"identity"][@"pid"] intValue]];
+        [result addObject:@{@"appName": app.localizedName ?: token[@"identity"][@"bundleID"], @"count": @1}];
+    }
+    self.offeredUnmovableWindows[@(ID)] = offered.copy;
+    return result;
+}
+- (void)allowUnmovableWindowsOnDisplayID:(CGDirectDisplayID)ID {
+    NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
+    if ([self.ownedIDs containsObject:@(ID)] && self.offeredUnmovableWindows[@(ID)]) {
+        self.allowedUnmovableWindows[@(ID)] = self.offeredUnmovableWindows[@(ID)];
+        // A modal prompt can outlive the inventory; verify its exact identities
+        // again rather than approving whatever appeared while it was open.
+        [self invalidateInventoryForMutation];
+    }
+}
+- (void)cancelUnmovableWindowAllowances {
+    [self.allowedUnmovableWindows removeAllObjects];
+    [self.offeredUnmovableWindows removeAllObjects];
 }
 - (BOOL)needsRestoreBeforeRemovingVirtualDisplay {
     for (NSNumber *ID in self.ownedIDs) if ([self needsRestoreForDisplayID:ID.unsignedIntValue]) return YES;
@@ -873,6 +984,8 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     }
 
     NSDictionary *snapshot = YMWorkspaceNormalizeWindowSnapshot(cgForApp, axWindows, YES, self.displays);
+    if (self.closingDisplayID && filter.unsignedIntValue == self.closingDisplayID)
+        snapshot = [self snapshot:snapshot excludingUnmovableTokens:self.allowedUnmovableWindows[filter] ?: @[]];
     if (!YMWorkspaceSnapshotAllowsSource(snapshot, filter)) {
         [self fail:error code:7 text:@"部分窗口无法可靠匹配或移动。请关闭弹窗、展开普通窗口后重试；尚未继续移屏。"];
         return nil;
@@ -1184,7 +1297,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     NSAssert(NSThread.isMainThread, @"App workspace is main-thread only.");
     if (self.operationInProgress) return [self fail:error code:1 text:@"正在核对窗口位置，请稍候。"];
     [self refreshInventory];
-    if (!self.inventoryReady || ![self inventoryCacheFresh])
+    if (![self inventoryReadyForClosingDisplayID:ID])
         return [self fail:error code:3 text:@"无法读取窗口清单；保留虚拟屏，稍后再试。"];
     if (![self.ownedIDs containsObject:@(ID)]) return [self fail:error code:17 text:@"只能返回 yomado 虚拟屏中的窗口。"];
     NSMutableOrderedSet *bundles = [NSMutableOrderedSet orderedSet];
@@ -1195,6 +1308,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
     if (!bundles.count) { self.statusText = @"此虚拟屏没有需要返回的窗口。"; return YES; }
     if (!self.accessibilityTrusted) return [self fail:error code:2 text:@"返回窗口需要控制权限；请先打开控制权限设置，或手动移回窗口。"];
     self.operationInProgress = YES;
+    self.closingDisplayID = ID;
     [self invalidateInventoryForMutation];
     @try {
         for (NSString *bundle in bundles) {
@@ -1205,6 +1319,7 @@ static const NSUInteger kYMInventoryMaxCGCandidates = 512;
         }
         return YES;
     } @finally {
+        self.closingDisplayID = 0;
         self.operationInProgress = NO;
         [self invalidateInventoryForMutation];
         [self refreshInventory];

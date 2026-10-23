@@ -356,6 +356,10 @@ int main(void) {
         Check(!YMWorkspaceSnapshotAllowsSource(dupPartialAX, @5),
             @"valid-plus-incomplete AX duplicate refuses sources");
 
+        Check([YMWorkspaceUnmovableSummary(@[@{@"appName": @"Marvelous Designer", @"count": @1}, @{@"appName": @"文本编辑", @"count": @2},
+            @{@"appName": @"文本编辑", @"count": @1}]) isEqualToString:@"「Marvelous Designer」1 个窗口、「文本编辑」3 个窗口"], @"unmovable windows are merged per app in first-seen order");
+        Check([YMWorkspaceUnmovableSummary(@[@{@"appName": @"Mail", @"count": @0}, @{@"count": @"2"}, (NSDictionary *)(id)@"bad"]) isEqualToString:@""], @"zero or malformed counts produce no prompt");
+        Check([YMWorkspaceUnmovableSummary(@[@{@"appName": @"", @"count": @2}]) isEqualToString:@"「应用」2 个窗口"], @"missing app name uses a generic label");
         if (failures) { fprintf(stderr, "%lu of %lu checks failed.\n", (unsigned long)failures, (unsigned long)checks); return 1; }
         printf("Passed %lu App workspace policy checks; no displays, applications or GUI were accessed.\n", (unsigned long)checks);
         return 0;

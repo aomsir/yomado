@@ -401,6 +401,7 @@ static NSURL *WriteTempFixtureApp(NSString *bundleID) {
 - (void)publishInventoryRead:(dispatch_block_t)publish;
 - (NSTimeInterval)inventoryTime;
 - (NSArray<NSScreen *> *)workspaceScreens;
+- (NSString *)displayUUIDForID:(CGDirectDisplayID)ID;
 - (void)invalidateInventoryForMutation;
 - (BOOL)displayStillCurrent:(NSDictionary *)display;
 - (NSDictionary *)liveDisplayStateForID:(CGDirectDisplayID)ID;
@@ -424,6 +425,7 @@ static NSURL *WriteTempFixtureApp(NSString *bundleID) {
 @property(nonatomic) NSUInteger scheduleCount;
 @property(nonatomic, strong) NSArray *fakeScreens;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSDictionary *> *liveDisplayStates;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, id> *liveDisplayUUIDs;
 @end
 
 @implementation YMWorkspaceFixture
@@ -435,6 +437,7 @@ static NSURL *WriteTempFixtureApp(NSString *bundleID) {
     _clock = 1000;
     _fakeScreens = @[];
     _liveDisplayStates = [NSMutableDictionary dictionary];
+    _liveDisplayUUIDs = [NSMutableDictionary dictionary];
     return self;
 }
 
@@ -450,6 +453,14 @@ static NSURL *WriteTempFixtureApp(NSString *bundleID) {
 - (NSTimeInterval)inventoryTime { return self.clock; }
 
 - (NSArray<NSScreen *> *)workspaceScreens { return self.fakeScreens ?: @[]; }
+
+- (NSString *)displayUUIDForID:(CGDirectDisplayID)ID {
+    id override = self.liveDisplayUUIDs[@(ID)];
+    if (override) return [override isKindOfClass:NSString.class] ? override : nil;
+    for (NSDictionary *display in [self valueForKey:@"displays"])
+        if ([display[@"displayID"] unsignedIntValue] == ID) return display[@"displayUUID"];
+    return nil;
+}
 
 - (NSDictionary *)liveDisplayStateForID:(CGDirectDisplayID)ID {
     NSDictionary *override = self.liveDisplayStates[@(ID)];
@@ -538,8 +549,208 @@ static YMWorkspaceFixture *ManagerFixture(YMFakeWindowAccess **outAccess, NSURL 
     return workspace;
 }
 
+static void SetWindowState(YMFakeWindowAccess *access, CGWindowID windowID, NSDictionary *state) {
+    NSMutableArray *records = [access.axByPID[@42] mutableCopy];
+    for (NSUInteger index = 0; index < records.count; index++) {
+        NSMutableDictionary *record = [records[index] mutableCopy];
+        if ([record[@"identity"][@"windowID"] unsignedIntValue] != windowID) continue;
+        [record addEntriesFromDictionary:state];
+        records[index] = record;
+        NSString *key = [access elementKey:record[@"element"]];
+        access.elementStates[key] = @{@"ordinary": record[@"ordinary"],
+            @"minimized": record[@"minimized"], @"positionSettable": record[@"positionSettable"]};
+        access.elementIdentities[key] = record[@"identity"];
+    }
+    access.axByPID[@42] = records;
+}
+
+static YMWorkspaceFixture *UnmovableFixture(YMFakeWindowAccess **outAccess, NSDictionary *state) {
+    YMFakeWindowAccess *access = [YMFakeWindowAccess new];
+    [access installApp:42 name:@"Calculator" bundle:@"test.calculator"];
+    [access installWindowPID:42 windowID:1490 cgFrame:Frame(15, 982, 37, 102)
+                    axFrame:Frame(2700, 100, 400, 300)];
+    SetWindowState(access, 1490, state);
+    YMWorkspaceFixture *workspace = [[YMWorkspaceFixture alloc] initWithWindowAccess:access];
+    [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:RuntimeDisplays()];
+    [workspace drainReads];
+    *outAccess = access;
+    return workspace;
+}
+
+static void UnmovableCloseChecks(void) {
+    for (id absentUUID in @[NSNull.null, @""]) {
+        YMFakeWindowAccess *access;
+        YMWorkspaceFixture *workspace = UnmovableFixture(&access, @{@"ordinary": @NO});
+        NSMutableArray *snapshot = [RuntimeDisplays() mutableCopy];
+        NSMutableDictionary *virtualDisplay = [snapshot[1] mutableCopy];
+        if (absentUUID == NSNull.null) [virtualDisplay removeObjectForKey:@"displayUUID"];
+        else virtualDisplay[@"displayUUID"] = absentUUID;
+        snapshot[1] = virtualDisplay;
+        workspace.liveDisplayUUIDs[@8] = @"live-agent-a";
+        [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:snapshot];
+        [workspace drainReads];
+        Check([[[workspace valueForKey:@"displays"] objectAtIndex:1][@"displayUUID"] isEqual:@"live-agent-a"],
+              @"production-shaped virtual snapshot resolves its live UUID through injected boundary");
+        Check([workspace unmovableWindowsForDisplayID:8].count == 1, @"resolved virtual UUID permits an exact offer");
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        [workspace drainReads];
+        Check([workspace inventoryReadyForClosingDisplayID:8], @"consent uses nonempty live virtual UUID");
+        workspace.liveDisplayUUIDs[@8] = @"live-agent-b";
+        Check(![workspace inventoryReadyForClosingDisplayID:8], @"same-ID same-geometry replacement fails even within cache TTL");
+        [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:snapshot];
+        [workspace drainReads];
+        Check(![workspace inventoryReadyForClosingDisplayID:8] && [workspace needsRestoreForDisplayID:8],
+              @"replacement UUID invalidates consent without an observed ID-removal gap");
+        workspace.liveDisplayUUIDs[@8] = NSNull.null;
+        [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:snapshot];
+        [workspace drainReads];
+        Check([workspace unmovableWindowsForDisplayID:8] == nil, @"unavailable virtual UUID cannot produce an authorizable offer");
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        [workspace drainReads];
+        Check(![workspace inventoryReadyForClosingDisplayID:8], @"empty UUID never reuses previous consent");
+        Check(access.writeCount == 0, @"UUID validation never reads or writes real displays or windows");
+    }
+    for (NSDictionary *state in @[@{@"ordinary": @NO}, @{@"minimized": @YES}, @{@"positionSettable": @NO}]) {
+        YMFakeWindowAccess *access;
+        YMWorkspaceFixture *workspace = UnmovableFixture(&access, state);
+        Check(!workspace.inventoryReady, @"known unmovable windows never make strict inventory ready");
+        Check(![workspace inventoryReadyForClosingDisplayID:8], @"unconfirmed known window blocks its own screen");
+        Check([workspace inventoryReadyForClosingDisplayID:9], @"known AX ownership does not block another empty screen");
+        Check([workspace needsRestoreForDisplayID:8], @"unconfirmed dialog keeps display alive");
+        Check(![workspace needsRestoreForDisplayID:9], @"unrelated screen may close without dialog consent");
+        NSArray *items = [workspace unmovableWindowsForDisplayID:8];
+        Check(items.count == 1 && [items.firstObject[@"count"] unsignedIntegerValue] == 1 &&
+              [items.firstObject[@"appName"] isEqual:@"Calculator"], @"prompt counts the AX-owned window, not its physical thumbnail");
+        Check([workspace unmovableWindowsForDisplayID:9].count == 0, @"prompt is source-scoped");
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        Check(![workspace inventoryReadyForClosingDisplayID:8], @"consent forces fresh observation after modal prompt");
+        [workspace drainReads];
+        Check([workspace inventoryReadyForClosingDisplayID:8], @"exact consent permits closing known unmovable window");
+        Check(![workspace needsRestoreForDisplayID:8], @"consented dialog is not mistaken for an unrestored ordinary window");
+        NSError *error = nil;
+        Check([workspace restoreDisplayID:8 error:&error], @"dialog-only close has no window writes");
+        [workspace drainReads];
+        Check(access.writeCount == 0, @"leave-behind consent never writes a dialog or minimized window");
+        Check(![workspace restartOriginCheckpointsWithError:&error], @"close consent cannot authorize updater checkpoint export");
+        [workspace cancelUnmovableWindowAllowances];
+        Check(![workspace inventoryReadyForClosingDisplayID:8], @"cancel or failed attempt revokes exact consent");
+    }
+    {
+        YMFakeWindowAccess *access;
+        YMWorkspaceFixture *workspace = UnmovableFixture(&access, @{@"ordinary": @NO});
+        YMFakeRunningApp *app = access.appsByPID[@42];
+        [access installWindowPID:42 windowID:1491 cgFrame:Frame(2700, 450, 400, 300) axFrame:Frame(2700, 450, 400, 300)];
+        id ordinary = access.axByPID[@42].lastObject[@"element"];
+        NSDictionary *originFrame = Frame(220, 180, 400, 300);
+        [workspace installPlacementElement:ordinary application:app windowID:1491
+            origin:YMWorkspaceOrigin(originFrame, RuntimeDisplays().firstObject)
+            lastDisplayID:8 identity:Identity(42, 1491)];
+        [access installWindowPID:42 windowID:1492 cgFrame:Frame(5300, 100, 400, 300) axFrame:Frame(5300, 100, 400, 300)];
+        [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:RuntimeDisplays()];
+        [workspace drainReads];
+        Check([workspace unmovableWindowsForDisplayID:8].count == 1, @"mixed source offers only the classified dialog");
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        [workspace drainReads];
+        Check([workspace needsRestoreForDisplayID:8], @"consent does not hide movable ordinary windows or origins");
+        NSError *error = nil;
+        Check(![workspace restoreApplicationWithBundleIdentifier:@"test.calculator" fromDisplayID:8 error:&error],
+              @"manual restore cannot reuse close-only consent");
+        [workspace drainReads];
+        Check(access.writeCount == 0, @"blocked manual restore changes no window");
+        Check([workspace restoreDisplayID:8 error:&error], @"close restores ordinary window beside consented dialog");
+        [workspace drainReads];
+        Check(access.positionWrites.count == 1 &&
+              [access.positionWrites.firstObject[@"identity"] isEqual:Identity(42, 1491)], @"only source ordinary identity receives a restore write");
+        Check([access.elementFrames[[access elementKey:ordinary]] isEqual:originFrame], @"ordinary window retains exact physical origin");
+        Check(![workspace needsRestoreForDisplayID:8] && [workspace needsRestoreForDisplayID:9],
+              @"close empties only its source and preserves sibling workspace");
+    }
+    for (NSString *change in @[@"replacement", @"newWindow", @"timeout", @"duplicate", @"unknownSource",
+                              @"trust", @"topology", @"unmatched", @"unreadable", @"invalidIdentity", @"cgFailure"]) {
+        YMFakeWindowAccess *access;
+        YMWorkspaceFixture *workspace = UnmovableFixture(&access, @{@"ordinary": @NO});
+        (void)[workspace unmovableWindowsForDisplayID:8];
+        if ([change isEqual:@"replacement"]) {
+            NSMutableDictionary *identity = [Identity(42, 1490) mutableCopy];
+            identity[@"startSeconds"] = @1001;
+            SetWindowState(access, 1490, @{@"identity": identity});
+        } else if ([change isEqual:@"newWindow"]) {
+            [access installWindowPID:42 windowID:1491 cgFrame:Frame(2800, 450, 400, 300) axFrame:Frame(2800, 450, 400, 300)];
+            SetWindowState(access, 1491, @{@"ordinary": @NO});
+        } else if ([change isEqual:@"timeout"]) access.forceIncompleteObserve = YES;
+        else if ([change isEqual:@"duplicate"]) [access.cgWindows addObject:access.cgWindows.firstObject];
+        else if ([change isEqual:@"unknownSource"]) SetWindowState(access, 1490, @{@"frame": Frame(12000, 100, 400, 300)});
+        else if ([change isEqual:@"trust"]) access.trusted = NO;
+        else if ([change isEqual:@"unmatched"]) access.axByPID[@42] = @[];
+        else if ([change isEqual:@"unreadable"]) SetWindowState(access, 1490, @{@"readable": @NO});
+        else if ([change isEqual:@"invalidIdentity"]) SetWindowState(access, 1490, @{@"identity": @{@"pid": @42, @"windowID": @1490}});
+        else if ([change isEqual:@"cgFailure"]) access.failVisibleWindows = YES;
+        else workspace.liveDisplayStates[@8] = @{@"isActive": @NO, @"isOnline": @NO, @"bounds": Frame(2560, 0, 2560, 1440)};
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        [workspace drainReads];
+        NSError *error = nil;
+        Check(![workspace inventoryReadyForClosingDisplayID:8], [@"prompt-time change cannot inherit consent: " stringByAppendingString:change]);
+        Check(![workspace restoreDisplayID:8 error:&error] && [workspace needsRestoreForDisplayID:8],
+              @"changed or incomplete evidence retains the screen after consent");
+        Check(access.writeCount == 0, @"failed consent revalidation writes nothing");
+    }
+    {
+        YMFakeWindowAccess *access;
+        YMWorkspaceFixture *workspace = UnmovableFixture(&access, @{@"ordinary": @NO});
+        [access installWindowPID:42 windowID:1491 cgFrame:Frame(2700, 450, 400, 300) axFrame:Frame(2700, 450, 400, 300)];
+        NSDictionary *ordinary = access.axByPID[@42].lastObject;
+        [workspace installPlacementElement:ordinary[@"element"] application:access.appsByPID[@42] windowID:1491
+            origin:YMWorkspaceOrigin(Frame(100, 100, 400, 300), RuntimeDisplays().firstObject)
+            lastDisplayID:8 identity:ordinary[@"identity"]];
+        [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:RuntimeDisplays()];
+        [workspace drainReads];
+        (void)[workspace unmovableWindowsForDisplayID:8];
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        [workspace drainReads];
+        access.failNextPositionWrites = 1;
+        NSError *error = nil;
+        Check(![workspace restoreDisplayID:8 error:&error], @"consented dialog cannot hide ordinary-window restore failure");
+        [workspace drainReads];
+        Check([workspace needsRestoreForDisplayID:8] && [[workspace valueForKey:@"placements"] count] == 1,
+              @"failed restoration retains both screen and exact origin");
+    }
+    {
+        YMFakeWindowAccess *access;
+        YMWorkspaceFixture *workspace = UnmovableFixture(&access, @{@"ordinary": @NO});
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        Check(![workspace inventoryReadyForClosingDisplayID:8], @"allow without presenting exact windows is not blanket authorization");
+        (void)[workspace unmovableWindowsForDisplayID:8];
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        [workspace drainReads];
+        [workspace advanceClock:1.01];
+        Check(![workspace inventoryReadyForClosingDisplayID:8], @"expired evidence cannot use prior consent");
+        [workspace refreshWithVirtualDisplayIDs:@[@9] displaySnapshot:RuntimeDisplays()];
+        [workspace drainReads];
+        [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:RuntimeDisplays()];
+        [workspace drainReads];
+        Check(![workspace inventoryReadyForClosingDisplayID:8], @"removed and recreated display cannot inherit consent");
+    }
+    {
+        YMFakeWindowAccess *access;
+        YMWorkspaceFixture *workspace = UnmovableFixture(&access, @{@"ordinary": @NO});
+        NSDictionary *window = access.axByPID[@42].firstObject;
+        [workspace installPlacementElement:window[@"element"] application:access.appsByPID[@42] windowID:1490
+            origin:YMWorkspaceOrigin(Frame(100, 100, 400, 300), RuntimeDisplays().firstObject)
+            lastDisplayID:8 identity:window[@"identity"]];
+        [workspace advanceClock:1.01];
+        [workspace refreshWithVirtualDisplayIDs:@[@8, @9] displaySnapshot:RuntimeDisplays()];
+        [workspace drainReads];
+        Check([workspace unmovableWindowsForDisplayID:8] == nil, @"remembered window cannot be offered as disposable dialog");
+        [workspace allowUnmovableWindowsOnDisplayID:8];
+        NSError *error = nil;
+        Check(![workspace restoreDisplayID:8 error:&error] && [[workspace valueForKey:@"placements"] count] == 1,
+              @"consent cannot discard a failed or hidden tracked restoration");
+    }
+}
+
 int main(void) {
     @autoreleasepool {
+        UnmovableCloseChecks();
         NSArray *displays = RuntimeDisplays();
 
         {

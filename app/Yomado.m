@@ -4,6 +4,7 @@
 #import <Carbon/Carbon.h>
 #import <dlfcn.h>
 #import <signal.h>
+#import <os/log.h>
 #import "VDVirtualDisplay.h"
 #import "YMDisplayTopology.h"
 #import "LayoutPolicy.h"
@@ -11,11 +12,13 @@
 #import "ControlUI.h"
 #import "WindowRecovery.h"
 #import "AppWorkspace.h"
+#import "AppWorkspacePolicy.h"
 #import "AppWorkspaceView.h"
 #import "AutomaticUpdater.h"
 #import "UpdateWorkspaceRecovery.h"
 #import "MenuBarIcon.h"
 #import "PanelPresentation.h"
+#import "InputLease.h"
 
 static NSString *YMAppVersion(void) {
     return [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"—";
@@ -168,6 +171,7 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property YMManagedDisplay *selectedProfile;
 @property NSButton *addDisplayButton;
 @property YMAppWorkspace *appWorkspace;
+@property YMInputLeaseCenter *inputLeases;
 @property NSStackView *applicationCards;
 @property NSView *permissionContainer;
 @property NSMutableDictionary<NSNumber *, YMAppWorkspaceView *> *workspaceViews;
@@ -288,9 +292,77 @@ static NSView *YMSpacer(void) {
         }
     });
 }
+// Quit and close failures used to leave their reason only in status labels
+// that are not shown. Log each one so a refused quit can be traced with
+// `log show --predicate 'subsystem == "dev.chekusu.yomado"'`.
+static os_log_t YMQuitLog(void) {
+    static os_log_t quitLog;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ quitLog = os_log_create("dev.chekusu.yomado", "quit"); });
+    return quitLog;
+}
+- (void)logQuitStep:(NSString *)step {
+    os_log(YMQuitLog(), "%{public}@ | status: %{public}@ | detail: %{public}@", step,
+        self.statusLabel.stringValue ?: @"", self.detailLabel.stringValue ?: @"");
+}
+- (NSApplicationTerminateReply)refuseTermination:(NSString *)reason {
+    [self logQuitStep:[@"quit refused: " stringByAppendingString:reason]];
+    return NSTerminateCancel;
+}
+// Dialogs, splash screens and tool windows cannot be matched to a movable
+// window, so they cannot return to a remembered origin. Ask once before
+// leaving them for macOS to relocate when the screens are removed.
+- (BOOL)confirmUnmovableWindowsOnDisplayIDs:(NSArray<NSNumber *> *)displayIDs {
+    if (self.appOperationInProgress) return NO;
+    self.appOperationInProgress = YES;
+    @try {
+    __block NSMutableArray *items;
+    BOOL observed = WaitUntil(^BOOL{
+        [self updateInventory];
+        items = [NSMutableArray array];
+        for (NSNumber *ID in displayIDs) {
+            NSArray *windows = [self.appWorkspace unmovableWindowsForDisplayID:ID.unsignedIntValue];
+            if (!windows) return NO;
+            [items addObjectsFromArray:windows];
+        }
+        return YES;
+    }, 1.5);
+    if (!observed) {
+        [self.appWorkspace cancelUnmovableWindowAllowances];
+        [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留虚拟屏。请稍后重试关闭。"];
+        return NO;
+    }
+    NSString *summary = YMWorkspaceUnmovableSummary(items);
+    if (!summary.length) return YES;
+    [self logQuitStep:[@"windows that cannot return: " stringByAppendingString:summary]];
+    if (![self confirmLeavingUnmovableWindows:summary]) {
+        [self.appWorkspace cancelUnmovableWindowAllowances];
+        [self logQuitStep:@"user kept the screens because of windows that cannot return"];
+        return NO;
+    }
+    for (NSNumber *ID in displayIDs) [self.appWorkspace allowUnmovableWindowsOnDisplayID:ID.unsignedIntValue];
+    return YES;
+    } @finally {
+        self.appOperationInProgress = NO;
+    }
+}
+- (BOOL)confirmLeavingUnmovableWindows:(NSString *)summary {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"有窗口无法挪回原位";
+    alert.informativeText = [NSString stringWithFormat:@"%@多半是弹窗、启动画面或工具窗，yomado 无法可靠地把它们挪回原位。其他窗口照常返回原位。\n继续关闭后，macOS 会把这些窗口移到剩下的屏幕上，位置可能不同。", summary];
+    [alert addButtonWithTitle:@"继续关闭"];
+    [alert addButtonWithTitle:@"取消"];
+    // The prompt can appear while the person is typing elsewhere. Return must
+    // not leave windows behind; only an explicit click on 继续关闭 does.
+    alert.buttons.firstObject.keyEquivalent = @"";
+    alert.buttons.lastObject.keyEquivalent = @"\r";
+    [self showWindow:nil];
+    return [alert runModal] == NSAlertFirstButtonReturn;
+}
 - (void)resumeTerminationAfterTopologyRecovery:(BOOL)recovered {
     BOOL requested = self.terminationAfterTopologyRecovery;
     self.terminationAfterTopologyRecovery = NO;
+    if (requested) [self logQuitStep:recovered ? @"quit continues after a screen was removed" : @"quit stopped: display recovery failed"];
     if (requested && recovered) dispatch_async(dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
 }
 - (void)recoverTopology:(YMDisplayTopologySnapshot *)snapshot removedID:(CGDirectDisplayID)removedID completion:(void (^)(BOOL, NSError *))completion {
@@ -347,6 +419,8 @@ static NSView *YMSpacer(void) {
     [main addItem:appItem];
     NSApp.mainMenu = main;
     [self buildWindow];
+    self.inputLeases = [[YMInputLeaseCenter alloc] init];
+    [self.inputLeases start];
     EventTypeSpec type = { kEventClassKeyboard, kEventHotKeyPressed };
     OSStatus handlerStatus = InstallEventHandler(GetApplicationEventTarget(), RecoveryHotkey, 1, &type,
                                                 (__bridge void *)self, &_keyHandler);
@@ -989,7 +1063,7 @@ static NSView *YMSpacer(void) {
     board.autohidesScrollers = YES;
     self.applicationCards = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 14);
     self.applicationCards.alignment = NSLayoutAttributeTop;
-    self.applicationCards.distribution = NSStackViewDistributionFill;
+    self.applicationCards.distribution = NSStackViewDistributionGravityAreas;
     self.workspaceViews = [NSMutableDictionary dictionary];
     board.documentView = self.applicationCards;
     NSLayoutConstraint *preferredBoardWidth = [self.applicationCards.widthAnchor constraintEqualToAnchor:board.contentView.widthAnchor];
@@ -1003,7 +1077,11 @@ static NSView *YMSpacer(void) {
         [board.heightAnchor constraintGreaterThanOrEqualToConstant:210]
     ]];
     [stack addArrangedSubview:board]; YMFillWidth(board, stack);
-    [board setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
+    // The header, footer and update rows hug at DefaultLow. The board and its
+    // cards hug less, so the board alone takes the spare height and card
+    // fitting has a determinate board height.
+    [board setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationVertical];
+    [self.applicationCards setHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationVertical];
 
     NSStackView *footer = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 10);
     [footer addArrangedSubview:[self footerLink:@"yomado.app" action:@selector(openWebsite:) tooltip:@"官方网站 · https://yomado.app"]];
@@ -1192,9 +1270,10 @@ static NSView *YMSpacer(void) {
     }];
     NSArray<NSNumber *> *ids = [displays valueForKey:@"displayID"];
     NSMutableArray<NSString *> *layoutSignature = [NSMutableArray array];
-    double logicalWidth = 0;
+    double logicalWidth = 0, logicalHeight = 0;
     for (NSDictionary *item in displays) {
         logicalWidth += [item[@"logicalWidth"] doubleValue];
+        logicalHeight = MAX(logicalHeight, [item[@"logicalHeight"] doubleValue]);
         [layoutSignature addObject:[NSString stringWithFormat:@"%@:%@:%@:%@:%@", item[@"displayID"], item[@"logicalWidth"], item[@"logicalHeight"], item[@"x"], item[@"y"]]];
     }
     if (![self.workspaceLayoutSignature isEqualToArray:layoutSignature]) {
@@ -1218,7 +1297,17 @@ static NSView *YMSpacer(void) {
             };
             [self.applicationCards addArrangedSubview:view];
             CGFloat fraction = [item[@"logicalWidth"] doubleValue] / MAX(1, logicalWidth);
-            [view.widthAnchor constraintEqualToAnchor:self.applicationCards.widthAnchor multiplier:fraction constant:-14.0 * (CGFloat)(displays.count - 1) * fraction].active = YES;
+            NSLayoutConstraint *fillWidth = [view.widthAnchor constraintEqualToAnchor:self.applicationCards.widthAnchor multiplier:fraction constant:-14.0 * (CGFloat)(displays.count - 1) * fraction];
+            // Both card constraints stay below the window's stay-put priority, so
+            // cards shrink, or the board scrolls, rather than the window growing.
+            fillWidth.priority = NSLayoutPriorityWindowSizeStayPut - 2;
+            fillWidth.active = YES;
+            // Fit the tallest display to the visible board so every card keeps one
+            // shared scale. The required minimum width wins in a very small window.
+            NSLayoutConstraint *fitHeight = [view.heightAnchor constraintLessThanOrEqualToAnchor:self.applicationCards.enclosingScrollView.contentView.heightAnchor
+                multiplier:[item[@"logicalHeight"] doubleValue] / MAX(1, logicalHeight)];
+            fitHeight.priority = NSLayoutPriorityWindowSizeStayPut - 1;
+            fitHeight.active = YES;
             [view.widthAnchor constraintGreaterThanOrEqualToConstant:140].active = YES;
             self.workspaceViews[@(displayID)] = view;
         }
@@ -1631,6 +1720,7 @@ static NSView *YMSpacer(void) {
 - (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID {
     if (self.appOperationInProgress) return NO;
     self.appOperationInProgress = YES;
+    BOOL restored = NO;
     @try {
     [self updateInventory];
     // World-changing steps first (WeChat restore / control-panel move). Their
@@ -1668,7 +1758,7 @@ static NSView *YMSpacer(void) {
     }
     BOOL inventoryReady = WaitUntil(^BOOL{
         [self updateInventory];
-        return self.appWorkspace.inventoryReady;
+          return [self.appWorkspace inventoryReadyForClosingDisplayID:displayID];
     }, 1.5);
     if (!inventoryReady) {
         [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留这个虚拟屏。请稍后重试关闭。"];
@@ -1685,12 +1775,14 @@ static NSView *YMSpacer(void) {
         [self updateInventory];
         return ![self.appWorkspace needsRestoreForDisplayID:displayID];
     }, 1.5);
-    if (!emptied) {
+      if (!emptied) {
         [self reportApplicationError:nil fallback:@"仍有应用窗口或窗口清单尚未更新，已保留这个虚拟屏。请稍后重试关闭。"];
         return NO;
-    }
-    return YES;
-    } @finally {
+      }
+      restored = YES;
+      return YES;
+      } @finally {
+          if (!restored) [self.appWorkspace cancelUnmovableWindowAllowances];
         self.appOperationInProgress = NO;
         [self updateInventory];
     }
@@ -1698,13 +1790,21 @@ static NSView *YMSpacer(void) {
 }
 - (void)stop:(id)sender {
     (void)sender;
-    if (self.previewMode || self.updateWorkspaceBusy || self.displayOperationInProgress || self.appOperationInProgress) return;
-    if (self.topologyRecoverySnapshot) { [self retryTopologyRecovery:nil]; return; }
+    if (self.previewMode) return;
+    if (self.updateWorkspaceBusy || self.displayOperationInProgress || self.appOperationInProgress) {
+        [self logQuitStep:@"close skipped: another operation is running"]; return;
+    }
+    if (self.topologyRecoverySnapshot) { [self logQuitStep:@"close retries display recovery"]; [self retryTopologyRecovery:nil]; return; }
     if (self.armed || self.preparing || self.layoutChangedForTrial) [self restore:nil];
-    if (self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) return;
+    if (self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) {
+        [self logQuitStep:@"close skipped: screen-off trial still restoring"]; return;
+    }
     VDVirtualDisplay *closing = self.virtualDisplay;
-    if (!closing.isCreated) return;
-    if (![self restoreApplicationsForDisplayID:closing.displayID]) return;
+    if (!closing.isCreated) { [self logQuitStep:@"close skipped: selected screen is not running"]; return; }
+    if (![self confirmUnmovableWindowsOnDisplayIDs:@[@(closing.displayID)]]) return;
+    if (![self restoreApplicationsForDisplayID:closing.displayID]) {
+        [self logQuitStep:@"close stopped: windows did not return to the physical screen"]; return;
+    }
     BOOL physicalActive = NO;
     for (NSDictionary *item in DisplaySnapshot()) {
         CGDirectDisplayID ident = [item[@"displayID"] unsignedIntValue];
@@ -1717,9 +1817,11 @@ static NSView *YMSpacer(void) {
         self.originalMain = 0;
         mainReady = [self setVirtualMain:NO];
     }
-    if (!mainReady) {
+      if (!mainReady) {
+          [self.appWorkspace cancelUnmovableWindowAllowances];
         self.statusLabel.stringValue = @"保留虚拟屏：尚无可用的实体主屏";
         self.detailLabel.stringValue = @"请先打开或重新连接实体显示器，再关闭或退出。";
+        [self logQuitStep:@"close stopped: no physical main display"];
         return;
     }
     self.displayOperationInProgress = YES;
@@ -1727,11 +1829,14 @@ static NSView *YMSpacer(void) {
     YMDisplayTopologySnapshot *before = [self.displayTopology captureSnapshotWithError:&topologyError];
     CGDirectDisplayID removedID = closing.displayID;
     YMDisplayTopologySnapshot *survivors = [before snapshotByExcludingDisplayID:removedID];
-    if (!survivors) {
+      if (!survivors) {
+          [self.appWorkspace cancelUnmovableWindowAllowances];
         self.displayOperationInProgress = NO;
         [self reportTopologyError:topologyError];
+        [self logQuitStep:@"close stopped: display arrangement snapshot failed"];
         return;
     }
+    [self logQuitStep:[NSString stringWithFormat:@"closing screen %u", removedID]];
     [self finishWatchdog];
     self.selectedProfile.topologyVerified = NO;
     [closing destroy];
@@ -1765,7 +1870,7 @@ static NSView *YMSpacer(void) {
             [self.automaticUpdater installationWasDeferredWithError:error ?: [NSError errorWithDomain:YMAutomaticUpdaterErrorDomain code:104 userInfo:@{NSLocalizedDescriptionKey:@"窗口已变化，点击检查更新以重新保存位置后安装。"}]];
             [self updateInventory];
             [self refreshUpdateUI];
-            return NSTerminateCancel;
+            return [self refuseTermination:@"update installation was deferred"];
         }
         [self storeUpdatePanelState];
         [self writeStateEnding:YES];
@@ -1773,16 +1878,27 @@ static NSView *YMSpacer(void) {
         // ordinary quit's return-all-to-physical-display workflow here.
         return NSTerminateNow;
     }
-    if (self.updateWorkspaceBusy || self.displayOperationInProgress || self.appOperationInProgress) return NSTerminateCancel;
-    if (self.topologyRecoverySnapshot) { self.terminationAfterTopologyRecovery = YES; [self retryTopologyRecovery:nil]; return NSTerminateCancel; }
+    if (self.updateWorkspaceBusy || self.displayOperationInProgress || self.appOperationInProgress)
+        return [self refuseTermination:@"another operation is running"];
+    if (self.topologyRecoverySnapshot) {
+        self.terminationAfterTopologyRecovery = YES; [self retryTopologyRecovery:nil];
+        return [self refuseTermination:@"display recovery is pending; retrying it first"];
+    }
     if (self.armed || self.preparing || self.layoutChangedForTrial) [self restore:nil];
-    if (self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) return NSTerminateCancel;
+    if (self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested)
+        return [self refuseTermination:@"screen-off trial still restoring"];
     NSArray<YMManagedDisplay *> *active = [self activeProfiles];
+    [self logQuitStep:[NSString stringWithFormat:@"quit requested with %lu running screen(s)", (unsigned long)active.count]];
+    NSMutableArray<NSNumber *> *activeIDs = [NSMutableArray array];
+    for (YMManagedDisplay *profile in active) [activeIDs addObject:@(profile.display.displayID)];
+    if (![self confirmUnmovableWindowsOnDisplayIDs:activeIDs])
+        return [self refuseTermination:@"the user kept the screens because of windows that cannot return"];
     // Restore every workspace before removing any; a failure leaves the whole
     // virtual topology available for manual recovery.
     for (YMManagedDisplay *profile in active) {
         if (![self restoreApplicationsForDisplayID:profile.display.displayID]) {
-            [self showWindow:nil]; return NSTerminateCancel;
+            [self showWindow:nil];
+            return [self refuseTermination:[NSString stringWithFormat:@"windows on screen %u did not return", profile.display.displayID]];
         }
     }
     if (active.count) {
@@ -1795,10 +1911,15 @@ static NSView *YMSpacer(void) {
         if (!self.displayOperationInProgress) {
             self.terminationAfterTopologyRecovery = NO;
             if (profile.display.isCreated || self.topologyRecoverySnapshot) [self showWindow:nil];
+            return [self refuseTermination:@"the first screen could not be closed"];
         }
+        // Not a refusal: removal is asynchronous and quit resumes afterwards.
         return NSTerminateCancel;
     }
-    if (self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay) { [self showWindow:nil]; return NSTerminateCancel; }
+    if (self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay) {
+        [self showWindow:nil];
+        return [self refuseTermination:@"WeChat must return to the physical screen first"];
+    }
     [self writeStateEnding:YES];
     return NSTerminateNow;
 }
@@ -1806,6 +1927,7 @@ static NSView *YMSpacer(void) {
     if (self.previewMode) return;
     (void)notification;
     [self.panelPresenter invalidate];
+    [self.inputLeases stop];
     [NSNotificationCenter.defaultCenter removeObserver:self];
     [self.heartbeatTimer invalidate];
     if (self.hotkey) UnregisterEventHotKey(self.hotkey);
@@ -2067,6 +2189,7 @@ int main(int argc, const char *argv[]) {
                 @"physicalDisplaySwitchAPI":@(EnableAPI() != NULL), @"displays":DisplaySnapshot()}, includeIdentifiers).UTF8String);
             return 0;
         }
+        if (argc > 1 && strcmp(argv[1], "--input") == 0) return YMInputLeaseCommand(argc, argv);
         if (argc > 2 && strcmp(argv[1], "--self-test") == 0)
             return SelfTest([NSString stringWithUTF8String:argv[2]], argc > 3 && strcmp(argv[3], "hidpi") == 0);
         if (argc > 3 && strcmp(argv[1], "--watchdog-test") == 0)
