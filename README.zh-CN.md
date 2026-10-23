@@ -102,6 +102,20 @@ dist/Yomado.zip
 
 Yomado 不修改密码、锁屏策略、屏保或登录设置；保持唤醒的请求不能解锁 Mac。截图和输入权限由执行这些操作的工具自行管理。
 
+## 共用鼠标键盘
+
+Agent 应优先使用后台输入：辅助功能动作，以及只发给目标 App 的事件。这样不会动你的光标、焦点和前台 App。三维视图、游戏等部分 App 只接受真实的鼠标键盘事件，这时 Agent 可以先向 yomado 申请：
+
+```sh
+./dist/Yomado.app/Contents/MacOS/Yomado --input request --agent "Codex" --reason "旋转 Blender 视图" --seconds 120
+./dist/Yomado.app/Contents/MacOS/Yomado --input status --lease <leaseID>
+./dist/Yomado.app/Contents/MacOS/Yomado --input release --lease <leaseID>
+```
+
+yomado 会在主屏弹出申请，提供「允许」和「拒绝」；60 秒内没有回应即自动拒绝。获准期间，主屏右上角会一直显示「Agent 正在使用你的鼠标键盘」，附 Agent 名称、剩余时间和「停止」按钮。每次借用 10 到 600 秒，Agent 归还、到期或你按下「停止」时结束。归还或到期后，yomado 会把光标和前台 App 放回原处；按「停止」时则保持现状，交还给你。每条命令输出一行 JSON；退出码 0 表示已获准、已归还、仍有效或空闲。
+
+yomado 自己不发送输入，也无法拦住 Agent 的工具。借用只是一种许可加可见提示：[yomado skill](skills/yomado/SKILL.md) 要求 Agent 每批真实输入前都检查一次，借用结束就立即停下。
+
 ## 版本与检查更新
 
 面板底部显示当前版本，并提供 [yomado.app](https://yomado.app/)、GitHub 源码和 MIT 协议入口。点击版本旁的刷新图标，或菜单栏菜单中的「检查并安装更新…」。菜单栏只保留夜窗 logo 的窗子轮廓，背景透明、颜色跟随系统外观；应用图标仍保留完整深色底图。
@@ -156,7 +170,7 @@ bash ./test.sh
 
 它们检查显示放置、窗口归属与恢复几何、微信检查点、诊断脱敏及更新策略。更新测试使用模拟网络覆盖版本比较、实验版、分页、重复请求和失败情况，不访问 GitHub。这些测试不调用私有显示 API，也不能证明真实显示配置或跨应用输入能够成功。
 
-独立的隐藏 AppKit 布局回归检查屏幕比例、顶部对齐、应用列表变化、滚动和窗口缩放。它需要 macOS WindowServer 会话，不读取或移动真实应用窗口，也不创建显示器：
+独立的隐藏 AppKit 布局回归检查屏幕比例、顶部对齐、应用列表变化、滚动和窗口缩放；它还会用合成显示器构建控制面板，确认在悬浮式和常驻式滚动条下，屏幕卡片都能完整放进总览区域、不出现滚动条，并且窗口不会为了容纳卡片而变大。它需要 macOS WindowServer 会话，不读取或移动真实应用窗口，也不创建显示器：
 
 ```sh
 bash ./scripts/test-layout.sh
