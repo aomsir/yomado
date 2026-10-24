@@ -27,6 +27,9 @@ ym_layout_sdk="$(DEVELOPER_DIR="$ym_layout_developer" /usr/bin/xcrun --sdk macos
   -framework AppKit -framework QuartzCore -o "$ym_layout_stage/WorkspaceLayoutTests"
 "$ym_layout_stage/WorkspaceLayoutTests"
 
+bash "$ym_layout_root/scripts/test-display-profile-ui.sh"
+bash "$ym_layout_root/scripts/test-display-profile-panel.sh"
+
 # The overview test builds the production controller panel from synthetic
 # display snapshots in preview mode.
 ym_layout_sparkle="$("$ym_layout_root/scripts/fetch-sparkle.sh")"
@@ -39,6 +42,7 @@ ym_layout_sparkle="$("$ym_layout_root/scripts/fetch-sparkle.sh")"
   "$ym_layout_root/app/AutomaticUpdater.m" "$ym_layout_root/app/UpdateWorkspaceRecovery.m" \
   "$ym_layout_root/app/AppWorkspace.m" "$ym_layout_root/app/AppWorkspaceAccess.m" \
   "$ym_layout_root/app/AppWorkspaceView.m" "$ym_layout_root/app/InputLease.m" \
+  "$ym_layout_root/app/DisplayProfileEditor.m" "$ym_layout_root/app/SavedDisplayProfilesView.m" \
   "$ym_layout_root/bridge/VDVirtualDisplay.m" "$ym_layout_root/bridge/YMDisplayTopology.m" \
   -framework AppKit -framework CoreGraphics -framework IOKit -framework Carbon -framework ApplicationServices \
   -framework QuartzCore -framework ColorSync \

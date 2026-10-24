@@ -35,6 +35,10 @@ static ADController *Panel(NSArray<NSDictionary *> *snapshot, NSScrollerStyle st
     controller.previewState = @"running";
     controller.previewSnapshot = snapshot;
     [controller buildWindow];
+    if (!NSEqualSizes(controller.window.contentMinSize, NSMakeSize(760, 520))) {
+        fprintf(stderr, "FAIL: profile-management panel minimum content size changed\n");
+        exit(1);
+    }
     controller.applicationCards.enclosingScrollView.scrollerStyle = style;
     [controller updateInventory];
     controller.updateStatusLabel.stringValue = statusRow ? @"已是最新版本" : @"";
@@ -51,6 +55,10 @@ static void Settle(ADController *controller, NSSize content) {
 }
 
 static void CheckWindowKept(NSString *scenario, ADController *controller, NSSize content) {
+    if (controller.window.visible || NSApp.activationPolicy != NSApplicationActivationPolicyProhibited) {
+        fprintf(stderr, "FAIL %s: fixture must remain hidden and non-activating\n", scenario.UTF8String);
+        exit(1);
+    }
     // Cards must shrink to the board, or the board scroll; enlarging the window
     // would hide the overflow and act as a hidden minimum size.
     NSSize window = controller.window.contentView.frame.size;
@@ -108,7 +116,7 @@ int main(void) {
             @"one portrait":@[Display(1, 0, 1080, 1920, NO)],
             @"portrait and landscape":@[Display(1, 0, 1080, 1920, NO), Display(2, 1080, 1920, 1080, NO)],
             @"small virtual":@[Display(1, 0, 1920, 1080, NO), Display(2, 1920, 640, 480, YES)]};
-        NSArray<NSValue *> *sizes = @[[NSValue valueWithSize:NSMakeSize(1000, 410)], [NSValue valueWithSize:NSMakeSize(760, 370)]];
+        NSArray<NSValue *> *sizes = @[[NSValue valueWithSize:NSMakeSize(1000, 620)], [NSValue valueWithSize:NSMakeSize(760, 520)]];
         for (NSNumber *style in @[@(NSScrollerStyleOverlay), @(NSScrollerStyleLegacy)]) {
             NSString *styleName = style.integerValue == NSScrollerStyleLegacy ? @"legacy" : @"overlay";
             for (NSString *name in [layouts.allKeys sortedArrayUsingSelector:@selector(compare:)])
@@ -121,12 +129,27 @@ int main(void) {
                         [controller.window close];
                     }
 
+            for (NSValue *size in sizes) {
+                ADController *controller = Panel(ThreeMixed(), style.integerValue, YES);
+                YMManagedDisplay *saved = [controller newProfileWithOrdinal:1 name:@"Saved screen" width:1920 height:1080 hiDPI:NO];
+                controller.displayProfiles = [NSMutableArray arrayWithObject:saved];
+                [controller updateInventory];
+                Settle(controller, size.sizeValue);
+                if (controller.savedProfilesView.hidden) {
+                    fprintf(stderr, "FAIL: saved-profile integration case must show its list\n");
+                    exit(1);
+                }
+                CheckFits([NSString stringWithFormat:@"three mixed with saved list %@ %@", styleName, NSStringFromSize(size.sizeValue)],
+                          controller, ThreeMixed(), size.sizeValue);
+                [controller.window close];
+            }
+
             for (NSString *name in [tight.allKeys sortedArrayUsingSelector:@selector(compare:)])
                 for (NSNumber *statusRow in @[@NO, @YES]) {
                     ADController *controller = Panel(tight[name], style.integerValue, statusRow.boolValue);
-                    Settle(controller, NSMakeSize(760, 370));
+                    Settle(controller, NSMakeSize(760, 520));
                     NSString *scenario = [NSString stringWithFormat:@"%@ %@ minimum%@", name, styleName, statusRow.boolValue ? @" status" : @""];
-                    CheckWindowKept(scenario, controller, NSMakeSize(760, 370));
+                    CheckWindowKept(scenario, controller, NSMakeSize(760, 520));
                     scenarios++;
                     printf("PASS %s: window keeps its size\n", scenario.UTF8String);
                     [controller.window close];
@@ -134,15 +157,15 @@ int main(void) {
 
             // Closing a virtual display rebuilds the cards while the board keeps its scroll state.
             ADController *controller = Panel(ThreeMixed(), style.integerValue, YES);
-            Settle(controller, NSMakeSize(1000, 410));
+            Settle(controller, NSMakeSize(1000, 620));
             controller.previewSnapshot = TwoMixed();
             [controller updateInventory];
-            Settle(controller, NSMakeSize(1000, 410));
-            CheckFits([NSString stringWithFormat:@"three to two %@", styleName], controller, TwoMixed(), NSMakeSize(1000, 410));
+            Settle(controller, NSMakeSize(1000, 620));
+            CheckFits([NSString stringWithFormat:@"three to two %@", styleName], controller, TwoMixed(), NSMakeSize(1000, 620));
             controller.previewSnapshot = ThreeMixed();
             [controller updateInventory];
-            Settle(controller, NSMakeSize(1000, 410));
-            CheckFits([NSString stringWithFormat:@"two to three %@", styleName], controller, ThreeMixed(), NSMakeSize(1000, 410));
+            Settle(controller, NSMakeSize(1000, 620));
+            CheckFits([NSString stringWithFormat:@"two to three %@", styleName], controller, ThreeMixed(), NSMakeSize(1000, 620));
             [controller.window close];
         }
         printf("Passed %lu overview layout scenarios using a hidden preview panel; no displays or application windows were read or moved.\n",
