@@ -78,6 +78,8 @@
 @property NSUInteger resumedTerminations;
 @property BOOL deferTopologyOperations;
 @property BOOL useRealPanelPresentation;
+@property BOOL useProductionAppRestore;
+@property BOOL useProductionUnmovableConfirmation;
 @property NSMutableArray<NSDictionary *> *pendingTopologyOperations;
 - (void)runNextTopologyOperation;
 @end
@@ -103,8 +105,16 @@
 - (void)saveDisplayProfiles { self.saves++; }
 - (void)reportTopologyError:(NSError *)error { (void)error; self.reports++; }
 - (void)powerAssertions:(BOOL)on { self.systemAssertion = self.displayAssertion = on && !self.powerFails ? 1 : 0; }
-- (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID { (void)displayID; return YES; }
-- (BOOL)confirmUnmovableWindowsOnDisplayIDs:(NSArray<NSNumber *> *)displayIDs { (void)displayIDs; return YES; }
+- (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID {
+    if (self.useProductionAppRestore) return [super restoreApplicationsForDisplayID:displayID];
+    (void)displayID;
+    return YES;
+}
+- (BOOL)confirmUnmovableWindowsOnDisplayIDs:(NSArray<NSNumber *> *)displayIDs {
+    if (self.useProductionUnmovableConfirmation) return [super confirmUnmovableWindowsOnDisplayIDs:displayIDs];
+    (void)displayIDs;
+    return YES;
+}
 - (void)showWindow:(id)sender {
     self.showCalls++;
     if (self.useRealPanelPresentation) [super showWindow:sender];
@@ -130,6 +140,86 @@
             [self resumeTerminationAfterTopologyRecovery:recovered];
         }];
     }
+}
+@end
+
+@interface YMUnmovableWorkspace : NSObject
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSArray<NSDictionary *> *> *windowsByDisplayID;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *pendingReadsByDisplayID;
+@property(nonatomic, strong) NSMutableSet<NSNumber *> *neverReadyDisplayIDs;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *queriedDisplayIDs;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *allowedDisplayIDs;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *restoreDisplayIDs;
+@property(nonatomic) CGDirectDisplayID restoreFailureDisplayID;
+@property(nonatomic) NSUInteger cancelAllowanceCalls;
+- (NSArray<NSDictionary *> *)unmovableWindowsForDisplayID:(CGDirectDisplayID)displayID;
+- (void)allowUnmovableWindowsOnDisplayID:(CGDirectDisplayID)displayID;
+- (void)cancelUnmovableWindowAllowances;
+- (BOOL)inventoryReadyForClosingDisplayID:(CGDirectDisplayID)displayID;
+- (BOOL)restoreDisplayID:(CGDirectDisplayID)displayID error:(NSError **)error;
+- (BOOL)needsRestoreForDisplayID:(CGDirectDisplayID)displayID;
+@end
+@implementation YMUnmovableWorkspace
+- (instancetype)init {
+    if ((self = [super init])) {
+        _windowsByDisplayID = [NSMutableDictionary dictionary];
+        _pendingReadsByDisplayID = [NSMutableDictionary dictionary];
+        _neverReadyDisplayIDs = [NSMutableSet set];
+        _queriedDisplayIDs = [NSMutableArray array];
+        _allowedDisplayIDs = [NSMutableArray array];
+        _restoreDisplayIDs = [NSMutableArray array];
+    }
+    return self;
+}
+- (NSArray<NSDictionary *> *)unmovableWindowsForDisplayID:(CGDirectDisplayID)displayID {
+    NSNumber *key = @(displayID);
+    [self.queriedDisplayIDs addObject:key];
+    if ([self.neverReadyDisplayIDs containsObject:key]) return nil;
+    NSUInteger pendingReads = self.pendingReadsByDisplayID[key].unsignedIntegerValue;
+    if (pendingReads) {
+        self.pendingReadsByDisplayID[key] = @(pendingReads - 1);
+        return nil;
+    }
+    return self.windowsByDisplayID[key] ?: @[];
+}
+- (void)allowUnmovableWindowsOnDisplayID:(CGDirectDisplayID)displayID {
+    [self.allowedDisplayIDs addObject:@(displayID)];
+}
+- (void)cancelUnmovableWindowAllowances {
+    self.cancelAllowanceCalls++;
+    [self.allowedDisplayIDs removeAllObjects];
+}
+- (BOOL)inventoryReadyForClosingDisplayID:(CGDirectDisplayID)displayID {
+    (void)displayID;
+    return YES;
+}
+- (BOOL)restoreDisplayID:(CGDirectDisplayID)displayID error:(NSError **)error {
+    [self.restoreDisplayIDs addObject:@(displayID)];
+    if (displayID == self.restoreFailureDisplayID) {
+        if (error) *error = [NSError errorWithDomain:@"fixture" code:8 userInfo:nil];
+        return NO;
+    }
+    return YES;
+}
+- (BOOL)needsRestoreForDisplayID:(CGDirectDisplayID)displayID { (void)displayID; return NO; }
+- (BOOL)accessibilityTrusted { return YES; }
+@end
+
+@interface YMUnmovableController : YMFakeController
+@property(nonatomic, copy) NSString *confirmationSummary;
+@property(nonatomic) BOOL confirmationResponse;
+@property(nonatomic) NSUInteger confirmationCalls;
+@property(nonatomic) NSUInteger applicationErrors;
+@end
+@implementation YMUnmovableController
+- (BOOL)confirmLeavingUnmovableWindows:(NSString *)summary {
+    self.confirmationCalls++;
+    self.confirmationSummary = summary;
+    return self.confirmationResponse;
+}
+- (void)reportApplicationError:(NSError *)error fallback:(NSString *)fallback {
+    (void)error; (void)fallback;
+    self.applicationErrors++;
 }
 @end
 
@@ -214,10 +304,129 @@
     return self.adoptedNonemptyOrigins;
 }
 @end
+
+// Close-gate fixture: inventory readiness and a single restore write.
+@interface YMCloseGateWorkspace : NSObject {
+    BOOL _gateReady;
+}
+@property(nonatomic) BOOL inventoryReady;
+@property(nonatomic) BOOL needsRestoreFlag;
+@property(nonatomic) BOOL restoreResult;
+@property(nonatomic) NSUInteger restoreCalls;
+@property(nonatomic) NSUInteger readyPolls;
+@property(nonatomic) NSUInteger needsRestorePolls;
+@property(nonatomic) NSUInteger refreshesBeforeReady;
+@property(nonatomic) NSUInteger closingReadyPolls;
+@property(nonatomic) CGDirectDisplayID lastClosingDisplayID;
+@property(nonatomic) BOOL closingReadinessOverrideEnabled;
+@property(nonatomic) BOOL closingReadinessOverride;
+@property(nonatomic, strong) NSMutableArray<NSString *> *events;
+@end
+@implementation YMCloseGateWorkspace
+- (instancetype)init {
+    if ((self = [super init])) {
+        _gateReady = YES;
+        _restoreResult = YES;
+        _events = [NSMutableArray array];
+    }
+    return self;
+}
+- (void)refreshWithVirtualDisplayIDs:(NSArray *)ids displaySnapshot:(NSArray *)snapshot {
+    (void)ids; (void)snapshot;
+    [self.events addObject:@"refresh"];
+    if (self.refreshesBeforeReady > 0) {
+        self.refreshesBeforeReady--;
+        _gateReady = self.refreshesBeforeReady == 0;
+    }
+}
+- (BOOL)inventoryReady {
+    self.readyPolls++;
+    [self.events addObject:_gateReady ? @"readyYES" : @"readyNO"];
+    return _gateReady;
+}
+- (void)setInventoryReady:(BOOL)inventoryReady {
+    _gateReady = inventoryReady;
+}
+- (BOOL)inventoryReadyForClosingDisplayID:(CGDirectDisplayID)displayID {
+    self.closingReadyPolls++;
+    self.lastClosingDisplayID = displayID;
+    return self.closingReadinessOverrideEnabled ? self.closingReadinessOverride : self.inventoryReady;
+}
+- (BOOL)needsRestoreForDisplayID:(CGDirectDisplayID)displayID {
+    (void)displayID;
+    self.needsRestorePolls++;
+    return self.needsRestoreFlag;
+}
+- (BOOL)restoreDisplayID:(CGDirectDisplayID)displayID error:(NSError **)error {
+    (void)displayID; (void)error;
+    self.restoreCalls++;
+    [self.events addObject:@"restore"];
+    // restoreDisplayID itself requires ready evidence (mirrors production gate).
+    if (!_gateReady) {
+        if (error) *error = [NSError errorWithDomain:@"fixture" code:3 userInfo:nil];
+        return NO;
+    }
+    return self.restoreResult;
+}
+- (void)cancelUnmovableWindowAllowances {}
+- (BOOL)accessibilityTrusted { return YES; }
+- (NSArray *)rowsForDisplayID:(CGDirectDisplayID)displayID { (void)displayID; return @[]; }
+@end
+
+@interface YMCloseGateController : YMFakeController
+@end
+@implementation YMCloseGateController
+- (void)updateInventory {
+    self.inventoryUpdates++;
+    NSArray *ids = self.virtualDisplay.isCreated ? @[@(self.virtualDisplay.displayID)] : @[];
+    [(id)self.appWorkspace refreshWithVirtualDisplayIDs:ids displaySnapshot:@[]];
+}
+- (void)reportApplicationError:(NSError *)error fallback:(NSString *)fallback {
+    (void)error; (void)fallback; self.reports++;
+}
+@end
 @interface YMControllerLegacyRecovery : NSObject
 @property BOOL needsRestoreBeforeRemovingVirtualDisplay;
+@property(nonatomic, weak) YMCloseGateWorkspace *workspaceToInvalidate;
+@property(nonatomic) NSUInteger restoreWeChatCalls;
+@property(nonatomic) NSUInteger refreshSnapshotCount;
+@property(nonatomic, strong) NSArray *lastRefreshSnapshot;
+@property(nonatomic, strong) NSMutableArray<NSString *> *events;
 @end
 @implementation YMControllerLegacyRecovery
+- (instancetype)init {
+    if ((self = [super init])) _events = [NSMutableArray array];
+    return self;
+}
+- (void)refreshWithVirtualDisplayID:(CGDirectDisplayID)displayID displaySnapshot:(NSArray *)snapshot {
+    (void)displayID;
+    self.refreshSnapshotCount++;
+    self.lastRefreshSnapshot = snapshot;
+    [self.events addObject:@"wechatRefresh"];
+}
+- (BOOL)restoreWeChat:(NSError **)error {
+    (void)error;
+    self.restoreWeChatCalls++;
+    [self.events addObject:@"wechatRestore"];
+    // World change after WeChat: inventory key/TTL no longer authorizes close.
+    YMCloseGateWorkspace *gate = self.workspaceToInvalidate;
+    if (gate) {
+        gate.inventoryReady = NO;
+        gate.refreshesBeforeReady = 2;
+    }
+    return YES;
+}
+@end
+
+@interface YMIsolatedWeChatController : YMCloseGateController
+@property(nonatomic) NSUInteger displaySnapshotCalls;
+@property(nonatomic, strong) NSArray *fakeDisplaySnapshot;
+@end
+@implementation YMIsolatedWeChatController
+- (NSArray *)controllerDisplaySnapshot {
+    self.displaySnapshotCalls++;
+    return self.fakeDisplaySnapshot ?: @[];
+}
 @end
 @interface YMUpdateCompletionController : YMFakeController
 @property NSMutableArray *events;
@@ -671,6 +880,206 @@ int main(void) {
         [completionController restoreUpdateProfileAtIndex:0];
         Expect(completionController.completionError!=nil && [events isEqual:@[@"restore",@"finished"]],
             "backend failure without NSError cannot be announced as a successful recovery");
+
+        // Production confirmation logic with only inventory and prompt-boundary fakes.
+        {
+            YMUnmovableWorkspace *workspace = [YMUnmovableWorkspace new];
+            workspace.windowsByDisplayID[@101] = @[
+                @{@"appName": @"Editor", @"count": @1},
+                @{@"appName": @"Tool", @"count": @1}
+            ];
+            workspace.windowsByDisplayID[@202] = @[@{@"appName": @"Editor", @"count": @2}];
+            YMUnmovableController *controller = [YMUnmovableController new];
+            controller.appWorkspace = (YMAppWorkspace *)(id)workspace;
+            controller.useProductionUnmovableConfirmation = YES;
+            controller.confirmationResponse = YES;
+            BOOL confirmed = [controller confirmUnmovableWindowsOnDisplayIDs:@[@101, @202]];
+            Expect(confirmed && controller.confirmationCalls == 1,
+                   "production confirmation prompts once for unmovable windows across screens");
+            Expect([controller.confirmationSummary isEqualToString:@"「Editor」3 个窗口、「Tool」1 个窗口"],
+                   "multi-screen confirmation aggregates counts by application");
+            Expect([workspace.allowedDisplayIDs isEqualToArray:@[@101, @202]],
+                   "continuing authorizes the exact displayed screen IDs");
+            Expect(NSApp == nil, "unmovable confirmation tests do not create NSApplication");
+
+            workspace = [YMUnmovableWorkspace new];
+            workspace.windowsByDisplayID[@202] = @[@{@"appName": @"Dialog", @"count": @1}];
+            controller = [YMUnmovableController new];
+            controller.appWorkspace = (YMAppWorkspace *)(id)workspace;
+            controller.useProductionUnmovableConfirmation = YES;
+            controller.confirmationResponse = NO;
+            confirmed = [controller confirmUnmovableWindowsOnDisplayIDs:@[@202]];
+            Expect(!confirmed && controller.confirmationCalls == 1 && workspace.allowedDisplayIDs.count == 0,
+                   "canceling the production confirmation grants no allowance");
+            Expect(workspace.cancelAllowanceCalls == 1,
+                   "canceling clears offered unmovable-window allowances");
+
+            workspace = [YMUnmovableWorkspace new];
+            controller = [YMUnmovableController new];
+            controller.appWorkspace = (YMAppWorkspace *)(id)workspace;
+            controller.useProductionUnmovableConfirmation = YES;
+            controller.confirmationResponse = NO;
+            confirmed = [controller confirmUnmovableWindowsOnDisplayIDs:@[@202]];
+            Expect(confirmed && controller.confirmationCalls == 0 && workspace.allowedDisplayIDs.count == 0,
+                   "an empty unmovable-window list succeeds without prompting or authorizing");
+
+            workspace = [YMUnmovableWorkspace new];
+            workspace.pendingReadsByDisplayID[@202] = @1;
+            workspace.windowsByDisplayID[@202] = @[@{@"appName": @"Dialog", @"count": @1}];
+            controller = [YMUnmovableController new];
+            controller.appWorkspace = (YMAppWorkspace *)(id)workspace;
+            controller.useProductionUnmovableConfirmation = YES;
+            controller.confirmationResponse = YES;
+            confirmed = [controller confirmUnmovableWindowsOnDisplayIDs:@[@202]];
+            Expect(confirmed && workspace.queriedDisplayIDs.count >= 2 && controller.inventoryUpdates >= 2,
+                   "pending inventory is retried until it becomes ready");
+            Expect(controller.confirmationCalls == 1 && [workspace.allowedDisplayIDs isEqualToArray:@[@202]],
+                   "ready inventory is summarized and authorized only after confirmation");
+
+            workspace = [YMUnmovableWorkspace new];
+            [workspace.neverReadyDisplayIDs addObject:@202];
+            controller = [YMUnmovableController new];
+            controller.appWorkspace = (YMAppWorkspace *)(id)workspace;
+            controller.useProductionUnmovableConfirmation = YES;
+            controller.confirmationResponse = YES;
+            NSDate *started = [NSDate date];
+            confirmed = [controller confirmUnmovableWindowsOnDisplayIDs:@[@202]];
+            NSTimeInterval waited = -[started timeIntervalSinceNow];
+            Expect(!confirmed && controller.confirmationCalls == 0 && workspace.allowedDisplayIDs.count == 0,
+                   "inventory timeout retains the screen without prompting or authorizing");
+            Expect(workspace.cancelAllowanceCalls == 1 && controller.applicationErrors == 1,
+                   "inventory timeout clears allowances and reports the blocked close");
+            Expect(waited >= 1.4 && waited < 3.0,
+                   "unmovable inventory readiness wait is bounded near 1.5 seconds");
+
+            YMUnmovableWorkspace *quitWorkspace = [YMUnmovableWorkspace new];
+            quitWorkspace.windowsByDisplayID[@202] = @[@{@"appName": @"Dialog", @"count": @1}];
+            quitWorkspace.restoreFailureDisplayID = 202;
+            YMUnmovableController *quitController = [YMUnmovableController new];
+            YMFakeDisplay *firstDisplay = [YMFakeDisplay new];
+            firstDisplay.live = YES; firstDisplay.fixtureID = 101;
+            YMFakeDisplay *secondDisplay = [YMFakeDisplay new];
+            secondDisplay.live = YES; secondDisplay.fixtureID = 202;
+            YMManagedDisplay *firstProfile = [YMManagedDisplay new]; firstProfile.display = firstDisplay;
+            YMManagedDisplay *secondProfile = [YMManagedDisplay new]; secondProfile.display = secondDisplay;
+            quitController.displayProfiles = [NSMutableArray arrayWithArray:@[firstProfile, secondProfile]];
+            quitController.selectedProfile = firstProfile;
+            quitController.virtualDisplay = firstDisplay;
+            quitController.appWorkspace = (YMAppWorkspace *)(id)quitWorkspace;
+            quitController.useProductionUnmovableConfirmation = YES;
+            quitController.useProductionAppRestore = YES;
+            quitController.confirmationResponse = YES;
+            NSApplicationTerminateReply reply =
+                [quitController applicationShouldTerminate:(NSApplication *)(id)[NSObject new]];
+            Expect(reply == NSTerminateCancel && quitController.stopCalls == 0,
+                   "failure restoring any screen cancels quit before stopping one");
+            Expect(firstDisplay.live && secondDisplay.live &&
+                   [quitWorkspace.restoreDisplayIDs isEqualToArray:@[@101, @202]],
+                   "quit restores every workspace before removing any screen");
+            Expect(quitWorkspace.allowedDisplayIDs.count == 0 && quitWorkspace.cancelAllowanceCalls == 1,
+                   "failed multi-screen quit clears temporary unmovable-window allowances");
+        }
+
+        // Group 5: ready wait + single restore write; timeout retains virtual display.
+        {
+            YMFakeTopology *closeT = [YMFakeTopology new];
+            YMFakeDisplay *closeD = [YMFakeDisplay new];
+            closeD.live = YES; closeD.fixtureID = 202;
+            YMManagedDisplay *closeP = [YMManagedDisplay new];
+            closeP.width = 800; closeP.height = 600; closeP.display = closeD; closeP.topologyVerified = YES;
+            YMCloseGateController *closeController = [YMCloseGateController new];
+            closeController.displayTopology = (YMDisplayTopology *)closeT;
+            closeController.displayProfiles = [NSMutableArray arrayWithObject:closeP];
+            closeController.selectedProfile = closeP;
+            closeController.virtualDisplay = closeD;
+            closeController.useProductionAppRestore = YES;
+            YMCloseGateWorkspace *gate = [YMCloseGateWorkspace new];
+            gate.inventoryReady = YES;
+            gate.needsRestoreFlag = NO;
+            gate.restoreResult = YES;
+            closeController.appWorkspace = (YMAppWorkspace *)(id)gate;
+            closeController.windowRecovery = (YMWindowRecovery *)(id)[YMControllerLegacyRecovery new];
+            BOOL restored = [closeController restoreApplicationsForDisplayID:202];
+            Expect(restored && gate.restoreCalls == 1,
+                   "ready inventory restores the display exactly once");
+            Expect(gate.closingReadyPolls > 0 && gate.lastClosingDisplayID == 202,
+                   "production close checks inventory readiness for the target display");
+            Expect(gate.needsRestorePolls >= 1,
+                   "convergence polling observes needsRestore without a second write");
+            Expect(closeD.live && closeD.destroys == 0, "successful restore does not destroy the display");
+
+            gate.restoreCalls = 0; gate.readyPolls = 0; gate.needsRestorePolls = 0; gate.closingReadyPolls = 0;
+            gate.inventoryReady = YES;
+            gate.closingReadinessOverrideEnabled = YES;
+            gate.closingReadinessOverride = NO;
+            gate.refreshesBeforeReady = 0; // never becomes ready
+            NSDate *started = [NSDate date];
+            restored = [closeController restoreApplicationsForDisplayID:202];
+            NSTimeInterval waited = -[started timeIntervalSinceNow];
+            Expect(!restored && gate.restoreCalls == 0 && gate.closingReadyPolls > 0 && gate.readyPolls == 0,
+                   "per-display readiness timeout blocks writes even when global inventory is ready");
+            Expect(waited >= 1.4 && waited < 3.0, "ready wait bounds near 1.5 seconds");
+            Expect(closeD.live && closeD.destroys == 0,
+                   "timeout does not remove the virtual display");
+            Expect(closeController.reports >= 1, "timeout reports and retains the screen");
+
+            // Ready after several refreshes, then a single restore write.
+            gate.restoreCalls = 0; gate.readyPolls = 0; gate.needsRestorePolls = 0; gate.closingReadyPolls = 0;
+            gate.closingReadinessOverrideEnabled = NO;
+            gate.needsRestoreFlag = NO;
+            gate.restoreResult = YES;
+            gate.inventoryReady = NO;
+            gate.refreshesBeforeReady = 3;
+            [gate.events removeAllObjects];
+            restored = [closeController restoreApplicationsForDisplayID:202];
+            Expect(restored && gate.restoreCalls == 1,
+                   "ready after several refreshes restores the display exactly once");
+            Expect(gate.closingReadyPolls >= 3 && gate.readyPolls >= 3,
+                   "controller waits through per-display readiness refreshesBeforeReady");
+
+            // WeChat world-change must happen before the ready wait that authorizes restore.
+            // If wait runs first, WeChat invalidates ready and restoreDisplayID refuses.
+            // Display reads go through controllerDisplaySnapshot — never real CG/NSScreen.
+            YMIsolatedWeChatController *wechatController = [YMIsolatedWeChatController new];
+            wechatController.displayTopology = (YMDisplayTopology *)closeT;
+            wechatController.displayProfiles = [NSMutableArray arrayWithObject:closeP];
+            wechatController.selectedProfile = closeP;
+            wechatController.virtualDisplay = closeD;
+            wechatController.useProductionAppRestore = YES;
+            wechatController.appWorkspace = (YMAppWorkspace *)(id)gate;
+            wechatController.fakeDisplaySnapshot =
+                @[@{@"displayID": @5, @"displayUUID": @"physical",
+                    @"bounds": @{@"x": @0, @"y": @0, @"width": @2560, @"height": @1440},
+                    @"isMain": @YES, @"isActive": @YES, @"isOnline": @YES, @"isVirtual": @NO},
+                  @{@"displayID": @202, @"displayUUID": @"agent",
+                    @"bounds": @{@"x": @2560, @"y": @0, @"width": @2560, @"height": @1440},
+                    @"isMain": @NO, @"isActive": @YES, @"isOnline": @YES, @"isVirtual": @YES}];
+            YMControllerLegacyRecovery *wechatRecovery = [YMControllerLegacyRecovery new];
+            wechatRecovery.needsRestoreBeforeRemovingVirtualDisplay = YES;
+            wechatRecovery.workspaceToInvalidate = gate;
+            wechatController.windowRecovery = (YMWindowRecovery *)(id)wechatRecovery;
+            wechatController.wechatDisplayID = 202;
+            gate.restoreCalls = 0; gate.readyPolls = 0; gate.needsRestorePolls = 0;
+            gate.needsRestoreFlag = NO;
+            gate.restoreResult = YES;
+            gate.inventoryReady = YES;
+            gate.refreshesBeforeReady = 0;
+            [gate.events removeAllObjects];
+            [wechatRecovery.events removeAllObjects];
+            restored = [wechatController restoreApplicationsForDisplayID:202];
+            Expect(wechatRecovery.restoreWeChatCalls == 1, "pending WeChat restore runs during close");
+            Expect(restored && gate.restoreCalls == 1,
+                   "ready wait after WeChat world-change still restores once");
+            Expect(wechatController.displaySnapshotCalls >= 1,
+                   "WeChat close path uses overridable controllerDisplaySnapshot");
+            Expect(wechatRecovery.refreshSnapshotCount == 1 &&
+                   [wechatRecovery.lastRefreshSnapshot isEqual:wechatController.fakeDisplaySnapshot],
+                   "WeChat refresh receives fake snapshot, not live DisplaySnapshot");
+            Expect([wechatRecovery.events indexOfObject:@"wechatRestore"] != NSNotFound &&
+                   [gate.events indexOfObject:@"restore"] != NSNotFound,
+                   "WeChat restore and app restore both recorded");
+            Expect(restored, "WeChat-then-ready-then-restore close path succeeds");
+        }
 
         {
             BOOL seamAvailable = [ADController instancesRespondToSelector:

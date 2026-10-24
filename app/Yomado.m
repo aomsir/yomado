@@ -208,6 +208,8 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 - (void)buildWindow;
 - (void)preparePanelPresenter;
 - (void)updateInventory;
+// Private test seam: production returns DisplaySnapshot(); tests override with fixtures.
+- (NSArray<NSDictionary *> *)controllerDisplaySnapshot;
 - (void)beginUpdater;
 - (void)automaticUpdateStateDidChange;
 - (void)restoreUpdateWorkspace;
@@ -311,11 +313,40 @@ static os_log_t YMQuitLog(void) {
 // window, so they cannot return to a remembered origin. Ask once before
 // leaving them for macOS to relocate when the screens are removed.
 - (BOOL)confirmUnmovableWindowsOnDisplayIDs:(NSArray<NSNumber *> *)displayIDs {
-    NSMutableArray *items = [NSMutableArray array];
-    for (NSNumber *ID in displayIDs) [items addObjectsFromArray:[self.appWorkspace unmovableWindowsForDisplayID:ID.unsignedIntValue] ?: @[]];
+    if (self.appOperationInProgress) return NO;
+    self.appOperationInProgress = YES;
+    @try {
+    __block NSMutableArray *items;
+    BOOL observed = WaitUntil(^BOOL{
+        [self updateInventory];
+        items = [NSMutableArray array];
+        for (NSNumber *ID in displayIDs) {
+            NSArray *windows = [self.appWorkspace unmovableWindowsForDisplayID:ID.unsignedIntValue];
+            if (!windows) return NO;
+            [items addObjectsFromArray:windows];
+        }
+        return YES;
+    }, 1.5);
+    if (!observed) {
+        [self.appWorkspace cancelUnmovableWindowAllowances];
+        [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留虚拟屏。请稍后重试关闭。"];
+        return NO;
+    }
     NSString *summary = YMWorkspaceUnmovableSummary(items);
     if (!summary.length) return YES;
     [self logQuitStep:[@"windows that cannot return: " stringByAppendingString:summary]];
+    if (![self confirmLeavingUnmovableWindows:summary]) {
+        [self.appWorkspace cancelUnmovableWindowAllowances];
+        [self logQuitStep:@"user kept the screens because of windows that cannot return"];
+        return NO;
+    }
+    for (NSNumber *ID in displayIDs) [self.appWorkspace allowUnmovableWindowsOnDisplayID:ID.unsignedIntValue];
+    return YES;
+    } @finally {
+        self.appOperationInProgress = NO;
+    }
+}
+- (BOOL)confirmLeavingUnmovableWindows:(NSString *)summary {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"有窗口无法挪回原位";
     alert.informativeText = [NSString stringWithFormat:@"%@多半是弹窗、启动画面或工具窗，yomado 无法可靠地把它们挪回原位。其他窗口照常返回原位。\n继续关闭后，macOS 会把这些窗口移到剩下的屏幕上，位置可能不同。", summary];
@@ -326,12 +357,7 @@ static os_log_t YMQuitLog(void) {
     alert.buttons.firstObject.keyEquivalent = @"";
     alert.buttons.lastObject.keyEquivalent = @"\r";
     [self showWindow:nil];
-    if ([alert runModal] != NSAlertFirstButtonReturn) {
-        [self logQuitStep:@"user kept the screens because of windows that cannot return"];
-        return NO;
-    }
-    for (NSNumber *ID in displayIDs) [self.appWorkspace allowUnmovableWindowsOnDisplayID:ID.unsignedIntValue];
-    return YES;
+    return [alert runModal] == NSAlertFirstButtonReturn;
 }
 - (void)resumeTerminationAfterTopologyRecovery:(BOOL)recovered {
     BOOL requested = self.terminationAfterTopologyRecovery;
@@ -366,6 +392,12 @@ static os_log_t YMQuitLog(void) {
     (void)notification;
     [self loadDisplayProfiles];
     self.appWorkspace = [[YMAppWorkspace alloc] init];
+    __weak ADController *weakSelf = self;
+    self.appWorkspace.inventoryDidChange = ^{
+        ADController *controller = weakSelf;
+        if (!controller) return;
+        [controller updateInventory];
+    };
     self.windowRecovery = [[YMWindowRecovery alloc] initWithCheckpointURL:nil];
     self.targets = @[];
     self.systemAssertion = kIOPMNullAssertionID;
@@ -1347,6 +1379,9 @@ static os_log_t YMQuitLog(void) {
     [window orderOut:nil];
     return NO;
 }
+- (NSArray<NSDictionary *> *)controllerDisplaySnapshot {
+    return DisplaySnapshot();
+}
 - (void)updateInventory {
     if (self.updatingInventory) return;
     self.updatingInventory = YES;
@@ -1685,11 +1720,16 @@ static os_log_t YMQuitLog(void) {
 - (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID {
     if (self.appOperationInProgress) return NO;
     self.appOperationInProgress = YES;
+    BOOL restored = NO;
     @try {
     [self updateInventory];
+    // World-changing steps first (WeChat restore / control-panel move). Their
+    // CG signature or TTL impact must settle before the ready gate that
+    // authorizes restoreDisplayID. Do not restore/move inside the wait.
     BOOL ownsPendingWeChat = self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay && self.wechatDisplayID == displayID;
     if (ownsPendingWeChat) {
-        [self.windowRecovery refreshWithVirtualDisplayID:displayID displaySnapshot:DisplaySnapshot()];
+        [self.windowRecovery refreshWithVirtualDisplayID:displayID
+                                       displaySnapshot:[self controllerDisplaySnapshot]];
         NSError *error = nil;
         if (![self.windowRecovery restoreWeChat:&error]) {
             [self reportApplicationError:error fallback:@"微信尚未返回实体屏；保留这个虚拟屏。"];
@@ -1716,6 +1756,14 @@ static os_log_t YMQuitLog(void) {
         [self.window setFrame:frame display:YES];
         [self updateInventory];
     }
+    BOOL inventoryReady = WaitUntil(^BOOL{
+        [self updateInventory];
+          return [self.appWorkspace inventoryReadyForClosingDisplayID:displayID];
+    }, 1.5);
+    if (!inventoryReady) {
+        [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留这个虚拟屏。请稍后重试关闭。"];
+        return NO;
+    }
     NSError *error = nil;
     if (![self.appWorkspace restoreDisplayID:displayID error:&error]) {
         [self reportApplicationError:error fallback:@"有应用窗口未能返回实体屏；保留这个虚拟屏。"];
@@ -1727,12 +1775,14 @@ static os_log_t YMQuitLog(void) {
         [self updateInventory];
         return ![self.appWorkspace needsRestoreForDisplayID:displayID];
     }, 1.5);
-    if (!emptied) {
+      if (!emptied) {
         [self reportApplicationError:nil fallback:@"仍有应用窗口或窗口清单尚未更新，已保留这个虚拟屏。请稍后重试关闭。"];
         return NO;
-    }
-    return YES;
-    } @finally {
+      }
+      restored = YES;
+      return YES;
+      } @finally {
+          if (!restored) [self.appWorkspace cancelUnmovableWindowAllowances];
         self.appOperationInProgress = NO;
         [self updateInventory];
     }
@@ -1767,7 +1817,8 @@ static os_log_t YMQuitLog(void) {
         self.originalMain = 0;
         mainReady = [self setVirtualMain:NO];
     }
-    if (!mainReady) {
+      if (!mainReady) {
+          [self.appWorkspace cancelUnmovableWindowAllowances];
         self.statusLabel.stringValue = @"保留虚拟屏：尚无可用的实体主屏";
         self.detailLabel.stringValue = @"请先打开或重新连接实体显示器，再关闭或退出。";
         [self logQuitStep:@"close stopped: no physical main display"];
@@ -1778,7 +1829,8 @@ static os_log_t YMQuitLog(void) {
     YMDisplayTopologySnapshot *before = [self.displayTopology captureSnapshotWithError:&topologyError];
     CGDirectDisplayID removedID = closing.displayID;
     YMDisplayTopologySnapshot *survivors = [before snapshotByExcludingDisplayID:removedID];
-    if (!survivors) {
+      if (!survivors) {
+          [self.appWorkspace cancelUnmovableWindowAllowances];
         self.displayOperationInProgress = NO;
         [self reportTopologyError:topologyError];
         [self logQuitStep:@"close stopped: display arrangement snapshot failed"];
